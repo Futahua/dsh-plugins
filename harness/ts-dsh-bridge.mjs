@@ -223,46 +223,6 @@ function writeUnauthorized(res, method) {
   res.end(method === 'HEAD' ? undefined : 'dsh web authentication required; open the GUI URL to sign in.\n')
 }
 
-/**
- * Sign a browser in and bounce it to the GUI. Used for any top-level navigation
- * that arrives without a session; there is no key or password involved, because
- * anything able to reach this port is already on the tailnet.
- *
- * The cookie is issued by the server as a Set-Cookie header and the redirect is
- * a plain Location hop, so no JavaScript is involved: Safari (and iOS in
- * general) is unreliable about document.cookie writes during a page-load
- * navigation, and Private Browsing silently drops them.
- *
- * Presentation is chosen from the Host header so the cookie is bound to exactly
- * the authority the browser used, which is the one the hop back to DSH presents.
- */
-function writeBootstrap(res, authority, next = '/') {
-  // Anchor expiresAt to the backdated issuedAt so the span stays exactly
-  // MAX_AGE_MILLISECONDS: DSH rejects a cookie whose window exceeds the limit.
-  const issuedAt = Date.now() - CLOCK_SKEW_MILLISECONDS
-  const expiresAt = issuedAt + MAX_AGE_MILLISECONDS
-  const cookie = signFor(authority, issuedAt, expiresAt)
-  const maxAge = Math.floor(MAX_AGE_MILLISECONDS / 1000)
-  const target = /^\/(?!\/)/u.test(next) ? next : '/'
-  const html = `<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DSH login</title>
-<style>body{font:16px system-ui,sans-serif;margin:3rem auto;max-width:24rem;padding:0 1rem;text-align:center}</style>
-<p>Signed in. <a href="${target}">Open the DeepSeek Harness GUI</a></p>`
-  res.writeHead(303, {
-    location: target,
-    // SameSite=Lax (not Strict) so the cookie still rides a top-level
-    // navigation that started in another app. No Secure: this is plain HTTP.
-    'set-cookie': `${cookie}; Path=/; Max-Age=${maxAge}; SameSite=Lax`,
-    'content-type': 'text/html; charset=utf-8',
-    'cache-control': 'no-store, no-cache, must-revalidate',
-    'referrer-policy': 'no-referrer',
-    'content-length': Buffer.byteLength(html)
-  })
-  res.end(html)
-}
-
 /** Presentation authority: the name the browser used when it is one we serve. */
 function authorityFor(host) {
   return PUBLIC_AUTHORITIES.includes(host ?? '') ? host : PUBLIC_AUTHORITIES[0]
@@ -313,25 +273,51 @@ const server = createServer((req, res) => {
   // DSH stays the single authority that mints sessions. The web-app manifest is
   // public too: a 401 there makes iOS treat "Add to Home Screen" as broken.
   const hasToken = url.searchParams.has(TOKEN_QUERY)
-  if (cookie === undefined && !hasToken && url.pathname !== MANIFEST_PATH) {
-    // A browser landing on the GUI with no session is far more likely to be a
-    // bookmarked or typed address than an attack, so sign it in rather than
-    // showing DSH's 401. Sub-resources still get a hard 401: only top-level
-    // navigations are redirected, which also keeps this loop-free.
-    if (isDocumentRequest(req, url)) {
-      log('auto-login redirect for', req.headers.host)
-      // Relay only a path DSH actually serves; anything else lands on "/" so the
-      // user gets the GUI instead of a 404 from a stale deep bookmark.
-      const next = url.pathname === '/index.html' ? '/index.html' : '/'
-      writeBootstrap(res, authorityFor(req.headers.host), next)
-      return
-    }
+  const publicPath = url.pathname === MANIFEST_PATH
+
+  // A browser landing on the GUI with no session is far more likely to be a
+  // bookmarked or typed address than an attack, so serve it the GUI with a
+  // freshly minted session rather than showing DSH's 401. Sub-resources still
+  // get a hard 401: a fetch or image following a redirect to "/" would receive
+  // HTML under a resource content type.
+  const mint = cookie === undefined && !hasToken && !publicPath && isDocumentRequest(req, url)
+  if (cookie === undefined && !hasToken && !publicPath && !mint) {
     log('denied', req.method, req.url)
     writeUnauthorized(res, req.method)
     return
   }
-  const headers = upstreamHeaders(req.headers, cookie)
-  if (cookie === undefined) delete headers.cookie
+
+  // Signing in happens IN ONE HOP, by proxying with a minted cookie rather than
+  // redirecting to a login URL. Redirecting looks equivalent and is not: a
+  // client that cannot retain cookies follows the 303 back to "/", arrives
+  // cookieless again, and is sent round forever — measured with `curl -L`,
+  // which gave up after 50 redirects. Proxying in place hands such a client a
+  // real page, and browsers just save a round trip.
+  //
+  // A Referer-based guard against that loop was tried first and cannot work:
+  // this response sets `referrer-policy: no-referrer`, so the follow-up arrives
+  // with no Referer to detect. Do not reintroduce one.
+  let effective = cookie
+  let setCookie
+  if (mint) {
+    // Anchor expiresAt to the backdated issuedAt so the window stays exactly
+    // MAX_AGE_MILLISECONDS: DSH rejects a cookie whose span exceeds the limit.
+    const issuedAt = Date.now() - CLOCK_SKEW_MILLISECONDS
+    const expiresAt = issuedAt + MAX_AGE_MILLISECONDS
+    // TWO signings, because the two hops present different authorities: the
+    // browser stores a cookie bound to the name in its address bar, while DSH
+    // must receive one bound to the loopback authority it was launched on.
+    // Signing once and using it for both is a 401 — DSH checks the binding.
+    // SameSite=Lax (not Strict) so the cookie still rides a top-level
+    // navigation that started in another app. No Secure: this is plain HTTP.
+    const maxAge = Math.floor(MAX_AGE_MILLISECONDS / 1000)
+    setCookie = `${signFor(authorityFor(req.headers.host), issuedAt, expiresAt)}; Path=/; Max-Age=${maxAge}; SameSite=Lax`
+    effective = signFor(UPSTREAM_AUTHORITY, issuedAt, expiresAt)
+    log('auto-login for', req.headers.host)
+  }
+
+  const headers = upstreamHeaders(req.headers, effective)
+  if (effective === undefined) delete headers.cookie
   const upstream = httpRequest({
     host: '127.0.0.1',
     port: UPSTREAM_PORT,
@@ -339,7 +325,9 @@ const server = createServer((req, res) => {
     path: req.url,
     headers
   }, (upRes) => {
-    res.writeHead(upRes.statusCode ?? 502, upRes.headers)
+    const out = { ...upRes.headers }
+    if (setCookie !== undefined) out['set-cookie'] = setCookie
+    res.writeHead(upRes.statusCode ?? 502, out)
     upRes.pipe(res)
   })
   upstream.on('error', (error) => {

@@ -39,6 +39,7 @@ the launcher by hand. `boot-dsh.ps1` is the missing first half.
 | [`ts-dsh-bridge.mjs`](ts-dsh-bridge.mjs) | The loopback auth bridge. See below. |
 | [`ts-make-access.mjs`](ts-make-access.mjs) | Mints and verifies a session cookie for a given authority. Diagnostic. |
 | [`ts-acceptance.mjs`](ts-acceptance.mjs) | Checks the auth boundary through the tailnet: API requests are gated, document navigations auto-sign-in. |
+| [`pane-acceptance.mjs`](pane-acceptance.mjs) | The end-to-end gate: one command, five checks, non-zero exit on failure. |
 | [`pane-lease.mjs`](pane-lease.mjs) | Fail-closed per-tab ownership lease for the shared browser page. CLI + library. |
 | [`pane-lease-verify.mjs`](pane-lease-verify.mjs) | Twelve checks on the lease, including that corrupt state denies rather than grants. |
 | [`pane-input-proof.mjs`](pane-input-proof.mjs) | Measures the pane's coordinate transform: dispatches clicks, then you read back what was hit. |
@@ -97,9 +98,18 @@ and re-signs it for the loopback authority DSH expects, preserving the original
 `issuedAt`/`expiresAt` so re-signing never extends a session.
 
 **There is no key, password or login URL.** A top-level navigation that arrives
-without a session is signed in automatically and redirected to the GUI; API and
-asset requests are still verified per request, and answer 401 without a valid
-cookie.
+without a session is served the GUI in one hop, with a freshly minted cookie on
+the same response; API and asset requests are still verified per request, and
+answer 401 without a valid cookie.
+
+Signing in deliberately does **not** redirect. It proxies in place, because a
+client that cannot retain cookies would otherwise follow the redirect back to
+`/`, arrive cookieless again, and loop forever — measured with `curl -L`, which
+gave up after 50 redirects. Proxying in place hands such a client a real page and
+saves browsers a round trip. The cookie is signed **twice** per request, once
+bound to the authority in the browser's address bar and once bound to the
+loopback authority DSH was launched on; reusing a single signing for both hops
+produces a 401, because DSH checks the binding.
 
 Since the bridge is reachable only from loopback, and loopback is reachable only
 through `tailscale serve`, **tailnet membership is the access boundary**. That
