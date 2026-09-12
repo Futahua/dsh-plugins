@@ -178,7 +178,7 @@ const effects = [];
 exported.apply({ effect: (fn, label) => effects.push({ fn, label }) });
 check("registers both effects", effects.length === 2, String(effects.length));
 check("labels every effect", effects.every((e) => typeof e.label === "string"));
-check("publishes a build marker", globalThis.window.__dshMobileRail?.version === 6,
+check("publishes a build marker", globalThis.window.__dshMobileRail?.version === 5,
 	JSON.stringify(globalThis.window.__dshMobileRail));
 
 // apply() injects the stylesheet, so inspect it only after apply has run.
@@ -196,46 +196,18 @@ check("blanks the squeezed centre column", css.includes(":not([data-sidebar-coll
 // The blanking rule must not invent a colour; the glow below legitimately has one,
 // so this is checked against that exact rule rather than the whole sheet.
 check("the blanking rule paints no colour of its own (the app's background shows)",
-	css.includes("opacity:0!important;pointer-events:none!important}"), "rule text carries no background");
-check("the blanked content cannot be clicked through", css.includes("pointer-events:none!important"));
+	css.includes("> :nth-child(2) > *{visibility:hidden!important}"), "rule text carries no background");
 
 console.log("animation:");
-check("defines both slide keyframes",
-	css.includes("@keyframes dsh-mobile-rail-slide-in") && css.includes("@keyframes dsh-mobile-rail-slide-out"));
-check("slides the drawer rather than the track",
-	css.includes("animation:dsh-mobile-rail-slide-in") && css.includes("animation:dsh-mobile-rail-slide-out"));
-check("neither slide leaves a transform behind (no fill mode)",
-	!/animation:dsh-mobile-rail-slide-(?:in|out)[^}]*both/.test(css), "no `both`/`forwards`");
-check("shares one duration between the CSS and the hold-open timer",
-	source.includes("const RAIL_MS = 240") && source.includes("slide-out ${RAIL_MS}ms") &&
-		css.includes("slide-out 240ms"),
-	"the sheet is built from the constant the timer uses");
+check("defines the slide keyframes", css.includes("@keyframes dsh-mobile-rail-slide-in"));
+check("slides the drawer rather than the track", css.includes("animation:dsh-mobile-rail-slide-in"));
+check("the slide leaves no transform behind (no fill mode)",
+	!/animation:dsh-mobile-rail-slide-in[^}]*both/.test(css), "no `both`/`forwards`");
 check("the glow is blue", css.includes("rgba(88,150,255"));
 check("the glow fades rather than snapping", css.includes("transition:opacity 200ms ease-out"));
 check("the glow cannot swallow a tap", css.includes("pointer-events:none"));
 check("the glow sits above the drawer but below dialogs",
 	css.includes("z-index:15"), "overlay layer is 20");
-
-console.log("the cover fades, both ways:");
-check("fades instead of hiding", /:nth-child\(2\) > \*\{opacity:0!important/.test(css));
-check("the transition lives on a rule that always matches",
-	css.includes(":nth-child(2) > *{transition:opacity"),
-	"a transition declared only on the leaving state disappears with it and snaps");
-check("the fading rule is not the one gated on the drawer being open",
-	!css.includes("not([data-sidebar-collapsed]) > :nth-child(2) > *{transition"));
-
-console.log("closing holds the drawer open for one animation:");
-check("the closing rule needs both attributes (so it outranks the collapse)",
-	css.includes("[data-sidebar-collapsed][data-rail-closing] > :first-of-type"));
-check("it restores the measured width", css.includes("width:var(--dsh-rail-w,280px)!important"));
-check("it restores visibility", css.includes("visibility:visible!important"));
-check("it keeps the drawer over the already-expanded centre", css.includes("position:relative;z-index:16"));
-check("the width is remembered while open, not measured while closing",
-	source.includes("function rememberWidth") && source.includes("rememberWidth(el)"));
-check("the hold is released on a timer", source.includes("closingTimer = window.setTimeout"));
-check("the hold is cleaned up on unload", source.includes("closingOn?.removeAttribute"));
-check("watches the frame's collapsed attribute",
-	source.includes('attributeFilter: ["data-sidebar-collapsed"]'));
 // Deliberate, and measured: this phone reports prefers-reduced-motion because
 // Android's animation scales are 0.0, which would have hidden the effect entirely.
 check("animates regardless of the OS motion setting",

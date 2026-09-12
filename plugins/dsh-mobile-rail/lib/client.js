@@ -31,13 +31,12 @@
  *
  *  4. BLANK what is left. With the drawer open the product still lays the
  *     conversation out in the remaining 139px of a 419px viewport, where it is an
- *     unreadable sandwich of squeezed controls. That strip is covered by fading its
- *     content out — the app's own background shows through, so no colour is invented.
+ *     unreadable sandwich of squeezed controls. That strip is painted blank.
  *
- *  5. ANIMATE it. The band glows blue as the finger lands, the drawer slides in and
- *     back out again, and the cover fades with it, so a tap that rearranges the
- *     whole screen has a beginning and an end. All of it runs regardless of
- *     `prefers-reduced-motion`, deliberately — see the note at the end of the sheet.
+ *  5. ANIMATE it. The band glows blue as the finger lands and the drawer slides in
+ *     behind the light, so a tap that changes the whole layout has a beginning.
+ *     Both run regardless of `prefers-reduced-motion`, deliberately — see the note
+ *     at the end of the stylesheet.
  *
  * Nothing is shadowed, replaced, or removed from the product.
  *
@@ -98,34 +97,12 @@ window.__ModuleLoader__.load({
 		const GLOW_MS = 320;
 
 		/**
-		 * The drawer's travel time, in and out.
-		 *
-		 * Shared between the stylesheet animation and the timer that holds the drawer
-		 * open long enough to slide out of, so the two cannot drift apart.
-		 */
-		const RAIL_MS = 240;
-
-		/** How long the squeezed remainder takes to fade away, and to come back. */
-		const COVER_MS = 200;
-
-		/**
 		 * Width of the glow, twice the tap band so the light has somewhere to fall
 		 * off. The app itself is monochrome -- it exposes no accent colour to match
 		 * (checked: no blue custom properties, no coloured links) -- so this is a
 		 * chosen blue that reads on the `#151517` base, not a borrowed token.
 		 */
 		const GLOW_PX = 48;
-
-		/**
-		 * Root custom property holding the drawer's last known width.
-		 *
-		 * Set on `documentElement` rather than the frame because the frame's inline
-		 * `style` is managed by React. It exists because the closing animation needs
-		 * the width the drawer *had*: by the time the collapsed attribute is observed
-		 * the width has already computed to 0, and a hard-coded 280px would snap on any
-		 * drawer the user has resized.
-		 */
-		const WIDTH_VAR = "--dsh-rail-w";
 
 		/**
 		 * The frame element, identified WITHOUT a hashed class name.
@@ -168,12 +145,11 @@ window.__ModuleLoader__.load({
 		 * as well.
 		 */
 		const css = [
-			// The drawer slides, both ways. The grid track changes in a single commit,
-			// so the movement has to be a transform on the column itself. No fill mode:
-			// a transform left behind would make the column a containing block for
-			// anything fixed-position inside it.
+			// The drawer slides in instead of appearing. The grid track changes in one
+			// commit, so the movement has to be a transform on the column itself. No
+			// fill mode: a transform left behind would make the column a containing
+			// block for anything fixed-position inside it.
 			"@keyframes dsh-mobile-rail-slide-in{from{transform:translateX(-100%)}to{transform:translateX(0)}}",
-			"@keyframes dsh-mobile-rail-slide-out{from{transform:translateX(0)}to{transform:translateX(-100%)}}",
 			// Visual only. The tap band has no element of its own -- the gesture is read
 			// from a capture listener -- so this is what the finger's feedback is drawn
 			// on. `pointer-events:none` keeps it out of hit-testing completely, so it can
@@ -193,29 +169,23 @@ window.__ModuleLoader__.load({
 			// 1px sliver where the browser does honour it.
 			`.dsh-mobile-rail-frame[data-sidebar-collapsed]{`,
 			"grid-template-columns:0px minmax(0,1fr) 0px!important}",
-			// Closing: hold the drawer at its old width and visible for exactly one
-			// animation, or there is nothing left to slide out of -- the rule above
-			// would have collapsed it to 0px in the same commit. Two attribute
-			// selectors outrank the one above, so this wins with `!important` on both
-			// sides. `z-index:16` keeps it over the centre column, which is already
-			// back to full width underneath.
-			`.dsh-mobile-rail-frame[data-sidebar-collapsed][data-rail-closing] > :first-of-type{`,
-			`width:var(${WIDTH_VAR},280px)!important;min-width:var(${WIDTH_VAR},280px)!important;`,
-			"overflow:visible!important;visibility:visible!important;position:relative;z-index:16;",
-			`animation:dsh-mobile-rail-slide-out ${RAIL_MS}ms cubic-bezier(.4,0,.6,1)}`,
-			// The cover fades rather than snapping. The transition is declared on a rule
-			// that ALWAYS matches: a transition written only on the state being left
-			// disappears along with that state, and the change snaps instead of fading.
-			`.dsh-mobile-rail-frame > :nth-child(2) > *{transition:opacity ${COVER_MS}ms ease-out}`,
-			// Blanked: `pointer-events:none` so the invisible conversation cannot be
-			// scrolled or clicked through the cover.
+			// Expanded on a phone, the product keeps laying the conversation out in
+			// whatever is left of the row — measured 139px beside the 280px drawer,
+			// which renders the header, the tab strip, the messages, the file cards
+			// and the composer as an unreadable sandwich of squeezed controls.
+			//
+			// Blank that strip instead. The centre column paints no background of
+			// its own (`rgba(0,0,0,0)`), so hiding its content reveals the frame's
+			// background — the app's own base colour, correct in light and dark
+			// without hard-coding one. `:nth-child(2)` is the centre column: the
+			// frame's children are sidebar, centre, rightbar, overlay layer, handle.
 			`.dsh-mobile-rail-frame:not([data-sidebar-collapsed]) > :nth-child(2) > *{`,
-			"opacity:0!important;pointer-events:none!important}",
+			"visibility:hidden!important}",
 			// Slide the drawer in as it opens.
 			`.dsh-mobile-rail-frame:not([data-sidebar-collapsed]) > :first-of-type{`,
-			`animation:dsh-mobile-rail-slide-in ${RAIL_MS}ms cubic-bezier(.22,.72,.24,1)}`,
+			"animation:dsh-mobile-rail-slide-in 240ms cubic-bezier(.22,.72,.24,1)}",
 			"}",
-			// NOTE: these effects deliberately do NOT honour
+			// NOTE: these two effects deliberately do NOT honour
 			// `prefers-reduced-motion`, and that is a measured decision rather than an
 			// oversight. On the phone this was built for, Android's
 			// `animator_duration_scale`, `transition_animation_scale` and
@@ -428,72 +398,17 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * Remember the drawer's width while it is open.
+		 * Keep the frame marked despite React re-mounts.
 		 *
-		 * The closing animation needs the width the drawer *had*: by the time the
-		 * collapsed attribute can be observed, the stylesheet has already computed it
-		 * to 0, and measuring then would always yield nothing.
-		 * @param el the frame.
+		 * The class the stylesheet targets can disappear when the layout
+		 * re-mounts, so this watches for the frame and re-applies it. A
+		 * `MutationObserver` on the document body is the least invasive way to
+		 * do that: `childList` + `subtree` catches replacement without observing
+		 * every attribute in the tree.
 		 */
-		function rememberWidth(el) {
-			if (typeof document === "undefined") return;
-			const column = el.firstElementChild;
-			if (column === null) return;
-			const width = Math.round(column.getBoundingClientRect().width);
-			if (width > 0) document.documentElement.style.setProperty(WIDTH_VAR, `${width}px`);
-		}
-
-		/**
-		 * Keep the frame marked, and give a closing drawer something to slide out of.
-		 *
-		 * The class the stylesheet targets can disappear when the layout re-mounts, so
-		 * this watches for the frame and re-applies it. A `MutationObserver` on the
-		 * document body is the least invasive way to do that: `childList` + `subtree`
-		 * catches replacement without observing every attribute in the tree.
-		 *
-		 * The same pass watches the frame's own `data-sidebar-collapsed`, because
-		 * closing needs one extra step: the collapsed rules hide the drawer in the same
-		 * commit that the attribute appears, so without holding it open for the length
-		 * of the animation there would be nothing to slide out.
-		 */
-		function installFrameWatch() {
+		function installFrameMarker() {
 			if (typeof document === "undefined" || typeof MutationObserver === "undefined") return () => {};
 			markFrames();
-
-			/** The frame whose collapsed state is being watched. */
-			let watched = null;
-			let collapseObserver = null;
-			let closingTimer;
-			/** The frame currently held open for its closing animation. */
-			let closingOn = null;
-
-			/** Watch one frame's collapsed state, moving on when React replaces it. */
-			const watchCollapse = (el) => {
-				if (el === watched) return;
-				collapseObserver?.disconnect();
-				watched = el;
-				if (el === null) return;
-				collapseObserver = new MutationObserver(() => {
-					if (el.hasAttribute("data-sidebar-collapsed")) {
-						// Closing. Hold it open for exactly one animation.
-						el.setAttribute("data-rail-closing", "");
-						closingOn = el;
-						window.clearTimeout(closingTimer);
-						closingTimer = window.setTimeout(() => {
-							el.removeAttribute("data-rail-closing");
-							if (closingOn === el) closingOn = null;
-						}, RAIL_MS);
-					} else {
-						// Opening again: cancel any hold, and record the width to come back to.
-						window.clearTimeout(closingTimer);
-						el.removeAttribute("data-rail-closing");
-						closingOn = null;
-						rememberWidth(el);
-					}
-				});
-				collapseObserver.observe(el, { attributes: true, attributeFilter: ["data-sidebar-collapsed"] });
-			};
-
 			let queued = false;
 			const observer = new MutationObserver(() => {
 				if (queued) return;
@@ -502,21 +417,10 @@ window.__ModuleLoader__.load({
 				requestAnimationFrame(() => {
 					queued = false;
 					markFrames();
-					const el = frame();
-					watchCollapse(el);
-					// An install that lands while the drawer is already open still needs a
-					// width to close with.
-					if (el !== null && !el.hasAttribute("data-sidebar-collapsed")) rememberWidth(el);
 				});
 			});
 			observer.observe(document.documentElement, { childList: true, subtree: true });
-			watchCollapse(frame());
-			return () => {
-				observer.disconnect();
-				collapseObserver?.disconnect();
-				window.clearTimeout(closingTimer);
-				closingOn?.removeAttribute("data-rail-closing");
-			};
+			return () => observer.disconnect();
 		}
 
 		/**
@@ -527,14 +431,14 @@ window.__ModuleLoader__.load({
 		 * running?" a measurement instead of an assumption. Bumped whenever the
 		 * behaviour changes, so a stale bundle is detectable rather than plausible.
 		 */
-		const VERSION = 6;
+		const VERSION = 5;
 
 		const inject = [];
 
 		function apply(ctx) {
 			ensureStyles();
 			if (typeof window !== "undefined") window.__dshMobileRail = { version: VERSION, edgePx: EDGE_PX };
-			ctx.effect(() => installFrameWatch(), "dsh-mobile-rail: frame watch");
+			ctx.effect(() => installFrameMarker(), "dsh-mobile-rail: frame marker");
 			ctx.effect(() => installEdgeTaps(), "dsh-mobile-rail: edge taps");
 		}
 

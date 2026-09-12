@@ -7,7 +7,7 @@ developed and verified against a live installation.
 | --- | --- |
 | [`dsh-opencode-go-usage`](plugins/dsh-opencode-go-usage/) | Shows OpenCode Go subscription usage: a progress ring in the composer, and a nested-window panel on click |
 | [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
-| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its left edge back: hides the collapsed rail, opens the real sidebar from an edge tap (glowing band, drawer sliding both ways, cover fading), closes it on a tap beside it, and blanks the squeezed remainder |
+| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its left edge back: hides the collapsed rail, opens the real sidebar from an edge tap (glowing band, sliding drawer), closes it on a tap beside it, and blanks the squeezed remainder |
 
 ## Where this runs
 
@@ -159,19 +159,6 @@ Findings that cost real debugging time, recorded so they need not be rediscovere
 - **`/json/new` is refused on Android Chrome** (`500 Could not create new page`),
   while `Target.createTarget` on the browser socket works. Phone coordinates are
   CSS pixels — 419x747 here, not the 720x1380 of a screenshot.
-
-- **A transition declared only on the state being left does not run.** The cover
-  fades by animating `opacity` on the centre column's children, and the
-  `transition` had to be moved onto a rule that always matches: written inside the
-  state being left, the declaration disappears along with that state and the change
-  snaps instead of fading. Same shape of mistake as an animation whose keyframes are
-  removed at the moment they are needed.
-
-- **A closing drawer has to be held open to be seen leaving.** The collapsed rules
-  hide it in the same commit that the attribute appears, so nothing can react in
-  time; `dsh-mobile-rail` sets a `data-rail-closing` attribute for exactly the
-  animation's duration. The width it restores is recorded while the drawer is
-  *open*, because measuring at close time always yields 0.
 
 - **A phone with Android's animation scales at `0.0` reports
   `prefers-reduced-motion: reduce`.** That is a Developer-options speed setting,
