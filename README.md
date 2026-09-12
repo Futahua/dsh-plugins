@@ -7,7 +7,7 @@ developed and verified against a live installation.
 | --- | --- |
 | [`dsh-opencode-go-usage`](plugins/dsh-opencode-go-usage/) | Shows OpenCode Go subscription usage: a progress ring in the composer, and a nested-window panel on click |
 | [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
-| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its edges back: both the sidebar rail and the browser-agent pane become invisible edge bands, with a highlight under the finger, a flash on the click, and the real panel sliding in — and both stand down while you are typing |
+| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a touch device its screen back: both the sidebar rail and the browser-agent pane become invisible edge bands (highlight, flash, real panel sliding in, standing down while you type), and on iPadOS/iOS the shell is pinned above the on-screen keyboard |
 
 The operational scripts — bringing the harness up at boot, restarting it to load
 a plugin's host half, opening an authenticated GUI, and the Tailscale auth bridge
@@ -171,6 +171,23 @@ Findings that cost real debugging time, recorded so they need not be rediscovere
   inline value, so the fix needs no patch to the package — which matters, because an
   earlier revision *did* patch it inside `node_modules`, and `npm install` would have
   silently undone every one of those fixes.
+
+- **iPadOS and iOS never resize the layout viewport for the keyboard.** They shrink the
+  *visual* viewport (`window.visualViewport.height`) and leave the layout viewport at
+  full height, so an app whose shell is `html, body, #root { height: 100% }` ends up
+  with its composer under the keyboard — and Safari's own attempt to reveal the focused
+  field is a heuristic that sometimes runs and sometimes does not. `dsh-mobile-rail`
+  pins `#root` to the visual viewport while a text field has focus, which is inert on
+  Android and desktop because their layout viewport already shrinks. Guarded by a
+  focus test, a 120px shrink threshold, and a zoom check (`visualViewport.scale`) —
+  otherwise a pinch zoom would look exactly like a keyboard.
+
+- **A newly added bundle does not load without a `dsh web` restart.** Adding a package
+  to a profile's `dsh.profile.bundles` was measured not to change the served page's
+  boot graph, while `lib/client.js` edits in an already-mounted bundle hot-reload
+  immediately. That is why the keyboard fix lives inside `dsh-mobile-rail` rather than
+  in a plugin of its own: the separate package was built, registered, and confirmed
+  absent from the served graph, then folded in and removed.
 
 - **A tap an edge band claims never reaches the app.** Both bands call
   `stopPropagation`, which is what keeps a tap from activating something underneath —

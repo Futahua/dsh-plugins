@@ -112,7 +112,14 @@ const styleTags = [];
 const body = [];
 const documentStub = {
 	activeElement: null,
-	documentElement: { attrs: {}, setAttribute(n) { this.attrs[n] = ""; }, removeAttribute(n) { delete this.attrs[n]; }, hasAttribute(n) { return n in this.attrs; } },
+	documentElement: {
+		attrs: {},
+		/** The custom properties the keyboard fix writes. */
+		style: { props: {}, setProperty(n, v) { this.props[n] = v; }, removeProperty(n) { delete this.props[n]; } },
+		setAttribute(n) { this.attrs[n] = ""; },
+		removeAttribute(n) { delete this.attrs[n]; },
+		hasAttribute(n) { return n in this.attrs; },
+	},
 	querySelector: (selector) => {
 		if (selector === '[data-slot="sidebar"]') return sidebarSlot;
 		if (selector === ".dsh-mobile-rail-frame") return frameStub;
@@ -140,8 +147,31 @@ const documentStub = {
 		listeners.splice(listeners.findIndex((l) => l.type === type && l.fn === fn && l.capture === (capture === true)), 1),
 };
 globalThis.document = documentStub;
+/**
+ * A `visualViewport` this test can drive.
+ *
+ * iPadOS shrinks this instead of the layout viewport when the keyboard appears, and
+ * `window.innerHeight` stays put -- which is the entire bug the keyboard half fixes.
+ * Modelling it here is what lets that half be checked without an iPad.
+ */
+const viewport = {
+	height: 1024,
+	offsetTop: 0,
+	scale: 1,
+	listeners: {},
+	addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); },
+	removeEventListener(type, fn) {
+		const list = this.listeners[type] ?? [];
+		const at = list.indexOf(fn);
+		if (at >= 0) list.splice(at, 1);
+	},
+	/** Fire an event the way the platform would. */
+	emit(type) { for (const fn of [...(this.listeners[type] ?? [])]) fn(); },
+};
 globalThis.window = {
 	innerWidth: 419,
+	innerHeight: 1024,
+	visualViewport: viewport,
 	__ModuleLoader__: { load: (value) => { globalThis.__registration = value; } },
 	setTimeout: (fn, ms) => setTimeout(fn, ms),
 	clearTimeout: (id) => clearTimeout(id),
@@ -151,8 +181,13 @@ globalThis.window = {
 	// a tab that does not render) is verified on the phone instead.
 	setInterval: () => 0,
 	clearInterval: () => {},
-	addEventListener: () => {},
-	removeEventListener: () => {},
+	addEventListener: (type, fn) => { (globalThis.window.listeners[type] ??= []).push(fn); },
+	removeEventListener: (type, fn) => {
+		const list = globalThis.window.listeners[type] ?? [];
+		const at = list.indexOf(fn);
+		if (at >= 0) list.splice(at, 1);
+	},
+	listeners: {},
 };
 globalThis.MutationObserver = class { observe() {} disconnect() {} };
 globalThis.requestAnimationFrame = (fn) => setTimeout(() => fn(0), 0);
@@ -182,12 +217,12 @@ check("finds the browser pane toggle", paneFound?.label === PANE_TOGGLE, String(
 console.log("effect registration:");
 const effects = [];
 exported.apply({ effect: (fn, label) => effects.push({ fn, label }) });
-check("registers both effects", effects.length === 2, String(effects.length));
+check("registers all three effects", effects.length === 3, String(effects.length));
 check("labels every effect", effects.every((e) => typeof e.label === "string"));
 check("publishes a build marker with both edges",
-	globalThis.window.__dshMobileRail?.version === 9 &&
+	globalThis.window.__dshMobileRail?.version === 10 &&
 		JSON.stringify(globalThis.window.__dshMobileRail?.edges) === '["left","right"]',
-	JSON.stringify(globalThis.window.__dshMobileRail));
+	JSON.stringify({ version: globalThis.window.__dshMobileRail?.version, edges: globalThis.window.__dshMobileRail?.edges }));
 
 console.log("CSS injected:");
 check("exactly one style tag", styleTags.length === 1, `${styleTags.length}`);
@@ -446,6 +481,72 @@ release(RIGHT, 400);
 check("the right band opens the pane again", paneOpen === true && activations === beforeRight + 1);
 press(5, 400);
 check("and a tap beside the pane closes it again", paneOpen === false);
+
+console.log("the keyboard, on a platform that does not resize the layout viewport:");
+// iPadOS with the keyboard up: the layout viewport is untouched (innerHeight), the
+// visual viewport is shorter by the keyboard, and a text field has focus.
+documentStub.activeElement = textField("DIV", { isContentEditable: true });
+viewport.height = 1024 - 346;
+viewport.offsetTop = 0;
+viewport.emit("resize");
+const root = documentStub.documentElement;
+check("a keyboard-sized shrink with a focused field pins the shell",
+	root.hasAttribute("data-dsh-keyboard") === true);
+check("the shell is told exactly how tall the visible area is",
+	root.style.props["--dsh-keyboard-height"] === "678px", String(root.style.props["--dsh-keyboard-height"]));
+check("and where it starts", root.style.props["--dsh-keyboard-top"] === "0px", String(root.style.props["--dsh-keyboard-top"]));
+
+// Safari pans the visual viewport to reveal a field; the layout viewport does not move.
+viewport.height = 678;
+viewport.offsetTop = 40;
+viewport.emit("scroll");
+check("Safari's own panning is compensated for",
+	root.style.props["--dsh-keyboard-top"] === "40px", String(root.style.props["--dsh-keyboard-top"]));
+
+// The keyboard goes away.
+viewport.height = 1024;
+viewport.offsetTop = 0;
+viewport.emit("resize");
+check("and the shell is released when it does",
+	root.hasAttribute("data-dsh-keyboard") === false &&
+		root.style.props["--dsh-keyboard-height"] === undefined &&
+		root.style.props["--dsh-keyboard-top"] === undefined);
+
+// A pinch zoom shrinks the visual viewport exactly like a keyboard does.
+viewport.height = 600;
+viewport.scale = 2;
+viewport.emit("resize");
+check("a pinch zoom is not mistaken for a keyboard", root.hasAttribute("data-dsh-keyboard") === false);
+viewport.scale = 1;
+
+// Safari's own toolbars move the visual viewport by tens of pixels, not hundreds.
+viewport.height = 1024 - 60;
+viewport.emit("resize");
+check("a toolbar-sized change is not mistaken for a keyboard",
+	root.hasAttribute("data-dsh-keyboard") === false);
+
+// No text field focused: whatever shrank the viewport, this is not our business.
+viewport.height = 1024 - 346;
+documentStub.activeElement = null;
+viewport.emit("resize");
+check("without a focused text field nothing is pinned", root.hasAttribute("data-dsh-keyboard") === false);
+
+// Android and desktop resize the layout viewport, so there is nothing to compensate.
+documentStub.activeElement = textField("TEXTAREA");
+viewport.height = 1024 - 346;
+globalThis.window.innerHeight = 1024 - 346;
+viewport.emit("resize");
+check("where the layout viewport does shrink, the plugin stays out of the way",
+	root.hasAttribute("data-dsh-keyboard") === false, "covered is 0");
+globalThis.window.innerHeight = 1024;
+
+// A focused checkbox is still not typing.
+documentStub.activeElement = textField("INPUT", { getAttribute: (n) => (n === "type" ? "checkbox" : null) });
+viewport.height = 1024 - 346;
+viewport.emit("resize");
+check("and a focused checkbox does not pin it either", root.hasAttribute("data-dsh-keyboard") === false);
+documentStub.activeElement = null;
+viewport.height = 1024;
 
 console.log("unloading:");
 for (const dispose of disposers) if (typeof dispose === "function") dispose();

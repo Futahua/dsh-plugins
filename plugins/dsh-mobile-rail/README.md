@@ -1,10 +1,12 @@
 # dsh-mobile-rail
 
-Gives a phone its edges back: two invisible bands, two real panels.
+Gives a touch device its screen back: two invisible bands, two real panels, and a
+shell that stays above the keyboard.
 
 ## The problem
 
-A phone has two rails it never asked for.
+A touch device has two rails it never asked for, and a keyboard that lands on top of
+the composer.
 
 **The left one** is the sidebar. On a narrow viewport the layout collapses it to a
 permanent 56px rail — it never goes away, because `computeColumns` maps a zero
@@ -30,6 +32,16 @@ is a 34px full-height strip that reserves its width the same way. The packaged
 default is also `collapsed = false`, on every load, on every device, and the choice
 is not persisted — so a phone opens a full-screen pane every time.
 
+**The third** is the keyboard, and it is an iPad and iPhone problem. The shell sizes
+itself with percentages — `html, body, #root { height: 100% }` — and a percentage
+resolves against the **layout** viewport. Android and desktop resize that viewport
+when the keyboard appears, so the composer rises on its own and there is nothing to
+fix. iPadOS and iOS resize only the **visual** viewport
+(`window.visualViewport.height`) and leave the layout viewport at full height, so the
+composer sits at the bottom of a box that still reaches under the keyboard. Safari
+sometimes pans the visual viewport to reveal the focused field and sometimes does not,
+which is the "it pushes everything up, except when it decides not to" behaviour.
+
 ## What this does
 
 Both edges get the same treatment, and both are driven entirely from this plugin.
@@ -47,6 +59,8 @@ Both edges get the same treatment, and both are driven entirely from this plugin
 | 9 | Tap beside the open pane closes it | `clientX <` the panel's left edge |
 | 10 | Settle the pane's packaged expanded default once, without a flash | `html[data-dsh-pane-boot]` + the pane's own toggle |
 | 11 | Stand down entirely while a text field has focus | `document.activeElement` is an editable field |
+| 12 | Pin the shell above the on-screen keyboard | `html[data-dsh-keyboard] #root` + `--dsh-keyboard-height` |
+| 13 | Follow Safari's own panning | `--dsh-keyboard-top` from `visualViewport.offsetTop` |
 
 Both bands behave like buttons: the band **highlights** while a finger is on it (even
 a thumb brushing past), the **click flashes** it, and only a **tap** opens anything —
@@ -127,6 +141,45 @@ which can be missed), and it is deliberately narrow:
 A bare `[role="textbox"]` is **not** enough: a session-less composer renders the same
 DOM inert, and an inert field holding focus must not disable the bands.
 
+## The keyboard, on iPad and iPhone
+
+While a text field holds focus and the visual viewport is shorter than the layout
+viewport by more than a keyboard's worth, the shell is pinned to the visual viewport:
+
+```css
+html[data-dsh-keyboard] #root {
+  position: fixed;
+  top: var(--dsh-keyboard-top, 0px);
+  height: var(--dsh-keyboard-height, 100%);
+}
+```
+
+`#root` is the app's own container (`<div id="root">` in the served page, and
+`document.getElementById("root")` in the bundle), and it is the element whose
+`height: 100%` chain decides where the composer sits. Pinned, the shell ends exactly
+where the keyboard begins: the conversation takes the remaining space and the composer
+sits on top of the keyboard — every time, rather than when the browser feels like it.
+`--dsh-keyboard-top` compensates for Safari's own panning, which moves what is visible
+without moving the layout viewport.
+
+The geometry is refreshed on every `resize` and `scroll` of the visual viewport rather
+than on a timer, because iOS fires those events *throughout* the keyboard's animation:
+following them moves the shell with the keyboard instead of snapping it into place
+afterwards.
+
+Three conditions guard it, so it cannot fire when it should not — and because of them
+the plugin is completely inert on desktop, on Android, and on an iPad with a hardware
+keyboard attached:
+
+| Condition | Why |
+| --- | --- |
+| a text field has focus | the same viewport measurement shrinks for other reasons |
+| the shrink is ≥ 120px (`MIN_KEYBOARD_PX`) | a software keyboard is a few hundred px; Safari's collapsible toolbars are tens |
+| `visualViewport.scale <= 1.01` | a pinch zoom shrinks the visual viewport exactly like a keyboard, and pinning the shell mid-zoom would be wrong |
+
+The composer check is shared with the edge bands above: one `isTyping()` predicate, so
+"is the user typing" has one definition in this plugin.
+
 ## Failure modes
 
 Stated plainly, because an earlier revision failed silently and looked like it had
@@ -142,6 +195,17 @@ worked:
 - The typing stand-down relies on focus staying on the editable element. If a future
   composer keeps focus on a wrapper that is neither editable nor inside
   `[data-composer-input]`, the bands would stay live while typing.
+- The keyboard fix relies on the shell staying `#root` with a percentage height. If a
+  future build gives `#root` — or the frame inside it — a `vh`/`dvh` height, that
+  element would keep the layout-viewport height and ignore the pin. (Checked in the
+  current build: the only `vh`/`dvh` rules are `max-height` caps on dialogs and
+  popovers, which is harmless.)
+- The keyboard fix is the one behaviour in this plugin that could not be verified on
+  real hardware: it needs an iPad or iPhone, and the phone this project was built
+  against is Android. It is covered by checks that drive a simulated
+  `visualViewport` — pin, exact geometry, pan compensation, release, zoom, toolbar
+  threshold, no focus, and the already-resized case — but the first real-device
+  confirmation is the user reloading the iPad.
 - **Background tabs do not run `requestAnimationFrame`.** The first version of this
   plugin coalesced its work through rAF, so it did nothing at all in a freshly
   created Android Chrome tab (which is a background tab until you look at it):

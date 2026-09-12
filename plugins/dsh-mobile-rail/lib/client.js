@@ -1,5 +1,16 @@
 /**
- * Give a phone its edges back: two invisible bands, two real panels.
+ * Give a touch device its screen back: two invisible bands, two real panels, and a
+ * shell that stays above the keyboard.
+ *
+ * The two halves are independent and fail independently:
+ *
+ *   1. EDGES (a phone). Both the sidebar rail and the browser-agent pane are replaced
+ *      by invisible edge bands that open the real panels.
+ *   2. KEYBOARD (an iPad or iPhone). iPadOS and iOS shrink only the *visual* viewport
+ *      for the on-screen keyboard, so a shell sized in percentages ends up with its
+ *      composer behind the keyboard. While a text field has focus the shell is pinned
+ *      to the visual viewport instead. Android and desktop already resize the layout
+ *      viewport, so this half does nothing there.
  *
  * Left edge — the sidebar drawer, which the product collapses to a permanent 56px
  * rail on a narrow viewport (`dsh-client-ui-layout` writes an inline
@@ -78,6 +89,29 @@ window.__ModuleLoader__.load({
 
 		/** The slide-in duration, shared with the stylesheet so the two cannot drift. */
 		const RAIL_MS = 240;
+
+		/**
+		 * How much the visual viewport must shrink before it is treated as a keyboard.
+		 *
+		 * A software keyboard is a few hundred pixels; Safari's own collapsing toolbars
+		 * are tens. 120px sits between the two with room on both sides — the smallest
+		 * phone keyboard is ~216px, and the largest toolbar change measured is ~60px.
+		 */
+		const MIN_KEYBOARD_PX = 120;
+
+		/**
+		 * Zoom tolerance for the keyboard check.
+		 *
+		 * `visualViewport.scale` is 1 with no zoom, and floating-point noise can make it
+		 * 1.0000001. A pinch zoom shrinks the visual viewport exactly like a keyboard
+		 * does, and pinning the shell mid-zoom would be actively wrong.
+		 */
+		const SCALE_TOLERANCE = 1.01;
+
+		/** The root attribute and custom properties the keyboard fix owns. */
+		const KEYBOARD_FLAG = "data-dsh-keyboard";
+		const KEYBOARD_HEIGHT_VAR = "--dsh-keyboard-height";
+		const KEYBOARD_TOP_VAR = "--dsh-keyboard-top";
 
 		/**
 		 * Input types that are not text entry.
@@ -610,6 +644,80 @@ window.__ModuleLoader__.load({
 			};
 		}
 
+		/* ------------------------------------------------------------ keyboard inset */
+
+		/**
+		 * Pin the shell to the visual viewport while a keyboard covers part of it.
+		 *
+		 * This is the iPad and iPhone fix, and it is inert everywhere else: Android and
+		 * desktop resize the layout viewport for the keyboard, so the shell already ends
+		 * where the keyboard begins and the shrink test below never fires. A device with
+		 * a hardware keyboard attached fires nothing either.
+		 *
+		 * It reuses `isTyping()` from the edge bands, which is the same question — is a
+		 * text field focused — because "the viewport is short" alone is not enough: the
+		 * visual viewport also shrinks for zoom and for Safari's toolbars.
+		 *
+		 * Runs on every event rather than on a timer: iOS fires `resize` throughout the
+		 * keyboard's own animation, so following the events moves the shell with the
+		 * keyboard instead of snapping it into place afterwards.
+		 */
+		function installKeyboardInset() {
+			if (typeof document === "undefined" || typeof window === "undefined") return () => {};
+			const vv = window.visualViewport;
+			// No visual viewport: the layout viewport is all this browser has, and the
+			// problem cannot be fixed from the page anyway.
+			if (vv === null || vv === undefined) return () => {};
+
+			const root = document.documentElement;
+			const style = root.style;
+			let pinned = false;
+
+			const update = () => {
+				const covered = Math.round(window.innerHeight - vv.height);
+				const wanted = isTyping() &&
+					(vv.scale ?? 1) <= SCALE_TOLERANCE &&
+					covered >= MIN_KEYBOARD_PX;
+				if (wanted) {
+					// Refreshed on every event: Safari animates the keyboard in, and pans the
+					// visual viewport as it goes.
+					style.setProperty(KEYBOARD_HEIGHT_VAR, `${Math.round(vv.height)}px`);
+					style.setProperty(KEYBOARD_TOP_VAR, `${Math.round(vv.offsetTop)}px`);
+				}
+				if (wanted === pinned) return;
+				pinned = wanted;
+				if (wanted) {
+					root.setAttribute(KEYBOARD_FLAG, "");
+				} else {
+					root.removeAttribute(KEYBOARD_FLAG);
+					style.removeProperty(KEYBOARD_HEIGHT_VAR);
+					style.removeProperty(KEYBOARD_TOP_VAR);
+				}
+			};
+
+			vv.addEventListener("resize", update);
+			vv.addEventListener("scroll", update);
+			window.addEventListener("resize", update);
+			window.addEventListener("orientationchange", update);
+			// Focus can change without either viewport moving (a tap between two fields),
+			// and focus is what decides whether this applies at all.
+			document.addEventListener("focusin", update);
+			document.addEventListener("focusout", update);
+			update();
+
+			return () => {
+				vv.removeEventListener("resize", update);
+				vv.removeEventListener("scroll", update);
+				window.removeEventListener("resize", update);
+				window.removeEventListener("orientationchange", update);
+				document.removeEventListener("focusin", update);
+				document.removeEventListener("focusout", update);
+				root.removeAttribute(KEYBOARD_FLAG);
+				style.removeProperty(KEYBOARD_HEIGHT_VAR);
+				style.removeProperty(KEYBOARD_TOP_VAR);
+			};
+		}
+
 		/* -------------------------------------------------------------------- css */
 
 		const css = [
@@ -678,6 +786,24 @@ window.__ModuleLoader__.load({
 			// is hidden, so a phone never flashes a full-screen panel on load.
 			'html[data-dsh-pane-boot] [data-dsh-browser-pane="expanded"]{display:none!important}',
 			"}",
+			// --- the keyboard, on the platforms that do not make room for it ------------
+			// Deliberately NOT inside the media query above: this is the iPad's problem,
+			// and an iPad is wider than 768px.
+			//
+			// The shell sizes itself with `html,body,#root{height:100%}`, and a percentage
+			// resolves against the LAYOUT viewport. Android and desktop resize that
+			// viewport for the keyboard, so their composer rises on its own. iPadOS and
+			// iOS resize only the VISUAL viewport (`visualViewport.height`), leaving the
+			// shell full height with the composer behind the keyboard -- and Safari pans
+			// the visual viewport to reveal the field only sometimes, which is the
+			// unpredictable behaviour this replaces.
+			//
+			// Pinned, the shell ends exactly where the keyboard begins: the conversation
+			// takes the remaining space and the composer sits on top of the keyboard.
+			// `top` compensates for Safari's own panning, which moves what is visible
+			// without moving the layout viewport.
+			`html[${KEYBOARD_FLAG}] #root{`,
+			`position:fixed;top:var(${KEYBOARD_TOP_VAR},0px);left:0;right:0;height:var(${KEYBOARD_HEIGHT_VAR},100%)}`,
 			// NOTE: these effects deliberately do NOT honour `prefers-reduced-motion`, and
 			// that is a measured decision rather than an oversight. On the phone this was
 			// built for, Android's `animator_duration_scale`,
@@ -708,17 +834,27 @@ window.__ModuleLoader__.load({
 		 * swap; a version on the window makes "is the new bundle running?" a measurement
 		 * instead of an assumption.
 		 */
-		const VERSION = 9;
+		const VERSION = 10;
 
 		const inject = [];
 
 		function apply(ctx) {
 			ensureStyles();
 			if (typeof window !== "undefined") {
-				window.__dshMobileRail = { version: VERSION, edgePx: EDGE_PX, edges: EDGES.map((e) => e.side) };
+				window.__dshMobileRail = {
+					version: VERSION,
+					edgePx: EDGE_PX,
+					edges: EDGES.map((e) => e.side),
+					minKeyboardPx: MIN_KEYBOARD_PX,
+					/** Is the shell pinned above the keyboard right now? */
+					get keyboardPinned() {
+						return document.documentElement.hasAttribute(KEYBOARD_FLAG);
+					},
+				};
 			}
 			ctx.effect(() => installFrameWatch(), "dsh-mobile-rail: frame watch");
 			ctx.effect(() => installEdgeTaps(), "dsh-mobile-rail: edge taps");
+			ctx.effect(() => installKeyboardInset(), "dsh-mobile-rail: keyboard inset");
 		}
 
 		exports.apply = apply;
