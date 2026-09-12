@@ -48,6 +48,7 @@ the launcher by hand. `boot-dsh.ps1` is the missing first half.
 | [`input-test.html`](input-test.html) | Scroll / drag / type target page for the above. |
 | [`phone-eval.mjs`](phone-eval.mjs) | Evaluate JS in a chosen tab of the phone's Chrome over the adb CDP forward. |
 | [`phone-touch-proof.mjs`](phone-touch-proof.mjs) | Aim a real touch at a *fraction* of the pane image, and derive the expected page coordinate from the same fraction. |
+| [`pane-teardown-check.mjs`](pane-teardown-check.mjs) | Looks for a leaked browser after a restart: every live instance must be parented and postdate the server. |
 
 ## Pane ownership, and what a lease can actually enforce
 
