@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DSH pane coordinate probe</title>
+<style>
+  html, body { margin: 0; height: 100%; }
+  /* Four known quadrants, each a click target with a distinct id. */
+  #g { position: fixed; inset: 0; display: grid;
+       grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+  #g div { display: flex; align-items: center; justify-content: center;
+           font: 700 32px system-ui, sans-serif; color: #fff;
+           user-select: none; }
+  #tl { background: #c0392b; } #tr { background: #27ae60; }
+  #bl { background: #2980b9; } #br { background: #f39c12; }
+  #log { position: fixed; left: 8px; bottom: 8px; z-index: 9;
+         background: rgba(0,0,0,.8); color: #0f0;
+         font: 14px ui-monospace, monospace; padding: 6px 10px; }
+</style>
+<div id="g">
+  <div id="tl">TL</div><div id="tr">TR</div>
+  <div id="bl">BL</div><div id="br">BR</div>
+</div>
+<div id="log">clicks:0</div>
+<script>
+  // Record every click with its page-space coordinate, so a dispatched event
+  // can be checked against the element it was supposed to hit.
+  window.__hits = [];
+  window.__probe = () => ({
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    dpr: window.devicePixelRatio,
+    hits: window.__hits,
+  });
+  for (const el of document.querySelectorAll('#g div')) {
+    el.addEventListener('click', (e) => {
+      window.__hits.push({ id: el.id, x: e.clientX, y: e.clientY });
+      document.getElementById('log').textContent =
+        'clicks:' + window.__hits.length + ' last:' + el.id;
+    });
+  }
+</script>

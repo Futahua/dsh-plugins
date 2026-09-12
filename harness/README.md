@@ -39,6 +39,52 @@ the launcher by hand. `boot-dsh.ps1` is the missing first half.
 | [`ts-dsh-bridge.mjs`](ts-dsh-bridge.mjs) | The loopback auth bridge. See below. |
 | [`ts-make-access.mjs`](ts-make-access.mjs) | Mints and verifies a session cookie for a given authority. Diagnostic. |
 | [`ts-acceptance.mjs`](ts-acceptance.mjs) | Checks the auth boundary through the tailnet: API requests are gated, document navigations auto-sign-in. |
+| [`pane-lease.mjs`](pane-lease.mjs) | Fail-closed per-tab ownership lease for the shared browser page. CLI + library. |
+| [`pane-lease-verify.mjs`](pane-lease-verify.mjs) | Twelve checks on the lease, including that corrupt state denies rather than grants. |
+| [`pane-input-proof.mjs`](pane-input-proof.mjs) | Measures the pane's coordinate transform: dispatches clicks, then you read back what was hit. |
+| [`coord-test.html`](coord-test.html) | The 2×2 target page those clicks are aimed at. |
+
+## Pane ownership, and what a lease can actually enforce
+
+The browser pane and an automation script drive **one shared page**, and nothing
+arbitrates between them. An automated run clicking through a flow will fight a
+human using the pane, and both will see a page behaving inexplicably.
+
+Two facts decide what can be done about it, both measured rather than assumed:
+
+1. **The pane's input route needs a live stream subscriber.** It reads a CDP
+   handle that only exists while an SSE client is attached (`pane.ts`, "the
+   screencast follows its subscribers"). Posting input with nobody watching is
+   rejected with `400 browser not ready`.
+2. **There is no hook to make that route refuse input.** The package registers
+   its routes directly on the web server and exposes no interception point.
+
+So a lease **cannot** stop a human clicking, and any design claiming otherwise
+would be theatre. What it *can* do — and where the real damage comes from — is
+stop an **automation** driving while somebody else holds the page. That boundary
+is ours, so it is enforceable there, and it fails closed:
+
+```js
+import { withLease } from './pane-lease.mjs'
+
+await withLease({ owner: 'my-run' }, async () => {
+  // Never runs if the page is already held.
+})
+```
+
+`pane-lease.mjs` keeps state in one JSON file taken atomically, so two racing
+acquirers cannot both win. Leases expire, so a crashed run cannot wedge the
+page. Unreadable, malformed or corrupt state reads as **held**, never free —
+failing open is the one bug that would make the whole thing worthless.
+
+The visible half lives in the page, not the GUI: `bannerScript(owner)` returns a
+JS expression any driver can evaluate, so the human watching the pane sees who
+has taken the page and until when. The banner is `pointer-events:none` — a
+takeover notice that swallowed clicks would be worse than none.
+
+Verified: 12/12 checks pass, and an A/B on the same automation with the same
+coordinates gave **0 clicks** while the lease was held and **2 clicks** at the
+expected coordinates once it was free.
 
 ## Why a bridge exists at all
 
