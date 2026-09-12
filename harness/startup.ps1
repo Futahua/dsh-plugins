@@ -90,9 +90,7 @@ if (Test-Path $tailscale) {
 
 Say "ready: http://sloptop.taild88607.ts.net:$servePort/"
 
-# --- 4. Surface the one-tap login link ----------------------------------------
-$keyFile = Join-Path $dshHome 'ts-bridge-key'
-if (Test-Path $keyFile) {
-    $key = (Get-Content $keyFile -Raw).Trim()
-    if ($key -ne '') { Say "login:  http://sloptop.taild88607.ts.net:$servePort/__dsh_login?key=$key" }
-}
+# --- 4. Say where the GUI is --------------------------------------------------
+# No login link to print any more: the bridge signs in any device that reaches
+# it, so tailnet membership is the only credential. See ts-dsh-bridge.mjs.
+Say "open:   any device on the tailnet -> http://sloptop.taild88607.ts.net:$servePort/"

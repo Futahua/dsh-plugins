@@ -16,8 +16,8 @@
 // cookie's own issuedAt/expiresAt, so the bridge cannot extend a session.
 //
 // Binds 127.0.0.1 only: reachable exclusively through Tailscale Serve.
-import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
 import { connect } from 'node:net'
 import { join } from 'node:path'
@@ -61,13 +61,21 @@ const COOKIE_PREFIX = 'dsh-auth-'
 const COOKIE_VERSION = 'v1'
 const TOKEN_QUERY = 'token'
 
-// One-tap login: /__dsh_login?key=<token> sets the session cookie and bounces
-// to the GUI. Needed on phones, where DevTools cannot set a cookie by hand, and
-// where typing a 300-character cookie into a URL bar is impractical.
-// The key persists across restarts so a home-screen bookmark keeps working.
-const BRIDGE_DIR = import.meta.dirname ?? process.cwd()
-const KEY_FILE = process.env.BRIDGE_KEY_FILE ?? join(BRIDGE_DIR, 'ts-bridge-key')
-const LOGIN_PATH = '/__dsh_login'
+// There is deliberately NO login key, password or bootstrap token here.
+//
+// The bridge signs in any top-level document navigation that arrives without a
+// session (the `cookie === undefined` branch below), because a browser landing
+// on the GUI is overwhelmingly a bookmark rather than an attack. Everything
+// that can reach these authorities is already on the tailnet, and tailnet
+// membership is the real access boundary.
+//
+// A key on top of that was a second door into a room with no walls: it never
+// denied anybody who could reach the port, it was only something to carry
+// around, paste into chat, and leak. Removing it changes no security property
+// that was actually being enforced — it removes the illusion of one.
+//
+// Do not reintroduce one. If access ever needs to be restricted, restrict the
+// tailnet (ACLs, device approval), which is the layer that actually gates.
 const MANIFEST_PATH = '/manifest.webmanifest'
 // Loopback health probe used by startup.ps1 to wait until DSH is actually
 // serving before the bridge starts forwarding to it.
@@ -76,22 +84,6 @@ const MAX_AGE_MILLISECONDS = 30 * 1440 * 60 * 1000
 // Backdate issuedAt to tolerate verifier-clock skew. Applied before the window
 // is computed, so it shortens a session rather than extending it.
 const CLOCK_SKEW_MILLISECONDS = 60 * 1000
-
-function loadBootstrapKey() {
-  if (process.env.BRIDGE_KEY) return process.env.BRIDGE_KEY.trim()
-  try {
-    if (existsSync(KEY_FILE)) {
-      const existing = readFileSync(KEY_FILE, 'utf8').trim()
-      if (/^[A-Za-z0-9_-]{20,}$/u.test(existing)) return existing
-    }
-  } catch { /* fall through and mint a new key */ }
-  const minted = randomBytes(32).toString('base64')
-    .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
-  try { writeFileSync(KEY_FILE, minted + '\n', { mode: 0o600 }) } catch { /* non-fatal */ }
-  return minted
-}
-
-const BOOTSTRAP_KEY = loadBootstrapKey()
 
 const b64url = (buf) => Buffer.from(buf).toString('base64')
   .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/u, '')
@@ -228,14 +220,18 @@ function writeUnauthorized(res, method) {
     'cache-control': 'no-store, no-cache, must-revalidate',
     'content-type': 'text/plain; charset=utf-8'
   })
-  res.end(method === 'HEAD' ? undefined : 'dsh web authentication required; reopen the URL printed by dsh web.\n')
+  res.end(method === 'HEAD' ? undefined : 'dsh web authentication required; open the GUI URL to sign in.\n')
 }
 
 /**
- * One-tap login. The cookie is issued by the server as a Set-Cookie header and
- * the redirect is a plain Location hop, so no JavaScript is involved: Safari
- * (and iOS in general) is unreliable about document.cookie writes during a
- * page-load navigation, and Private Browsing silently drops them.
+ * Sign a browser in and bounce it to the GUI. Used for any top-level navigation
+ * that arrives without a session; there is no key or password involved, because
+ * anything able to reach this port is already on the tailnet.
+ *
+ * The cookie is issued by the server as a Set-Cookie header and the redirect is
+ * a plain Location hop, so no JavaScript is involved: Safari (and iOS in
+ * general) is unreliable about document.cookie writes during a page-load
+ * navigation, and Private Browsing silently drops them.
  *
  * Presentation is chosen from the Host header so the cookie is bound to exactly
  * the authority the browser used, which is the one the hop back to DSH presents.
@@ -312,20 +308,6 @@ const server = createServer((req, res) => {
     return
   }
 
-  // Login bootstrap: authorized by its own unguessable key, never by a cookie.
-  if (url.pathname === LOGIN_PATH) {
-    const presented = Buffer.from(url.searchParams.get('key') ?? '', 'utf8')
-    const expected = Buffer.from(BOOTSTRAP_KEY, 'utf8')
-    if (presented.byteLength !== expected.byteLength || !timingSafeEqual(presented, expected)) {
-      log('denied bootstrap', req.socket.remoteAddress)
-      writeUnauthorized(res, req.method)
-      return
-    }
-    log('bootstrap login issued for', authorityFor(req.headers.host))
-    writeBootstrap(res, authorityFor(req.headers.host))
-    return
-  }
-
   const cookie = upstreamCookie(req.headers.cookie)
   // A token-bearing root URL is DSH's own launch handshake; let it through so
   // DSH stays the single authority that mints sessions. The web-app manifest is
@@ -394,6 +376,7 @@ server.on('upgrade', (req, socket) => {
 server.listen(LISTEN_PORT, '127.0.0.1', () => {
   log(`bridge listening on http://127.0.0.1:${LISTEN_PORT} -> http://${UPSTREAM_AUTHORITY}`)
   log(`public authorities: ${PUBLIC_AUTHORITIES.join(', ')}`)
-  log('auth: browser cookie verified per request; no session is minted for anonymous callers')
-  log(`one-tap login: http://${PUBLIC_AUTHORITIES[0]}${LOGIN_PATH}?key=${BOOTSTRAP_KEY}`)
+  log('auth: top-level navigations are signed in; sub-resources are verified per request')
+  log('access boundary: tailnet membership - no key, password or login URL')
+  log(`open the gui at: http://${PUBLIC_AUTHORITIES[0]}/`)
 })

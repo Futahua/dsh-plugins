@@ -69,7 +69,7 @@ $definitions = @(
     @{ Name = 'DeepSeek Harness'; Script = $open;    Arguments = '';      Window = $minimised; KeepOpen = $false; Description = 'Open the DSH Web GUI (starts it if needed)' }
     @{ Name = 'DSH Restart';      Script = $restart; Arguments = '';      Window = $normal;    KeepOpen = $true;  Description = 'Restart DSH and verify the plugin halves' }
     @{ Name = 'DSH Console';      Script = $console; Arguments = '';      Window = $normal;    KeepOpen = $true;  Description = 'Run DSH in the foreground with a visible log' }
-    @{ Name = 'DSH Phone Link';   Script = $open;    Arguments = '-Copy'; Window = $minimised; KeepOpen = $false; Description = 'Copy the tailnet login URL for a phone or tablet' }
+    @{ Name = 'DSH Phone Link';   Script = $open;    Arguments = '-Copy'; Window = $minimised; KeepOpen = $false; Description = 'Copy the tailnet URL for a phone or tablet (Tailscale only)' }
 )
 
 $targets = @([Environment]::GetFolderPath('Desktop'))

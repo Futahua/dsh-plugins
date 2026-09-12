@@ -54,8 +54,8 @@ browser will actually use.
 The flag fixes the **fence** only. The bridge additionally:
 
 1. **Signs the browser in.** DSH requires a signed session cookie; the bridge
-   verifies one and re-signs it for the loopback authority, and serves the
-   keyed `/__dsh_login` one-tap link your phone and iPad use.
+   verifies one and re-signs it for the loopback authority, and signs in any
+   top-level navigation that arrives without one.
 2. **Auto signs-in document navigations**, so a plain bookmarked URL works.
 
 Neither is covered by `--trusted-host`. Without the bridge you would sign in via
@@ -66,7 +66,7 @@ So the honest comparison is not "bridge vs no bridge" but:
 
 | Approach | Fence | Sign-in |
 | --- | --- | --- |
-| Bridge (today) | rewritten to loopback | keyed one-tap link, auto sign-in |
+| Bridge (today) | rewritten to loopback | auto sign-in, no credential |
 | `--trusted-host` alone | satisfied by flag | tokenised launch URL each time |
 
 ## If you want to drop the bridge

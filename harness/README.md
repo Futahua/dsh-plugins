@@ -31,8 +31,8 @@ the launcher by hand. `boot-dsh.ps1` is the missing first half.
 | --- | --- |
 | [`boot-dsh.ps1`](boot-dsh.ps1) | Logon entry point. Ensures `dsh web` is serving (starting it detached if not), then hands off to `startup.ps1`. Idempotent: starts nothing if the GUI already answers. |
 | [`dsh-boot.vbs`](dsh-boot.vbs) | The Startup-folder shim that runs `boot-dsh.ps1` fully hidden. A `.vbs` because the Startup folder needs no administrator rights, where a scheduled task would. |
-| [`startup.ps1`](startup.ps1) | Starts the auth bridge if it is not listening, re-asserts the Tailscale Serve mapping, rotates the bridge log, prints the one-tap login URL. |
-| [`open-dsh.ps1`](open-dsh.ps1) | Ensures the stack is up, then opens an **already-authenticated** URL. `-Copy` puts the tailnet login URL on the clipboard instead. |
+| [`startup.ps1`](startup.ps1) | Starts the auth bridge if it is not listening, re-asserts the Tailscale Serve mapping, rotates the bridge log, prints the URL to open. |
+| [`open-dsh.ps1`](open-dsh.ps1) | Ensures the stack is up, then opens the GUI. `-Copy` puts the tailnet URL on the clipboard instead. |
 | [`restart-harness.ps1`](restart-harness.ps1) | Stops the GUI and starts it again, then verifies. Resolves the launcher *before* stopping anything, and refuses to kill a listener that is not `node.exe`. |
 | [`start-harness.ps1`](start-harness.ps1) | The launcher. Pins `DSH_HOME` for the process and resolves `dsh` in three tiers (PATH → cached npx install → `npx @latest`). |
 | [`install-shortcuts.ps1`](install-shortcuts.ps1) | Creates or refreshes the four desktop shortcuts. |
@@ -48,19 +48,23 @@ tailnet hostname, so the request arrives with a Host header DSH refuses.
 
 The bridge listens on loopback, verifies the browser's session cookie itself,
 and re-signs it for the loopback authority DSH expects, preserving the original
-`issuedAt`/`expiresAt` so re-signing never extends a session. It never mints a
-session for an anonymous caller.
+`issuedAt`/`expiresAt` so re-signing never extends a session.
 
-It also serves the one-tap login link:
+**There is no key, password or login URL.** A top-level navigation that arrives
+without a session is signed in automatically and redirected to the GUI; API and
+asset requests are still verified per request, and answer 401 without a valid
+cookie.
 
-```
-http://<authority>/__dsh_login?key=<key>
-```
+Since the bridge is reachable only from loopback, and loopback is reachable only
+through `tailscale serve`, **tailnet membership is the access boundary**. That
+was already true before the key was removed — which is exactly why the key never
+denied anybody. It was a second door into a room with no walls: something to
+carry around, paste into chat, and leak, guarding nothing that was not already
+guarded by the tailnet. Removing it changed no security property that was
+actually being enforced.
 
-which sets the session cookie server-side and redirects — no JavaScript, which
-is what makes it usable from a phone or tablet where a long cookie cannot be
-typed into a URL bar. The key persists in `ts-bridge-key` across restarts so a
-home-screen bookmark keeps working.
+If access ever needs to be narrowed, narrow it in Tailscale (ACLs, device
+approval, node sharing). That is the layer that gates.
 
 ## Shortcuts
 
@@ -68,10 +72,10 @@ home-screen bookmark keeps working.
 
 | Shortcut | Runs | Job |
 | --- | --- | --- |
-| DeepSeek Harness | `open-dsh.ps1` | the everyday one — ensure up, open authenticated |
+| DeepSeek Harness | `open-dsh.ps1` | the everyday one — ensure up, then open |
 | DSH Restart | `restart-harness.ps1` | reload after a plugin change, then verify |
 | DSH Console | `start-harness.ps1` | foreground run with a visible log, for debugging |
-| DSH Phone Link | `open-dsh.ps1 -Copy` | tailnet login URL to the clipboard, for adding a device |
+| DSH Phone Link | `open-dsh.ps1 -Copy` | tailnet URL to the clipboard, for adding a device |
 
 ```powershell
 pwsh -File install-shortcuts.ps1            # desktop
@@ -90,7 +94,6 @@ install this was developed on. Honoured environment variables:
 | `BRIDGE_PORT` / `BRIDGE_UPSTREAM` | bridge listen port / GUI port | `3099` / `3080` |
 | `BRIDGE_AUTHORITIES` | comma-separated non-loopback authorities served | `sloptop.taild88607.ts.net:3080,sloptop:3080` |
 | `BRIDGE_SECRET` | override the signing secret (otherwise read from the credential store) | unset |
-| `BRIDGE_KEY_FILE` | where the one-tap login key lives | `<harness home>/ts-bridge-key` |
 
 ## Security notes
 
@@ -102,12 +105,14 @@ deliberately readable:
   closed** if it cannot. It previously carried a literal fallback — a copy of a
   live session-forgery key sitting in a file destined for a public repo. It was
   never committed, and it has been removed. Do not reintroduce a default.
-- **The login key is a bearer credential.** Anyone who has that URL has full
-  control of the GUI. It is stored in `ts-bridge-key` (mode 0600) and is
-  deliberately not in this repo. Rotate it by deleting the file and restarting
-  the bridge.
+- **There is no password to leak.** The previous one-tap login key is gone by
+  design; see the bridge section above. Nothing about adding a device involves a
+  credential — install Tailscale, join the tailnet, open the URL.
 - **The bridge binds loopback only** (`127.0.0.1`), so it is reachable only
   through `tailscale serve`. It is not an internet-facing proxy.
+- **Adding a device is a Tailscale action, not a DSH one.** If a device should
+  not have access, remove it from the tailnet; nothing in this folder can or
+  should gate it.
 - The tailnet hostname appears in these scripts as an overridable default. It is
   a MagicDNS name, not a secret, and it is already recorded in the top-level
   README — but it is the one piece of identifying information here, so change

@@ -10,23 +10,22 @@
   state this is meant to remove.
 
   So: ensure the stack is up (delegating to boot-dsh.ps1, which is idempotent),
-  then open an ALREADY-AUTHENTICATED URL.
+  then open the GUI.
 
-  That last part matters. The GUI itself answers 401 without a session cookie,
-  so opening the plain GUI URL can dump you on "authentication required" - the
-  problem the one-tap login link was built to solve. This opens the bridge's
-  login URL instead, which sets the session cookie and redirects to the GUI.
+  No key or password is involved. The auth bridge signs in any top-level
+  navigation that arrives without a session, so any device that can reach the
+  bridge is in - and the only devices that can reach it are on the tailnet.
+  Tailnet membership is the credential.
 
   Local by default: 127.0.0.1 on the bridge, no Tailscale round trip.
 
 .PARAMETER Tailnet
-  Open the tailnet login URL instead of the loopback one. Useful for checking
-  what a phone sees, from this machine.
+  Open the tailnet URL instead of the loopback one. Useful for checking what a
+  phone sees, from this machine.
 
 .PARAMETER Copy
-  Do not open a browser; copy the tailnet login URL to the clipboard so it can
-  be sent to a phone or tablet. This is the one to use when setting up a new
-  device.
+  Do not open a browser; copy the tailnet URL to the clipboard, for setting up a
+  new device. Only Tailscale has to be installed there first.
 
 .PARAMETER Authority
   Tailnet authority used by -Tailnet and -Copy. Default sloptop.taild88607.ts.net:3080.
@@ -56,7 +55,6 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $boot    = Join-Path $DshHome 'boot-dsh.ps1'
-$keyFile = Join-Path $DshHome 'ts-bridge-key'
 $pwshExe = Join-Path $PSHOME 'pwsh.exe'
 if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh' }
 
@@ -70,27 +68,21 @@ if (Test-Path -LiteralPath $boot) {
     Say ("boot script not found at {0}; opening the URL anyway" -f $boot)
 }
 
-# --- 2. Build the authenticated URL ------------------------------------------
-$key = ''
-if (Test-Path -LiteralPath $keyFile) { $key = (Get-Content -LiteralPath $keyFile -Raw).Trim() }
-
-if ($key -eq '') {
-    # No key means the bridge has never run. Fall back to the plain GUI URL
-    # rather than opening a login URL that cannot work.
-    $url = "http://127.0.0.1:{0}/" -f $Port
-    Say ("no login key at {0}; opening the plain GUI URL (it may ask for auth)" -f $keyFile)
-} elseif ($Tailnet -or $Copy) {
-    $url = "http://{0}/__dsh_login?key={1}" -f $Authority, $key
+# --- 2. Build the URL ---------------------------------------------------------
+# No key, no login path: the bridge signs in any top-level navigation, so simply
+# opening the GUI is enough. Loopback by default to avoid a Tailscale round trip.
+if ($Tailnet -or $Copy) {
+    $url = "http://{0}/" -f $Authority
 } else {
-    $url = "http://127.0.0.1:{0}/__dsh_login?key={1}" -f $BridgePort, $key
+    $url = "http://127.0.0.1:{0}/" -f $BridgePort
 }
 
 # --- 3. Open it, or copy it ---------------------------------------------------
 if ($Copy) {
     Set-Clipboard -Value $url
-    Say 'tailnet login URL copied to the clipboard - send it to the device you want to add.'
-    Say 'it stays valid across restarts, so it can be saved as a home-screen bookmark.'
+    Say 'tailnet URL copied - open it on any device that is on the tailnet.'
+    Say 'no key or password is needed; it can be saved as a home-screen bookmark.'
 } else {
-    Say ("opening {0}" -f ($url -replace 'key=.*$', 'key=<redacted>'))
+    Say ("opening {0}" -f $url)
     Start-Process $url
 }
