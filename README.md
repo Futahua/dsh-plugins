@@ -9,6 +9,10 @@ developed and verified against a live installation.
 | [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
 | [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its left edge back: hides the collapsed rail, opens the real sidebar from an edge tap (glowing band, sliding drawer), closes it on a tap beside it, and blanks the squeezed remainder |
 
+The operational scripts — bringing the harness up at boot, restarting it to load
+a plugin's host half, opening an authenticated GUI, and the Tailscale auth bridge
+they depend on — live separately in [`harness/`](harness/).
+
 ## Where this runs
 
 These plugins are installed into a DSH profile on the machine **`sloptop`**, at:
