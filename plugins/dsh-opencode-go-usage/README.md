@@ -13,16 +13,49 @@ Shows how much of your **OpenCode Go** subscription allowance is spent — the
 
 ## What you see
 
-A compact **`Go 27%`** pill in the composer row, immediately to the left of the
-context-occupancy ring (the 5-hour window is the headline number). It turns amber
-at 70% and red at 90%. Clicking it opens a small panel:
+A **progress ring** in the composer row, immediately to the left of the
+context-occupancy meter. The ring reports the 5-hour window — the shortest limit,
+so the one most likely to bite first — and wears that window's colour (pink). It
+escalates to amber at 70% and red at 90%. Clicking it opens a small panel:
 
 ```
-OpenCode Go usage
-5-hour    27%  · in 4h
-Weekly    41%  · in 2d
-Monthly   20%  · in 29d
+OpenCode Go allowance
+Monthly   24% · 29d   [━━━━━━━━│━━━━━━━━━━━━━━━━━━━]
+Weekly    48% · 35h   [━━━━━━━━│━━━━━━━━━━━━━━━━━━━]
+5-hour    11% · 3h    [        ┃██│━━━━━━━━━━━━━━━━]
+                              ↑ shared anchor
 ```
+
+Three rows on **one shared quota scale**, where the track in every row is the
+monthly allowance, so a bar's width is its allowance as a fraction of that
+($30 = 50%, $12 = 20%). The solid part of each bar is allowance consumed and the
+lighter part is what remains.
+
+Each window is **positioned by its own usage**, not by its allowance:
+
+```
+windowWidth = allowance / monthlyAllowance
+usedWidth   = windowWidth × usage%
+windowLeft  = anchor − usedWidth
+```
+
+Every used portion **ends at the same anchor**, which is what makes the three rows
+comparable — the boundary lines up vertically across them. Because position is a
+function of usage, the bars slide horizontally as usage changes: burn a window
+faster and it grows leftward.
+
+This is a **quota scale, not a timeline**. It makes no claim that the current week
+sits inside the current month — the windows are deliberately not nested in time
+(measured on a live account, the weekly window began four days *before* the
+monthly billing period, because the weekly resets on a fixed weekday boundary
+while the monthly cycle follows the subscription date).
+
+**Truncation.** A window whose reading would reach past either end of the track is
+clipped rather than rescaled, so the scale always means exactly one monthly
+allowance and never silently re-bases. A clipped edge is squared off so it reads
+as "continues" rather than "ends". Both directions are reachable: a heavy child
+against a light month clips on the **left** (used > anchor), and a light child
+against a heavy month clips on the **right** (remaining > 100 − anchor).
 
 It renders nothing until the first successful reading, so it never occupies the
 composer row with a placeholder it cannot fill. If the reading goes stale it
@@ -125,12 +158,9 @@ Both halves are new, so the running `dsh web` has never loaded them. Host
 activation requires one restart:
 
 ```
-dsh web --no-open
+cd D:\Letters\MatTroiSeConMoc
+dsh web --resume session-cedb656f-621c-4671-9e0f-02e556746177
 ```
-
-Do **not** use `dsh web --resume <session>` — that flag does not exist on this
-DSH version; it fails with `error: unknown option '--resume'`. Sessions persist
-under `$DSH_HOME/sessions/` and are reopened from the GUI session list.
 
 Then **press F5 in the browser**: a newly added client-plugin row is not injected
 into an already-running page (only *rewrites* of an already-loaded client bundle

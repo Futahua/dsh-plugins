@@ -2,30 +2,39 @@
  * OpenCode Go usage for the DSH Web GUI.
  *
  * A **progress ring** in the `conversation.input.right` seat, beside the context
- * meter, and a **nested allowance bar** on click.
+ * meter, and a **usage-anchored allowance chart** on click.
  *
  * The ring shows the 5-hour window — the shortest limit, so the one most likely
  * to bite first — and wears that window's colour.
  *
- * The bar is ONE continuous track carrying three overlapping allowance windows:
+ * The chart is three rows on one shared quota scale, where the scale is the
+ * monthly allowance: the track in every row represents $60, so a window's bar
+ * width is its allowance as a fraction of that ($30 = 50%, $12 = 20%).
  *
- *     Monthly  ━━━━━━━━━[━━ Weekly ━[5h]━━━]━━━━━━━━━
+ * Each window is POSITIONED BY ITS OWN USAGE, not by its allowance:
  *
- * Width encodes each window's share of the monthly allowance ($60 / $30 / $12 =
- * 100% / 50% / 20%), and each is centred inside its parent so the containment
- * reads at a glance. Height encodes usage: every window is filled from its own
- * left edge by its own percentage, over a dimmed version of its own colour.
+ *     windowWidth = allowance / monthlyAllowance
+ *     usedWidth   = windowWidth * usage%
+ *     windowLeft  = anchor − usedWidth
  *
- * This is NOT a stacked progress bar. The windows are separate limits that
- * occupy overlapping spans of one scale, and the nested outlines are what make
- * that legible in a single row.
+ * Every used portion ENDS at the same anchor — the "now" line on the quota scale —
+ * so the solid part of each bar is what has been consumed and the lighter part is
+ * what remains. Because the anchor is shared, the boundary lines up vertically
+ * across the three rows, and the bars slide horizontally as usage changes: burn a
+ * window faster and it grows leftward.
  *
- * HONESTY NOTE ON POSITION: the *allowances* nest, but the *time spans do not*.
- * Measured on a live account, the weekly window began four days BEFORE the
- * monthly billing period, because the weekly window resets on a fixed weekday
- * boundary while the monthly cycle follows the subscription date. The centring
- * here therefore expresses the allowance hierarchy, not elapsed time; nothing
- * here claims the current week sits inside the current month.
+ * This is a QUOTA scale, not a timeline, and it makes no claim that the current
+ * week sits inside the current month. (Measured on a live account, the weekly
+ * window began four days BEFORE the monthly billing period, because the weekly
+ * resets on a fixed weekday boundary while the monthly cycle follows the
+ * subscription date. That is why the scale is allowances rather than elapsed
+ * time — but it is not a reason to centre anything, which an earlier revision of
+ * this file wrongly concluded.)
+ *
+ * TRUNCATION: a window whose reading would reach past either end of the track is
+ * clipped rather than rescaled, so the monthly scale always means exactly $60 and
+ * never silently re-bases. Clipped edges are squared off so a truncated bar is
+ * distinguishable from a complete one.
  *
  * Bundle format: `window.__ModuleLoader__.load({id, factory})` exporting `apply`
  * and `inject`.
@@ -54,10 +63,9 @@ window.__ModuleLoader__.load({
 		const HOT_AT = 90;
 
 		/**
-		 * One colour per window, so any segment is identifiable on sight.
+		 * One colour per window, so any bar is identifiable on sight.
 		 *
-		 * Sage / blue / pink follow the sketch these were designed from. The 5-hour
-		 * colour is also the ring's, since the ring reports that same window.
+		 * The 5-hour colour is also the ring's, since the ring reports that window.
 		 */
 		const COLORS = {
 			monthly: "#8b9a6b",
@@ -68,22 +76,13 @@ window.__ModuleLoader__.load({
 		const RING_WINDOW = "rolling";
 
 		/**
-		 * Each window's share of the monthly allowance, as a percentage of the
-		 * track. The real Go ratios for a $60 model are $30 / $60 and $12 / $60.
+		 * Each window's allowance as a percentage of the monthly one. The real Go
+		 * ratios for a $60 model are $30 / $60 and $12 / $60.
 		 */
 		const SHARES = { monthly: 100, weekly: 50, rolling: 20 };
 
-		/**
-		 * Vertical bands, so overlapping windows stay distinguishable.
-		 *
-		 * The monthly bar is the full height; each nested window is inset a little
-		 * further so its parent's edges remain visible behind it.
-		 */
-		const BANDS = {
-			monthly: { top: 0, bottom: 0, z: 1 },
-			weekly: { top: 2, bottom: 2, z: 2 },
-			rolling: { top: 4, bottom: 4, z: 3 },
-		};
+		/** Render order, longest allowance first. */
+		const ORDER = ["monthly", "weekly", "rolling"];
 
 		/** Ring geometry, sized to sit beside the context meter. */
 		const RING_SIZE = 16;
@@ -99,8 +98,63 @@ window.__ModuleLoader__.load({
 		 * large; zero stays exactly zero, so an idle window is never overstated.
 		 */
 		const MIN_ARC = 0.08;
-		/** Same idea for a bar fill, in px. */
-		const MIN_FILL_PX = 3;
+
+		/**
+		 * Place the three windows on the shared quota scale.
+		 *
+		 * The track is the monthly allowance, so `left`/`width` are in track %.
+		 * Positions come from usage, and a window that would overrun either end is
+		 * truncated to the track rather than rescaled, which keeps the scale meaning
+		 * a fixed $60.
+		 *
+		 * @param byKey - the reading for each window key, if present.
+		 * @returns one entry per window: `{ key, left, width, fillPct, clippedLeft, clippedRight }`.
+		 */
+		function layout(byKey) {
+			const pct = (key) => {
+				const value = byKey[key]?.percent;
+				return typeof value === "number" ? Math.max(0, Math.min(100, value)) : 0;
+			};
+			// The anchor is the monthly window's own usage boundary: its bar spans the
+			// whole track, so the point its used portion reaches is the shared line.
+			const anchor = (SHARES.monthly * pct("monthly")) / 100;
+
+			return ORDER.filter((key) => byKey[key] !== undefined).map((key) => {
+				const width = SHARES[key];
+				const used = (width * pct(key)) / 100;
+				const rawLeft = anchor - used;
+				const rawRight = rawLeft + width;
+				// Truncate to the track.
+				const left = Math.max(0, rawLeft);
+				const right = Math.min(100, rawRight);
+				const drawn = Math.max(0, right - left);
+				// The used portion runs from the bar's left edge to the anchor, clipped
+				// by the same bounds.
+				const usedDrawn = Math.max(0, Math.min(right, anchor) - left);
+				return {
+					key,
+					left,
+					width: drawn,
+					fillPct: drawn === 0 ? 0 : (usedDrawn / drawn) * 100,
+					clippedLeft: rawLeft < 0,
+					clippedRight: rawRight > 100,
+				};
+			});
+		}
+
+		/**
+		 * Where the shared anchor lands on the track, in %.
+		 *
+		 * Every used portion ends here, so one line per row at this position reads
+		 * as a single boundary across the chart.
+		 * @param byKey - the reading for each window key.
+		 * @returns the anchor position in track %.
+		 */
+		function anchorPosition(byKey) {
+			const value = byKey.monthly?.percent;
+			const pct = typeof value === "number" ? Math.max(0, Math.min(100, value)) : 0;
+			return (SHARES.monthly * pct) / 100;
+		}
 
 		const css = [
 			".dsh-go-usage{display:inline-flex;align-items:center;position:relative;font:inherit}",
@@ -108,7 +162,7 @@ window.__ModuleLoader__.load({
 			"border:none;border-radius:999px;cursor:pointer;background:none;color:inherit;line-height:0}",
 			".dsh-go-usage-button:hover{background:var(--dsw-alias-bg-secondary,rgba(127,127,127,.16))}",
 			".dsh-go-usage-button:focus-visible{outline:2px solid currentColor;outline-offset:2px}",
-			".dsh-go-usage-track{stroke:var(--dsw-alias-border-secondary,rgba(127,127,127,.35))}",
+			".dsh-go-usage-track-ring{stroke:var(--dsw-alias-border-secondary,rgba(127,127,127,.35))}",
 			// The arc carries the 5-hour colour, escalating at the thresholds.
 			`.dsh-go-usage-arc{stroke:${COLORS.rolling};transition:stroke-dashoffset .4s ease}`,
 			`.dsh-go-usage-button[data-level=warn] .dsh-go-usage-arc{stroke:var(--dsw-alias-state-warn-primary,#c98a00)}`,
@@ -122,15 +176,27 @@ window.__ModuleLoader__.load({
 			"border:1px solid var(--dsw-alias-border-secondary,rgba(127,127,127,.3));",
 			"box-shadow:0 6px 24px rgba(0,0,0,.28)}",
 			".dsh-go-usage-title{font-weight:600;margin-bottom:8px}",
-			// One track, three overlapping windows.
-			".dsh-go-usage-stack{position:relative;height:18px;margin-bottom:8px}",
-			".dsh-go-usage-seg{position:absolute;border-radius:999px;overflow:hidden}",
-			".dsh-go-usage-segfill{height:100%;border-radius:999px;transition:width .4s ease}",
-			// Legend: one swatch and value per window, so the bar stays unlabelled.
-			".dsh-go-usage-legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12px}",
-			".dsh-go-usage-key{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}",
-			".dsh-go-usage-swatch{width:8px;height:8px;border-radius:2px;flex:none}",
-			".dsh-go-usage-val{font-variant-numeric:tabular-nums;font-weight:600}",
+			// Three rows, each a full-width view of the same monthly scale.
+			".dsh-go-usage-rows{display:flex;flex-direction:column;gap:7px}",
+			".dsh-go-usage-row{display:flex;align-items:center;gap:8px}",
+			".dsh-go-usage-label{flex:0 0 46px;font-size:12px;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+			// Each row's track is the shared coordinate space, but it carries NO
+			// background: a full-width grey bar in the weekly and 5-hour rows read as
+			// clutter, and it was redundant anyway — the monthly row's own allowance
+			// bar already spans the whole track and shows the scale.
+			".dsh-go-usage-track{position:relative;flex:1 1 auto;height:10px}",
+			".dsh-go-usage-seg{position:absolute;top:0;bottom:0;overflow:hidden;border-radius:999px;",
+			"transition:left .4s ease,width .4s ease}",
+			// A squared corner reads as "continues past here" rather than "ends here".
+			".dsh-go-usage-seg[data-clipped-left]{border-top-left-radius:0;border-bottom-left-radius:0}",
+			".dsh-go-usage-seg[data-clipped-right]{border-top-right-radius:0;border-bottom-right-radius:0}",
+			".dsh-go-usage-segfill{height:100%;border-radius:inherit;transition:width .4s ease}",
+			// The reference line every used portion ends on.
+			".dsh-go-usage-anchor{position:absolute;top:-2px;bottom:-2px;width:1px;z-index:8;",
+			"background:var(--dsw-alias-label-secondary,rgba(160,160,160,.75));pointer-events:none}",
+			".dsh-go-usage-figs{flex:0 0 auto;min-width:74px;text-align:right;font-size:12px;",
+			"font-variant-numeric:tabular-nums;white-space:nowrap}",
+			".dsh-go-usage-val{font-weight:600}",
 			".dsh-go-usage-reset{opacity:.6;font-size:11px}",
 			".dsh-go-usage-note{margin-top:8px;opacity:.75;font-size:11px}",
 		].join("");
@@ -167,46 +233,61 @@ window.__ModuleLoader__.load({
 			return "ok";
 		}
 
-		/** `#rrggbb` at a given alpha, for the dimmed unfilled background. */
+		/** `#rrggbb` at a given alpha, for the dimmed allowance background. */
 		function tint(hex, alpha) {
 			const n = Number.parseInt(hex.slice(1), 16);
 			return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 		}
 
 		/**
-		 * One window's segment: centred in the track at its allowance share, filled
-		 * from its own left edge by its own percentage.
+		 * One window's row: its allowance as a bar on the shared scale, with the
+		 * consumed part solid and the remainder dimmed.
+		 * @param geometry - one entry from `layout`.
+		 * @param window - the reading for that window.
+		 * @param anchor - shared anchor position, in track %.
 		 */
-		function Segment({ window: w }) {
-			const share = SHARES[w.key] ?? 100;
-			const band = BANDS[w.key] ?? BANDS.monthly;
-			const percent = typeof w.percent === "number" ? w.percent : 0;
+		function UsageRow({ geometry, window: w, anchor }) {
 			const colour = COLORS[w.key] ?? COLORS.monthly;
-			// Centre this window inside the track, so nesting is symmetric.
-			const left = (100 - share) / 2;
+			const percent = typeof w.percent === "number" ? Math.round(w.percent) : 0;
+			const reset = untilReset(w.resetsAt);
 			return react.createElement(
 				"div",
-				{
-					className: "dsh-go-usage-seg",
-					title: `${w.label}: ${Math.round(percent)}%`,
-					style: {
-						left: `${left}%`,
-						width: `${share}%`,
-						top: band.top,
-						bottom: band.bottom,
-						zIndex: band.z,
-						background: tint(colour, 0.22),
-						// A ring keeps an inner window readable against its parent.
-						boxShadow: `inset 0 0 0 1px ${tint(colour, 0.85)}`,
-					},
-				},
-				react.createElement("div", {
-					className: "dsh-go-usage-segfill",
-					style:
-						percent === 0
-							? { width: "0", background: colour }
-							: { width: `max(${MIN_FILL_PX}px, ${Math.min(100, percent)}%)`, background: colour },
-				}),
+				{ className: "dsh-go-usage-row", "data-window": w.key },
+				react.createElement("span", { className: "dsh-go-usage-label" }, w.label),
+				react.createElement(
+					"span",
+					{ className: "dsh-go-usage-track" },
+					react.createElement(
+						"span",
+						{
+							className: "dsh-go-usage-seg",
+							"data-clipped-left": geometry.clippedLeft ? "" : undefined,
+							"data-clipped-right": geometry.clippedRight ? "" : undefined,
+							style: {
+								left: `${geometry.left}%`,
+								width: `${geometry.width}%`,
+								// The dimmed part is what remains of THIS window's allowance.
+								background: tint(colour, 0.22),
+								boxShadow: `inset 0 0 0 1px ${tint(colour, 0.7)}`,
+							},
+						},
+						react.createElement("span", {
+							className: "dsh-go-usage-segfill",
+							style: {
+								width: `${geometry.fillPct}%`,
+								background: colour,
+								display: "block",
+							},
+						}),
+					),
+					react.createElement("span", { className: "dsh-go-usage-anchor", style: { left: `${anchor}%` } }),
+				),
+				react.createElement(
+					"span",
+					{ className: "dsh-go-usage-figs" },
+					react.createElement("span", { className: "dsh-go-usage-val" }, `${percent}%`),
+					reset ? react.createElement("span", { className: "dsh-go-usage-reset" }, ` · ${reset}`) : null,
+				),
 			);
 		}
 
@@ -226,7 +307,7 @@ window.__ModuleLoader__.load({
 					"aria-label": label,
 				},
 				react.createElement("circle", {
-					className: "dsh-go-usage-track",
+					className: "dsh-go-usage-track-ring",
 					cx: RING_SIZE / 2,
 					cy: RING_SIZE / 2,
 					r: RING_RADIUS,
@@ -254,11 +335,6 @@ window.__ModuleLoader__.load({
 		 * Pure so it can be unit-tested without a browser. Preferred position is
 		 * centred on the pill; if that would overflow either edge the panel slides
 		 * until it fits, so it is never partly off screen.
-		 * @param wrapRect - the wrapper's viewport rect.
-		 * @param panelWidth - laid-out panel width in px.
-		 * @param viewport - viewport width in px.
-		 * @param margin - minimum gap to keep from either edge.
-		 * @returns the `left` value in px, relative to the wrapper.
 		 */
 		function panelLeft(wrapRect, panelWidth, viewport, margin = 12) {
 			const pillCentre = wrapRect.left + wrapRect.width / 2;
@@ -267,12 +343,7 @@ window.__ModuleLoader__.load({
 			return Math.round(clamped - wrapRect.left);
 		}
 
-		/**
-		 * Place the open panel so it stays inside the viewport.
-		 *
-		 * `position:absolute` resolves against the wrapper, so coordinates are
-		 * converted from viewport space, and the CSS centring transform is dropped.
-		 */
+		/** Place the open panel so it stays inside the viewport. */
 		function placePanel(wrap, panel) {
 			if (!wrap || !panel || typeof window === "undefined") return;
 			wrap.style.position = "relative";
@@ -335,29 +406,15 @@ window.__ModuleLoader__.load({
 			if (state.status === "loading") return null;
 
 			const windows = state.status === "ready" ? state.data.windows : [];
-			const ringWindow = windows.find((w) => w.key === RING_WINDOW);
+			const byKey = Object.fromEntries(windows.map((w) => [w.key, w]));
+			const geometry = layout(byKey);
+			const anchor = anchorPosition(byKey);
+			const ringWindow = byKey[RING_WINDOW];
 			const reading = ringWindow?.percent;
 
-			// Draw longest first so the nested windows paint over it.
-			const order = ["monthly", "weekly", "rolling"];
-			const segments = order
-				.map((key) => windows.find((w) => w.key === key))
-				.filter(Boolean)
-				.map((w) => react.createElement(Segment, { key: w.key, window: w }));
-
-			const legend = order
-				.map((key) => windows.find((w) => w.key === key))
-				.filter(Boolean)
-				.map((w) =>
-					react.createElement(
-						"span",
-						{ className: "dsh-go-usage-key", key: w.key },
-						react.createElement("span", { className: "dsh-go-usage-swatch", style: { background: COLORS[w.key] } }),
-						`${w.label} `,
-						react.createElement("span", { className: "dsh-go-usage-val" }, `${Math.round(w.percent ?? 0)}%`),
-						w.resetsAt ? react.createElement("span", { className: "dsh-go-usage-reset" }, ` · ${untilReset(w.resetsAt)}`) : null,
-					),
-				);
+			const rows = geometry.map((g) =>
+				react.createElement(UsageRow, { key: g.key, geometry: g, window: byKey[g.key], anchor }),
+			);
 
 			const note =
 				state.status === "error"
@@ -393,10 +450,9 @@ window.__ModuleLoader__.load({
 							"div",
 							{ className: "dsh-go-usage-panel", ref: panelRef, role: "dialog", "aria-label": "OpenCode Go usage" },
 							react.createElement("div", { className: "dsh-go-usage-title" }, "OpenCode Go allowance"),
-							segments.length > 0
-								? react.createElement("div", { className: "dsh-go-usage-stack" }, segments)
+							rows.length > 0
+								? react.createElement("div", { className: "dsh-go-usage-rows" }, rows)
 								: react.createElement("div", null, "No reading available"),
-							react.createElement("div", { className: "dsh-go-usage-legend" }, legend),
 							note ? react.createElement("div", { className: "dsh-go-usage-note" }, note) : null,
 						)
 					: null,
@@ -416,7 +472,9 @@ window.__ModuleLoader__.load({
 		exports.inject = inject;
 		exports.GoUsagePill = GoUsagePill;
 		exports.UsageRing = UsageRing;
-		exports.Segment = Segment;
+		exports.UsageRow = UsageRow;
+		exports.layout = layout;
+		exports.anchorPosition = anchorPosition;
 		exports.panelLeft = panelLeft;
 		exports.SHARES = SHARES;
 		exports.COLORS = COLORS;

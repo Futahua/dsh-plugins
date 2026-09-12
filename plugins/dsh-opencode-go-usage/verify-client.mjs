@@ -4,15 +4,14 @@
  * The real rendering needs a browser, but this catches the failures that
  * actually bite: syntax errors, a wrong bundle envelope, a missing export, and
  * a mis-wired slot registration. It stubs `window.__ModuleLoader__`, `require`,
- * a minimal DOM, and a minimal React, so it runs from a fresh clone with no
- * dependencies installed:
+ * a minimal DOM, and a minimal React, so it runs with no dependencies installed:
  *
  *   node plugins/dsh-opencode-go-usage/verify-client.mjs
  *
  * The React stub is intentionally tiny: this never renders, it only evaluates
  * the bundle and inspects what it registered. `createElement` returns a plain
- * descriptor, and the hooks are inert, which is enough for the module body to
- * run and for `apply` to be exercised.
+ * descriptor and the hooks are inert, which is enough for the module body to run
+ * and for `apply` to be exercised.
  */
 import { readFileSync } from "node:fs";
 
@@ -115,27 +114,71 @@ for (const [label, wrapRect, viewport] of placementCases) {
   check(label, fits, `viewport x=${viewportLeft}..${viewportLeft + W} of ${viewport}`);
 }
 
-console.log("nested allowance bar:");
-// The ratios are the real Go allowances for a $60 monthly model: $30 / $60 and
-// $12 / $60. They are what makes the nesting mean something.
-check("monthly spans the whole track", exported.SHARES?.monthly === 100, String(exported.SHARES?.monthly));
-check("weekly is half the allowance", exported.SHARES?.weekly === 50, String(exported.SHARES?.weekly));
-check("5-hour is a fifth of it", exported.SHARES?.rolling === 20, String(exported.SHARES?.rolling));
-const colours = exported.COLORS ?? {};
-check("every window has its own colour", new Set(Object.values(colours)).size === 3, Object.values(colours).join(" "));
-check("the ring wears the 5-hour colour", /#e79aa6/u.test(String(styleTags[0]?.textContent)), "arc rule");
-// Centring is what makes the containment read: each window sits inside its parent.
-const centre = (key) => (100 - (exported.SHARES?.[key] ?? 100)) / 2;
+console.log("quota-scale layout:");
+// Widths are allowances ($30 / $60, $12 / $60); positions come from usage.
+const byKeyFrom = (m, w, r) => ({
+	monthly: { key: "monthly", label: "Monthly", percent: m },
+	weekly: { key: "weekly", label: "Weekly", percent: w },
+	rolling: { key: "rolling", label: "5-hour", percent: r },
+});
+const geo = (m, w, r) => Object.fromEntries(exported.layout(byKeyFrom(m, w, r)).map((g) => [g.key, g]));
+
+check("monthly spans the whole track", (() => {
+	const g = geo(24, 48, 7).monthly;
+	return Math.abs(g.left) < 0.01 && Math.abs(g.width - 100) < 0.01;
+})(), "left 0, width 100");
+
+// The shared boundary is the whole point: every used portion must END at the
+// same anchor, which is what lines the three rows up vertically.
+check("all used portions end at the shared anchor", (() => {
+	const g = geo(24, 48, 7);
+	const anchor = exported.anchorPosition(byKeyFrom(24, 48, 7));
+	return Object.values(g).every((e) => Math.abs(e.left + (e.fillPct / 100) * e.width - anchor) < 0.01);
+})(), "monthly 24, weekly 48, 5-hour 7");
+
+// Position must respond to USAGE, not allowance alone. This is the difference
+// between this design and the symmetric nesting it replaced.
+check("bars slide as usage changes", (() => {
+	const low = geo(24, 10, 7).weekly;
+	const high = geo(24, 80, 7).weekly;
+	return Math.abs(low.left - high.left) > 5;
+})(), "weekly moves with its own usage");
+check("heavier usage sits further left", (() => {
+	return geo(24, 80, 7).weekly.left < geo(24, 10, 7).weekly.left;
+})(), "left = anchor − usedWidth");
+
+console.log("truncation (clipped, never rescaled):");
+// Which edge can overflow is not obvious, so both cases are spelled out:
+//   left  overflow when used > anchor            (a heavy child, light month)
+//   right overflow when remaining > 100 − anchor (a light child, heavy month)
+const overLeft = geo(5, 100, 0).weekly;
+check("a bar past the LEFT edge is clipped", overLeft.clippedLeft === true, `monthly 5, weekly 100 → left ${overLeft.left.toFixed(1)}`);
+const overRight = geo(90, 5, 0).weekly;
+check("a bar past the RIGHT edge is clipped", overRight.clippedRight === true, `monthly 90, weekly 5 → right ${(overRight.left + overRight.width).toFixed(1)}`);
 check(
-	"weekly is centred inside monthly",
-	centre("weekly") === 25 && centre("weekly") + exported.SHARES.weekly === 75,
-	`${centre("weekly")}% .. ${centre("weekly") + exported.SHARES.weekly}%`,
+	"a clipped bar stays inside the track",
+	overLeft.left >= 0 && overLeft.left + overLeft.width <= 100.01 && overRight.left + overRight.width <= 100.01,
 );
-check(
-	"5-hour is centred inside weekly",
-	centre("rolling") >= centre("weekly") && centre("rolling") + exported.SHARES.rolling <= centre("weekly") + exported.SHARES.weekly,
-	`${centre("rolling")}% .. ${centre("rolling") + exported.SHARES.rolling}%`,
-);
+// The scale must NOT re-base: monthly keeps its width even when a child clips.
+check("the monthly scale does not re-base", (() => {
+	return Math.abs(geo(90, 5, 0).monthly.width - 100) < 0.01;
+})(), "monthly stays 100% wide while weekly is clipped");
+check("an unclipped reading reports no clipping", (() => {
+	const g = geo(24, 48, 7);
+	return Object.values(g).every((e) => e.clippedLeft === false && e.clippedRight === false);
+})());
+check("monthly is never clipped", (() => {
+	const g = geo(100, 100, 100).monthly;
+	return g.clippedLeft === false && g.clippedRight === false;
+})());
+check("no window ever escapes the track", (() => {
+	for (const [m, w, r] of [[0, 0, 0], [100, 100, 100], [5, 100, 0], [90, 5, 0], [50, 50, 50]]) {
+		for (const g of Object.values(geo(m, w, r))) {
+			if (g.left < -0.01 || g.left + g.width > 100.01) return false;
+		}
+	}
+	return true;
+})(), "across five extreme readings");
 
 console.log("");
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
