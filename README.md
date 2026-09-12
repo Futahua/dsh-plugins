@@ -7,7 +7,7 @@ developed and verified against a live installation.
 | --- | --- |
 | [`dsh-opencode-go-usage`](plugins/dsh-opencode-go-usage/) | Shows OpenCode Go subscription usage: a progress ring in the composer, and a nested-window panel on click |
 | [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
-| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its left edge back: hides the collapsed rail, opens the real sidebar from an edge tap (glowing band, sliding drawer), closes it on a tap beside it, and blanks the squeezed remainder |
+| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its edges back: both the sidebar rail and the browser-agent pane become invisible edge bands, with a highlight under the finger, a flash on the click, and the real panel sliding in |
 
 The operational scripts — bringing the harness up at boot, restarting it to load
 a plugin's host half, opening an authenticated GUI, and the Tailscale auth bridge
@@ -163,6 +163,25 @@ Findings that cost real debugging time, recorded so they need not be rediscovere
 - **`/json/new` is refused on Android Chrome** (`500 Could not create new page`),
   while `Target.createTarget` on the browser socket works. Phone coordinates are
   CSS pixels — 419x747 here, not the 720x1380 of a screenshot.
+
+- **A panel that reserves its width can erase the GUI.** The browser pane takes its
+  space out of the page with `body.margin-right`. On a 419px phone an expanded 520px
+  pane therefore left the GUI **0px** wide: the app looked hung, nothing responded,
+  and taps fell through to the pane. A stylesheet rule with `!important` beats the
+  inline value, so the fix needs no patch to the package — which matters, because an
+  earlier revision *did* patch it inside `node_modules`, and `npm install` would have
+  silently undone every one of those fixes.
+
+- **Background tabs never run `requestAnimationFrame`.** A freshly created Android
+  Chrome tab is a background tab until you look at it, and a plugin that coalesced its
+  work through rAF did nothing there at all — measured `marked: 0, pane: "expanded"`
+  after a reload, with no error anywhere. `setTimeout` plus a bounded retry settles it;
+  the plugin's checks now forbid rAF returning.
+
+- **A 130ms flash cannot be verified over ADB.** Reading the attribute after the tap is
+  a race that produced false failures, because a CDP round trip to the phone can
+  outlast the flash. The check records it with a `MutationObserver` inside the page
+  instead.
 
 - **A phone with Android's animation scales at `0.0` reports
   `prefers-reduced-motion: reduce`.** That is a Developer-options speed setting,
