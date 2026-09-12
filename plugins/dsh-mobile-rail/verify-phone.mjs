@@ -34,13 +34,12 @@ try {
 	await sleep(800);
 
 	const state = async () => await page.json(STATE_EXPR);
-	/** Are the centre column's own children painted? */
-	const centrePainted = async () =>
-		await page.ev(`(function(){
-      var kids=document.querySelector('.dsh-mobile-rail-frame').children[1].children, out=[];
-      for(var i=0;i<kids.length;i++) out.push(getComputedStyle(kids[i]).visibility);
-      return out.join(',');
-    })()`);
+	/**
+	 * How blank the squeezed remainder is: the cover works by fading the centre
+	 * column's content out, not by hiding it, so opacity is what says "blanked".
+	 */
+	const centreOpacity = async () =>
+		Number(await page.ev("getComputedStyle(document.querySelector('.dsh-mobile-rail-frame').children[1].children[0]).opacity"));
 
 	const s0 = await state();
 	console.log(`viewport ${s0.viewport}px  bundle ${s0.bundle}\n`);
@@ -51,14 +50,16 @@ try {
 	check("sidebar collapsed", s.collapsed === true);
 	check("rail hidden", s.railHidden === true);
 	check("conversation gets the full width", s.centreW === s.viewport, `${s.centreW} of ${s.viewport}`);
-	check("centre content is painted", (await centrePainted()) === "visible");
+	check("centre content is painted", (await centreOpacity()) === 1, `opacity ${await centreOpacity()}`);
 
 	console.log("\n2. real touch tap on the left edge (10,400):");
 	await page.tap(10, 400);
 	s = await state();
 	check("sidebar opened", s.collapsed === false, JSON.stringify(s));
 	check("it is the real 280px sidebar", s.sidebarW === 280, String(s.sidebarW));
-	check("centre content is blanked", (await centrePainted()) === "hidden", await centrePainted());
+	check("centre content is blanked", (await centreOpacity()) === 0, `opacity ${await centreOpacity()}`);
+	check("and the blanked content cannot be tapped through",
+		(await page.ev("getComputedStyle(document.querySelector('.dsh-mobile-rail-frame').children[1].children[0]).pointerEvents")) === "none");
 	console.log("   shot: " + (await page.shot(`${SHOTS}/verify-open.png`)));
 
 	// The animation: the glow lights on the band tap, and the drawer is caught
@@ -145,8 +146,66 @@ try {
 	check("no longer lit", settled.lit === false);
 	check("and it is not left behind as a second element",
 		(await page.ev("document.querySelectorAll('.dsh-mobile-rail-glow').length")) === 1);
+
+	// Sliding out, and the cover fading back: both are sampled during the close, so
+	// the tap is dispatched raw rather than through tap(), which settles first.
+	console.log("\n2d. closing slides out and the cover fades back:");
+	const coverOpacity = async () =>
+		await page.ev("getComputedStyle(document.querySelector('.dsh-mobile-rail-frame').children[1].children[0]).opacity");
+	const drawerTransform = async () =>
+		await page.ev("getComputedStyle(document.querySelector('.dsh-mobile-rail-frame').children[0]).transform");
+	const closingAttr = async () =>
+		await page.ev("document.querySelector('.dsh-mobile-rail-frame').hasAttribute('data-rail-closing')");
+
+	// Open it first, then close and sample throughout.
 	await page.tap(10, 400);
-	check("drawer can still be opened afterwards", (await state()).collapsed === false);
+	check("drawer open for the close test", (await state()).collapsed === false);
+	check("the cover is fully on while open", Number(await coverOpacity()) === 0, `opacity ${await coverOpacity()}`);
+	check("no hold attribute while open", (await closingAttr()) === false);
+
+	await page.call("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: 350, y: 400 }] });
+	await page.call("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+	let sawHold = false;
+	let minTx = 0;
+	let sawFading = false;
+	const opacities = [];
+	for (let i = 0; i < 16; i++) {
+		if (await closingAttr()) sawHold = true;
+		const t = String(await drawerTransform());
+		const m = /matrix\(([^)]+)\)/.exec(t);
+		if (m !== null) {
+			const tx = Number(m[1].split(",")[4]);
+			if (Number.isFinite(tx) && tx < minTx) minTx = tx;
+		}
+		const o = Number(await coverOpacity());
+		opacities.push(o);
+		if (o > 0.02 && o < 0.98) sawFading = true;
+		await sleep(25);
+	}
+	check("the drawer is caught sliding out", minTx < -20, `leftmost transform translateX ${minTx}px`);
+	check("the hold attribute was present during the close", sawHold === true);
+	check("the cover was caught mid-fade", sawFading === true, `opacities ${opacities.slice(0, 8).join(", ")}…`);
+
+	await sleep(600);
+	check("the hold is released afterwards", (await closingAttr()) === false);
+	check("drawer fully closed", (await state()).collapsed === true);
+	check("the cover is gone", Number(await coverOpacity()) === 1, `opacity ${await coverOpacity()}`);
+
+	console.log("\n2e. opening fades the cover in:");
+	await page.call("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: 10, y: 400 }] });
+	await page.call("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+	let fadeIn = false;
+	const inOpacities = [];
+	for (let i = 0; i < 12; i++) {
+		const o = Number(await coverOpacity());
+		inOpacities.push(o);
+		if (o > 0.02 && o < 0.98) fadeIn = true;
+		await sleep(25);
+	}
+	check("the cover was caught fading in", fadeIn === true, `opacities ${inOpacities.slice(0, 8).join(", ")}…`);
+	await sleep(500);
+	check("and settles fully on", Number(await coverOpacity()) === 0, `opacity ${await coverOpacity()}`);
+	check("drawer is open again", (await state()).collapsed === false);
 	await page.tap(350, 400);
 
 	console.log("\n3. real touch tap on the blank strip (350,400):");
@@ -155,7 +214,7 @@ try {
 	check("sidebar collapsed again", s.collapsed === true, JSON.stringify(s));
 	check("rail is gone again", s.railHidden === true);
 	check("conversation back to full width", s.centreW === s.viewport, `${s.centreW} of ${s.viewport}`);
-	check("centre content painted again", (await centrePainted()) === "visible");
+	check("centre content painted again", (await centreOpacity()) === 1, `opacity ${await centreOpacity()}`);
 
 	console.log("\n4. the edge tap works repeatedly:");
 	await page.tap(10, 400);
@@ -207,7 +266,7 @@ try {
 		`${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
 	check("desktop conversation keeps its width", before.centreW === after.centreW, `${before.centreW} -> ${after.centreW}`);
 	check("desktop is not blanked",
-		(await page.ev("getComputedStyle(document.querySelector('.dsh-mobile-rail-frame').children[1].children[0]).visibility")) === "visible");
+		(await page.ev("getComputedStyle(document.querySelector('.dsh-mobile-rail-frame').children[1].children[0]).opacity")) === "1");
 	await page.call("Emulation.clearDeviceMetricsOverride", {});
 
 	console.log("");

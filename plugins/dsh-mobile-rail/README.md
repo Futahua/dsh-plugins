@@ -37,7 +37,7 @@ inferred:
 | 2 | Left-edge tap opens the **real** sidebar | capture `pointerdown`, `clientX <= 24` |
 | 3 | Tap beside the open drawer closes it | capture `pointerdown`, `clientX > sidebar right edge` |
 | 4 | Blank the squeezed remainder | `:not([data-sidebar-collapsed]) > :nth-child(2) > *` |
-| 5 | Glow the band, slide the drawer in | `@keyframes dsh-mobile-rail-slide-in`, `.dsh-mobile-rail-glow[data-lit]` |
+| 5 | Glow the band, slide the drawer both ways, fade the cover | `@keyframes dsh-mobile-rail-slide-in` / `-slide-out`, `.dsh-mobile-rail-glow[data-lit]`, `transition:opacity` |
 
 **Why the width cannot simply be overridden.** It arrives as an inline `style`
 attribute, which outranks every stylesheet. A matching `!important` rule was
@@ -77,8 +77,8 @@ stylesheet contains no `background` declaration or hex colour at all.
 
 ## The animation, and the one preference it ignores
 
-A tap that rearranges the whole screen should have a beginning, so the band glows
-and the drawer slides in behind the light:
+A tap that rearranges the whole screen should have a beginning and an end, so the
+band glows, the drawer slides both ways, and the cover fades with it:
 
 - **The glow** is an injected `position:fixed` element on `body`, not on the frame
   — the frame is a grid, so a new child would become a grid item and could disturb
@@ -87,13 +87,33 @@ and the drawer slides in behind the light:
   above the drawer column and the resize handle (11) but below the overlay layer
   (20) that holds dialogs. Measured on the phone: `elementsFromPoint(6,400)` while
   lit returns the glow first, then the sidebar column.
-- **The slide** is a `transform` on the drawer column, not on the grid track: the
-  track changes in a single commit, so there is nothing to transition. It has no
-  `animation-fill-mode`, because a transform left behind would make the column a
-  containing block for anything fixed-position inside it.
+- **The slides** are a `transform` on the drawer column, not on the grid track: the
+  track changes in a single commit, so there is nothing to transition. Neither
+  direction uses `animation-fill-mode`, because a transform left behind would make
+  the column a containing block for anything fixed-position inside it.
+- **Sliding *out* needs the drawer held open.** The collapsed rules hide it in the
+  same commit that `data-sidebar-collapsed` appears, so by the time anything can
+  react there is nothing left to slide. The plugin watches that attribute and sets
+  `data-rail-closing` for exactly `RAIL_MS`, which restores the drawer's width and
+  visibility for one animation and lifts it to `z-index:16` — over the centre
+  column, which is already back to full width underneath. The width comes from
+  `--dsh-rail-w`, recorded while the drawer was **open**: measuring it at close
+  time always yields 0, and a hard-coded 280px would snap on a resized drawer. The
+  duration is shared with the stylesheet (`animation:… ${RAIL_MS}ms`) so the hold
+  and the animation cannot drift apart.
+- **The cover fades** by animating `opacity` on the centre column's children, with
+  the declaration living on a rule that **always** matches. A transition written
+  only on the state being left disappears along with that state, and the change
+  snaps instead of fading — this was the difference between a fade and a flicker.
+  `pointer-events:none` rides along while blanked, so the invisible conversation
+  cannot be scrolled or clicked through the cover.
 - The glow is `rgba(88,150,255,…)`. The app exposes **no** accent colour to borrow
   — checked: no blue custom properties anywhere, no coloured links — so this is a
   chosen blue that reads on the `#151517` base.
+
+Measured on the phone, mid-transition: the drawer caught at `translateX(-154px)`
+opening and `-260px` closing, the cover at `0.26 → 0.58 → 0.90 → 1` on the way
+back and `0.86 → 0.51 → 0.32 → 0.16 → 0` on the way in.
 
 **It deliberately does not honour `prefers-reduced-motion`.** That is measured, not
 overlooked: on the target phone Android's `animator_duration_scale`,
