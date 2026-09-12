@@ -1,0 +1,37 @@
+# The dsh-opencode-go-session bundle patch.
+#
+# Listed FIRST in the profile's `dsh.profile.bundles`, because this entry must
+# activate before `@deepseek-ai/dsh-llm-pi-ai` does: that plugin resolves its
+# provider catalog eagerly while it applies (`lib/index.js:2593` `profiles()`,
+# then `ensureDirectory()`/`ensureRegistrationFacts()`), and the resolution is
+# memoized by configuration identity. An entry appended after the bundles —
+# the only placement a profile's own `cordis.patch.yml` can produce — would
+# register the missing model too late, leaving it recorded as an invalid model
+# until the next settings change.
+#
+# `https://opencode.ai/zen/go/v1` rejects a sessionless request with
+# 400 MissingSessionID, but pi-ai can only emit session-affinity headers under
+# the names `x-session-id` / `session_id` / `x-client-request-id` /
+# `x-session-affinity`, and dsh-llm-pi-ai marks those compat fields
+# "withhold" — so no configuration can produce `x-opencode-session`.
+#
+# The plugin also registers `deepseek-v4.1-flash`, which pi-ai 0.85.1's
+# opencode-go catalog lacks. Without that entry the model forces a route-level
+# `api:`, which repoints every other model on the route away from its native
+# protocol.
+#
+# See ../index.js and its verify.mjs self-check. Remove this bundle once pi-ai
+# supplies both the header and the model.
+
+- insert:
+    - id: opencode-go-session
+      name: dsh-opencode-go-session
+      config:
+        enabled: true
+        # Routes whose requests carry the session header.
+        providers:
+          - opencode-go
+        header: x-opencode-session
+        # uuid: stable RFC 4122 v5-shaped id derived per conversation.
+        # raw:  send the Harness SessionId verbatim (easier to trace in logs).
+        sessionIdStyle: uuid

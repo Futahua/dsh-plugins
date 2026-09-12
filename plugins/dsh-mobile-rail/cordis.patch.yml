@@ -1,0 +1,13 @@
+# The dsh-mobile-rail bundle patch.
+#
+# Loads the client bundle that hides the collapsed sidebar rail on phones.
+# The plugin ships no host-side behaviour, so this row exists mainly so that
+# `dsh-client-modules` can discover the package's `./client` entry.
+#
+# Remove this bundle (or set enabled: false) to restore the always-visible rail.
+
+- insert:
+    - id: mobile-rail
+      name: dsh-mobile-rail
+      config:
+        enabled: true

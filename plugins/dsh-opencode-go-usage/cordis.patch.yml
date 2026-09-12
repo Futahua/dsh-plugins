@@ -1,0 +1,24 @@
+# The dsh-opencode-go-usage bundle patch.
+#
+# Registers one host-side service that reads the OpenCode Go subscription usage
+# from https://opencode.ai/zen/go/v1/usage and caches it.
+#
+# Placement: this entry is appended after the base bundles, which is correct
+# here. Unlike dsh-opencode-go-session it has no ordering dependency — it reads
+# the credential through `ctx.credentials` lazily on each refresh, so it does not
+# matter whether the provider catalog has resolved yet.
+#
+# Remove this bundle to stop tracking usage; the service installs no hooks and
+# touches no other plugin's behaviour.
+
+- insert:
+    - id: opencode-go-usage
+      name: dsh-opencode-go-usage
+      config:
+        enabled: true
+        baseUrl: https://opencode.ai/zen/go/v1
+        # Same reference the `opencode-go` provider profile uses, so the plugin
+        # follows the route's own credential rather than a second copy.
+        apiKeyEnv: OPENCODE_GO_API_KEY
+        cacheMs: 30000
+        refreshMs: 60000

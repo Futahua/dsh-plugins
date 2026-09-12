@@ -1,0 +1,144 @@
+# DSH plugins
+
+Three plugins for the [DeepSeek Harness](https://github.com/deepseek-ai) Web GUI,
+developed and verified against a live installation.
+
+| Plugin | What it does |
+| --- | --- |
+| [`dsh-opencode-go-usage`](plugins/dsh-opencode-go-usage/) | Shows OpenCode Go subscription usage: a progress ring in the composer, and a nested-window panel on click |
+| [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
+| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Auto-hides the collapsed sidebar rail on narrow viewports so phones get the full width |
+
+## Where this runs
+
+These plugins are installed into a DSH profile on the machine **`sloptop`**, at:
+
+```
+D:\Letters\MatTroiSeConMoc\.dsh\profiles\web\plugins\
+```
+
+That path is the profile's `plugins/` directory, wired in through
+`profiles/web/package.json`. The exact location is machine-specific; on another
+install it is `$DSH_HOME/profiles/web/plugins/`. Every script here reads the host
+from environment variables so it can be pointed elsewhere:
+
+| Variable | Meaning | Default in this repo |
+| --- | --- | --- |
+| `DSH_HOME` | the Harness home directory | `D:\Letters\MatTroiSeConMoc\.dsh` |
+| `DSH_AUTHORITY` | the host:port serving the Web GUI | `sloptop.taild88607.ts.net:3080` |
+| `DSH_PLUGIN_DIR` | where these plugin directories are installed | `$DSH_HOME/profiles/web/plugins` |
+
+## Installing
+
+A DSH plugin is a package the profile's Cordis loader mounts. Three steps per
+plugin:
+
+1. **Place the directory** in `$DSH_PLUGIN_DIR`.
+2. **Link it** so bare-specifier resolution works — a junction on Windows, a
+   symlink elsewhere:
+
+   ```powershell
+   New-Item -ItemType Junction `
+     -Path "$DSH_HOME\profiles\web\node_modules\dsh-opencode-go-usage" `
+     -Target "$DSH_HOME\profiles\web\plugins\dsh-opencode-go-usage"
+   ```
+
+3. **List it** in `$DSH_HOME/profiles/web/package.json`, as both a bundle and a
+   `link:` dependency:
+
+   ```json
+   {
+     "dsh": {
+       "profile": {
+         "bundles": [
+           "dsh-opencode-go-session",
+           "@deepseek-ai/dsh-base",
+           "@deepseek-ai/dsh-web-app",
+           "dsh-opencode-go-usage",
+           "dsh-mobile-rail"
+         ],
+         "patchReload": "live"
+       }
+     },
+     "dependencies": {
+       "dsh-opencode-go-usage": "link:D:/path/to/plugins/dsh-opencode-go-usage"
+     }
+   }
+   ```
+
+Bundle order matters for `dsh-opencode-go-session`: it must activate **before**
+`@deepseek-ai/dsh-llm-pi-ai`, which resolves its provider catalog eagerly. The
+other two have no ordering constraint.
+
+Then restart `dsh web` and reload the browser (see *Reloading* below).
+
+## Reloading
+
+DSH has two reload paths, and which one applies depends on what changed:
+
+| Change | Applies |
+| --- | --- |
+| `cordis.patch.yml` (row config, adding or removing rows) | **live** — `patchReload: "live"` watches it |
+| `lib/client.js` | **live** — `dsh-client-hmr` polls it and swaps the bundle in the browser |
+| `index.js` (host plugin code) | **restart `dsh web`** — module HMR is disabled in `dsh-base` |
+
+A **newly added** client plugin is not injected into an already-running page, so
+its first load also needs a browser reload.
+
+## Verifying
+
+Each plugin ships its own checks. They are the reason these plugins work — every
+one of them caught a real bug during development.
+
+```powershell
+# host half: cached fetch, credential resolution, /api route
+node plugins\dsh-opencode-go-usage\verify.mjs
+
+# client half: bundle envelope, seat wiring, panel placement maths
+node plugins\dsh-opencode-go-usage\verify-client.mjs
+
+# both plugins are actually served by a running instance
+node plugins\dsh-mobile-rail\check-live.mjs
+```
+
+`check-live.mjs` and the other live scripts need a running GUI; point them with
+`DSH_AUTHORITY`. `verify-client.mjs` needs nothing — it stubs the DOM and module
+table and evaluates the real bundle.
+
+## Notes from building these
+
+Findings that cost real debugging time, recorded so they need not be rediscovered:
+
+- **OpenCode Go usage is readable, but undocumented.**
+  `GET https://opencode.ai/zen/go/v1/usage` returns the three rolling windows.
+  It is not in the [Go docs](https://opencode.ai/docs/go/), which point only at
+  the web console. Inference responses carry **no** rate-limit headers, so
+  polling that endpoint is the only option. See
+  [`dsh-opencode-go-usage/README.md`](plugins/dsh-opencode-go-usage/README.md).
+
+- **The three Go windows do not nest in time.** The limits nest (5-hour is 20% of
+  the monthly allowance, weekly is 50%), but the weekly window resets on a fixed
+  weekday boundary and the monthly cycle follows the subscription date, so a week
+  can begin before the month does. Measured on a live account: the week started
+  four days *before* the monthly window. Drawing it nested would be a lie.
+
+- **`grid-template-columns` on the layout frame resists stylesheet overrides.**
+  The browser's own matched-styles API confirmed the rule winning the cascade,
+  and the track still computed to its old value; a freshly injected identical
+  sheet had no effect either. Sizing the column instead works. See
+  [`dsh-mobile-rail/README.md`](plugins/dsh-mobile-rail/README.md).
+
+- **`tailscale serve` plus the Host fence.** Plain-HTTP Serve preserves the
+  client's `Host` header, which DSH's `/api` fence rejects with 403 for a non-loopback
+  authority. `--trusted-host` fixes the fence; note the authority must match what
+  Serve presents *exactly*. See
+  [`dsh-mobile-rail/TRUSTED-HOST-FINDING.md`](plugins/dsh-mobile-rail/TRUSTED-HOST-FINDING.md).
+
+- **There is no slot inside the context-meter popover.** DSH's only UI
+  contribution mechanism is the slot registry; the popover's children are a
+  hardcoded array. The nearest supported seat is `conversation.input.right`,
+  which is where the ring lives.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

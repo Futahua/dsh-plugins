@@ -1,0 +1,22 @@
+{
+  "name": "dsh-opencode-go-usage",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenCode Go subscription usage (5-hour / weekly / monthly) for the DSH Web GUI",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "dsh-opencode-go-session",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Per-conversation x-opencode-session header and catalog catch-up for the OpenCode Go route",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}
