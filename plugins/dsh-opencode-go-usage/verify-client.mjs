@@ -4,8 +4,15 @@
  * The real rendering needs a browser, but this catches the failures that
  * actually bite: syntax errors, a wrong bundle envelope, a missing export, and
  * a mis-wired slot registration. It stubs `window.__ModuleLoader__`, `require`,
- * and a minimal DOM. Run:
- *   node .dsh/profiles/web/plugins/dsh-opencode-go-usage/verify-client.mjs
+ * a minimal DOM, and a minimal React, so it runs from a fresh clone with no
+ * dependencies installed:
+ *
+ *   node plugins/dsh-opencode-go-usage/verify-client.mjs
+ *
+ * The React stub is intentionally tiny: this never renders, it only evaluates
+ * the bundle and inspects what it registered. `createElement` returns a plain
+ * descriptor, and the hooks are inert, which is enough for the module body to
+ * run and for `apply` to be exercised.
  */
 import { readFileSync } from "node:fs";
 
@@ -27,16 +34,26 @@ globalThis.document = {
 
 // --- capture the module registration ------------------------------------------
 let registration;
-globalThis.window = { __ModuleLoader__: { load: (value) => { registration = value; } } };
+globalThis.window = {
+	innerWidth: 419,
+	__ModuleLoader__: { load: (value) => { registration = value; } },
+};
 
-const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
-const react = await import("react");
+/** Minimal React surface: element descriptors plus inert hooks. */
+const reactStub = {
+	createElement: (type, props, ...children) => ({ type, props, children }),
+	useState: (initial) => [typeof initial === "function" ? initial() : initial, () => {}],
+	useEffect: () => {},
+	useRef: (initial) => ({ current: initial ?? null }),
+	Fragment: Symbol("Fragment"),
+};
 const requireStub = (specifier) => {
-	if (specifier === "react") return react;
+	if (specifier === "react") return reactStub;
 	throw new Error(`unexpected require(${JSON.stringify(specifier)}) — the bundle should only need React`);
 };
 
 // Evaluate the bundle exactly as the browser would.
+const source = readFileSync(new URL("./lib/client.js", import.meta.url), "utf8");
 new Function("window", "require", source)(globalThis.window, requireStub);
 
 console.log("bundle envelope:");
@@ -97,6 +114,28 @@ for (const [label, wrapRect, viewport] of placementCases) {
   const fits = viewportLeft >= M - 0.5 && viewportLeft + W <= viewport - M + 0.5;
   check(label, fits, `viewport x=${viewportLeft}..${viewportLeft + W} of ${viewport}`);
 }
+
+console.log("nested allowance bar:");
+// The ratios are the real Go allowances for a $60 monthly model: $30 / $60 and
+// $12 / $60. They are what makes the nesting mean something.
+check("monthly spans the whole track", exported.SHARES?.monthly === 100, String(exported.SHARES?.monthly));
+check("weekly is half the allowance", exported.SHARES?.weekly === 50, String(exported.SHARES?.weekly));
+check("5-hour is a fifth of it", exported.SHARES?.rolling === 20, String(exported.SHARES?.rolling));
+const colours = exported.COLORS ?? {};
+check("every window has its own colour", new Set(Object.values(colours)).size === 3, Object.values(colours).join(" "));
+check("the ring wears the 5-hour colour", /#e79aa6/u.test(String(styleTags[0]?.textContent)), "arc rule");
+// Centring is what makes the containment read: each window sits inside its parent.
+const centre = (key) => (100 - (exported.SHARES?.[key] ?? 100)) / 2;
+check(
+	"weekly is centred inside monthly",
+	centre("weekly") === 25 && centre("weekly") + exported.SHARES.weekly === 75,
+	`${centre("weekly")}% .. ${centre("weekly") + exported.SHARES.weekly}%`,
+);
+check(
+	"5-hour is centred inside weekly",
+	centre("rolling") >= centre("weekly") && centre("rolling") + exported.SHARES.rolling <= centre("weekly") + exported.SHARES.weekly,
+	`${centre("rolling")}% .. ${centre("rolling") + exported.SHARES.rolling}%`,
+);
 
 console.log("");
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
