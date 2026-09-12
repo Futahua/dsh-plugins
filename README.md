@@ -7,7 +7,7 @@ developed and verified against a live installation.
 | --- | --- |
 | [`dsh-opencode-go-usage`](plugins/dsh-opencode-go-usage/) | Shows OpenCode Go subscription usage: a progress ring in the composer, and a nested-window panel on click |
 | [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
-| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its edges back: both the sidebar rail and the browser-agent pane become invisible edge bands, with a highlight under the finger, a flash on the click, and the real panel sliding in |
+| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its edges back: both the sidebar rail and the browser-agent pane become invisible edge bands, with a highlight under the finger, a flash on the click, and the real panel sliding in — and both stand down while you are typing |
 
 The operational scripts — bringing the harness up at boot, restarting it to load
 a plugin's host half, opening an authenticated GUI, and the Tailscale auth bridge
@@ -171,6 +171,15 @@ Findings that cost real debugging time, recorded so they need not be rediscovere
   inline value, so the fix needs no patch to the package — which matters, because an
   earlier revision *did* patch it inside `node_modules`, and `npm install` would have
   silently undone every one of those fixes.
+
+- **A tap an edge band claims never reaches the app.** Both bands call
+  `stopPropagation`, which is what keeps a tap from activating something underneath —
+  and also what stopped the tap that leaves the keyboard from blurring the composer.
+  `dsh-mobile-rail` therefore goes completely inert while a text field has focus,
+  claiming nothing at all. The composer is a Lexical **contenteditable div**
+  (`data-composer-input`, `role="textbox"`), not a textarea, so detection reads
+  `isContentEditable` — and deliberately not a bare `role="textbox"`, because a
+  session-less composer renders the same DOM inert.
 
 - **Background tabs never run `requestAnimationFrame`.** A freshly created Android
   Chrome tab is a background tab until you look at it, and a plugin that coalesced its

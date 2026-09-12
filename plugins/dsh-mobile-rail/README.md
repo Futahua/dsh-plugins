@@ -46,6 +46,7 @@ Both edges get the same treatment, and both are driven entirely from this plugin
 | 8 | Right-edge tap opens the pane, sliding in from the right | capture `pointerdown`, `clientX >= innerWidth - 24` |
 | 9 | Tap beside the open pane closes it | `clientX <` the panel's left edge |
 | 10 | Settle the pane's packaged expanded default once, without a flash | `html[data-dsh-pane-boot]` + the pane's own toggle |
+| 11 | Stand down entirely while a text field has focus | `document.activeElement` is an editable field |
 
 Both bands behave like buttons: the band **highlights** while a finger is on it (even
 a thumb brushing past), the **click flashes** it, and only a **tap** opens anything —
@@ -99,6 +100,33 @@ at `lib/client.js.orig`), and nothing outside this directory is modified.
 - **Scroll gestures that start inside a band** do not open anything: the release has
   to be within 12px of the press to count as a tap.
 
+## While you are typing, both bands stand down
+
+The natural way to leave the keyboard on a phone is to tap the empty band beside the
+composer. That tap lands **on this plugin's bands**, and the bands call
+`stopPropagation` — so before this existed, the tap never reached the app, the field
+never blurred, the keyboard stayed up and a panel opened instead.
+
+So while a text field has focus, both bands are completely inert: no highlight, no
+activation, and nothing claimed — not even `stopPropagation` — so the tap goes to the
+app and does what it was meant to do. The `armed` flag is not set either, which means
+the *release* of that same tap cannot open anything even though focus has gone by then.
+
+Detection is a read of `document.activeElement` on each gesture (no focus listeners,
+which can be missed), and it is deliberately narrow:
+
+- `INPUT` with a text-like `type`. A focused checkbox or button is not typing;
+- `TEXTAREA`;
+- `isContentEditable === true` — the composer is a **Lexical contenteditable div**,
+  not a textarea: `<div contentEditable role="textbox" aria-multiline
+  data-composer-input>`, from `ComposerContentEditable` in
+  `@deepseek-ai/dsh-client-ui-conversation`;
+- anything inside `[data-composer-input][contenteditable="true"]` or
+  `[role="textbox"][contenteditable="true"]`.
+
+A bare `[role="textbox"]` is **not** enough: a session-less composer renders the same
+DOM inert, and an inert field holding focus must not disable the bands.
+
 ## Failure modes
 
 Stated plainly, because an earlier revision failed silently and looked like it had
@@ -111,6 +139,9 @@ worked:
   sidebar staying the frame's first grid child and the centre column the second, and
   on the browser-agent package continuing to publish `data-dsh-browser-pane`. The
   checks assert the centre column is still `centerCol`.
+- The typing stand-down relies on focus staying on the editable element. If a future
+  composer keeps focus on a wrapper that is neither editable nor inside
+  `[data-composer-input]`, the bands would stay live while typing.
 - **Background tabs do not run `requestAnimationFrame`.** The first version of this
   plugin coalesced its work through rAF, so it did nothing at all in a freshly
   created Android Chrome tab (which is a background tab until you look at it):

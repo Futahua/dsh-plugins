@@ -111,6 +111,7 @@ const sidebarSlot = {
 const styleTags = [];
 const body = [];
 const documentStub = {
+	activeElement: null,
 	documentElement: { attrs: {}, setAttribute(n) { this.attrs[n] = ""; }, removeAttribute(n) { delete this.attrs[n]; }, hasAttribute(n) { return n in this.attrs; } },
 	querySelector: (selector) => {
 		if (selector === '[data-slot="sidebar"]') return sidebarSlot;
@@ -184,7 +185,7 @@ exported.apply({ effect: (fn, label) => effects.push({ fn, label }) });
 check("registers both effects", effects.length === 2, String(effects.length));
 check("labels every effect", effects.every((e) => typeof e.label === "string"));
 check("publishes a build marker with both edges",
-	globalThis.window.__dshMobileRail?.version === 8 &&
+	globalThis.window.__dshMobileRail?.version === 9 &&
 		JSON.stringify(globalThis.window.__dshMobileRail?.edges) === '["left","right"]',
 	JSON.stringify(globalThis.window.__dshMobileRail));
 
@@ -359,6 +360,92 @@ check("the left band is inert at 1280px", frameOpen === false && activations ===
 press(1270, 400);
 release(1270, 400);
 check("the right band is inert at 1280px", paneOpen === false && activations === 0);
+globalThis.window.innerWidth = 419;
+
+console.log("standing down while a text field has focus:");
+/** A focused element that counts as typing, shaped the way the page sees one. */
+const textField = (tag, extra = {}) => ({
+	tagName: tag,
+	isContentEditable: false,
+	getAttribute: (n) => (n === "type" ? null : null),
+	closest: () => null,
+	...extra,
+});
+frameOpen = false;
+paneOpen = false;
+activations = 0;
+documentStub.activeElement = textField("TEXTAREA");
+const whileTyping = press(10, 400);
+check("the tap is NOT swallowed: the app must receive it to blur the field",
+	whileTyping.propagationStopped === false && whileTyping.defaultPrevented === false);
+check("the left band does not highlight while typing", heldOn(EDGE) === false);
+release(10, 400);
+check("and tapping it does not open the sidebar", frameOpen === false && activations === 0);
+
+activations = 0;
+const rightWhileTyping = press(RIGHT, 400);
+check("the right band is inert too", rightWhileTyping.propagationStopped === false && heldOn(PANE) === false);
+release(RIGHT, 400);
+check("and does not open the pane", paneOpen === false && activations === 0);
+
+// The real composer is a Lexical contenteditable div:
+//   <div contentEditable role="textbox" aria-multiline data-composer-input>
+// (ComposerContentEditable in @deepseek-ai/dsh-client-ui-conversation.) These three
+// cases mirror the predicate's inputs exactly.
+documentStub.activeElement = textField("DIV", { isContentEditable: true });
+activations = 0;
+release(press(10, 400), 10, 400);
+check("the composer's editable div counts as typing", frameOpen === false && activations === 0);
+
+documentStub.activeElement = textField("DIV", {
+	// A focused wrapper that sits inside the app's own composer host.
+	closest: (sel) => (sel.includes("data-composer-input") ? {} : null),
+});
+activations = 0;
+release(press(10, 400), 10, 400);
+check("so does anything inside [data-composer-input]", frameOpen === false && activations === 0);
+
+// A session-less composer renders the same role but is NOT editable, and an inert
+// field holding focus must not disable the bands.
+documentStub.activeElement = textField("DIV", {
+	getAttribute: (n) => (n === "role" ? "textbox" : null),
+	closest: (sel) => (sel.includes('contenteditable="true"') ? null : {}),
+});
+activations = 0;
+press(10, 400);
+release(10, 400);
+check("an inert role=textbox is not typing, so the bands still work",
+	frameOpen === true && activations === 1);
+
+// A focused checkbox is not typing either.
+documentStub.activeElement = textField("INPUT", { getAttribute: (n) => (n === "type" ? "checkbox" : null) });
+frameOpen = true;
+activations = 0;
+press(300, 400);
+check("a focused checkbox is not typing, so the bands still work", frameOpen === false);
+
+// Once focus leaves, the bands come back.
+documentStub.activeElement = null;
+frameOpen = true;
+activations = 0;
+press(300, 400);
+check("a tap beside the open drawer closes it again once typing has stopped", frameOpen === false);
+activations = 0;
+press(10, 400);
+release(10, 400);
+check("and the left band opens it again", frameOpen === true && activations === 1);
+// Close it before testing the right band: with a panel already open, a tap anywhere
+// beside it closes that panel first, which is a deliberate priority -- leaving the
+// drawer open here would have measured that rule instead of the band.
+press(300, 400);
+check("closed again for the right-band test", frameOpen === false);
+paneOpen = false;
+const beforeRight = activations;
+press(RIGHT, 400);
+release(RIGHT, 400);
+check("the right band opens the pane again", paneOpen === true && activations === beforeRight + 1);
+press(5, 400);
+check("and a tap beside the pane closes it again", paneOpen === false);
 
 console.log("unloading:");
 for (const dispose of disposers) if (typeof dispose === "function") dispose();
@@ -371,3 +458,4 @@ await sleep(50);
 console.log("");
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
 process.exitCode = failures === 0 ? 0 : 1;
+

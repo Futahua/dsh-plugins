@@ -14,6 +14,10 @@
  * invisible band you can press (the band highlights under the finger), and a click
  * that flashes the band and slides the real panel in.
  *
+ * While a text field has focus both bands stand down completely, because the tap
+ * that leaves the keyboard is a tap on those same bands: it has to reach the app to
+ * blur the field, so nothing is claimed, not even `stopPropagation`.
+ *
  * This plugin owns the whole of that behaviour, which is deliberate: an earlier
  * revision patched the browser-agent package inside `node_modules` instead, and
  * every one of those patches would have been erased by the next `npm install`.
@@ -74,6 +78,16 @@ window.__ModuleLoader__.load({
 
 		/** The slide-in duration, shared with the stylesheet so the two cannot drift. */
 		const RAIL_MS = 240;
+
+		/**
+		 * Input types that are not text entry.
+		 *
+		 * A focused checkbox is not typing, and the bands must keep working around one.
+		 */
+		const NON_TEXT_INPUTS = new Set([
+			"button", "checkbox", "color", "file", "hidden", "image",
+			"radio", "range", "reset", "submit",
+		]);
 
 		/**
 		 * The two edges, as data.
@@ -218,9 +232,47 @@ window.__ModuleLoader__.load({
 			return x >= window.innerWidth - EDGE_PX;
 		}
 
-		/** Should this band respond at all? Only while its own panel is closed. */
+		/**
+		 * Is the user typing?
+		 *
+		 * On a phone the on-screen keyboard is up whenever a text field holds focus, and
+		 * the natural way to leave it is to tap the empty band beside the composer. That
+		 * tap has to reach the app -- blurring the field is what dismisses the keyboard --
+		 * so while a text field is focused both bands stand down completely: no
+		 * highlight, no activation, and no `stopPropagation` to swallow the tap.
+		 *
+		 * Read per gesture rather than tracked with focus listeners: the answer is only
+		 * ever wanted at the moment a finger lands, and a listener can be missed (the
+		 * field can lose focus without a blur event reaching this document).
+		 */
+		function isTyping() {
+			if (typeof document === "undefined") return false;
+			const el = document.activeElement;
+			if (el === null || el === undefined || el === document.body) return false;
+			if (el.tagName === "TEXTAREA") return true;
+			if (el.tagName === "INPUT") {
+				return !NON_TEXT_INPUTS.has((el.getAttribute("type") ?? "text").toLowerCase());
+			}
+			// The composer is a Lexical contenteditable div rather than a textarea --
+			// `<div contentEditable role="textbox" aria-multiline data-composer-input>`,
+			// from `ComposerContentEditable` in @deepseek-ai/dsh-client-ui-conversation.
+			// `isContentEditable` is the authority, because it is true only while the
+			// editor is actually editable; the app's own `data-composer-input` flag then
+			// names the element outright. Deliberately NOT a bare `[role="textbox"]`
+			// match: a session-less composer renders the same DOM inert, and an inert
+			// composer holding focus must not disable the bands.
+			if (el.isContentEditable === true) return true;
+			return typeof el.closest === "function" &&
+				el.closest('[data-composer-input][contenteditable="true"], [role="textbox"][contenteditable="true"]') !== null;
+		}
+
+		/**
+		 * Should this band respond at all?
+		 *
+		 * Only while its own panel is closed, and never while the user is typing.
+		 */
 		function bandLive(edge) {
-			if (!isNarrow()) return false;
+			if (!isNarrow() || isTyping()) return false;
 			return edge.closed(frame());
 		}
 
@@ -352,6 +404,9 @@ window.__ModuleLoader__.load({
 				if (!isNarrow()) return;
 				// Only the primary button ever opens or closes a panel.
 				if (event.pointerType === "mouse" && event.button !== 0) return;
+				// Typing: the tap belongs to the app. Return before anything is claimed --
+				// not even `stopPropagation` -- so the field blurs and the keyboard goes.
+				if (isTyping()) return;
 				const el = frame();
 
 				// 1. Something is open and this tap is beside it: close it, at once.
@@ -653,7 +708,7 @@ window.__ModuleLoader__.load({
 		 * swap; a version on the window makes "is the new bundle running?" a measurement
 		 * instead of an assumption.
 		 */
-		const VERSION = 8;
+		const VERSION = 9;
 
 		const inject = [];
 
