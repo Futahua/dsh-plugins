@@ -176,6 +176,16 @@ window.__ModuleLoader__.load({
 			"border:1px solid var(--dsw-alias-border-secondary,rgba(127,127,127,.3));",
 			"box-shadow:0 6px 24px rgba(0,0,0,.28)}",
 			".dsh-go-usage-title{font-weight:600;margin-bottom:8px}",
+			// The hover glance: swatches and numbers only, sized to its content.
+			".dsh-go-usage-quick{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);",
+			"z-index:60;box-sizing:border-box;max-width:calc(100vw - 24px);padding:7px 10px;border-radius:9px;",
+			"display:flex;flex-direction:column;gap:5px;font-size:12px;line-height:1.3;text-align:left;",
+			"background:var(--dsw-alias-bg-elevated,#1f1f1f);color:var(--dsw-alias-label-primary,#eee);",
+			"border:1px solid var(--dsw-alias-border-secondary,rgba(127,127,127,.3));",
+			"box-shadow:0 6px 24px rgba(0,0,0,.28);pointer-events:none}",
+			".dsh-go-usage-quickrow{display:flex;align-items:center;gap:6px;white-space:nowrap}",
+			".dsh-go-usage-swatch{width:8px;height:8px;border-radius:2px;flex:none}",
+			".dsh-go-usage-quickval{margin-left:auto;padding-left:10px;font-weight:600;font-variant-numeric:tabular-nums}",
 			// Three rows, each a full-width view of the same monthly scale.
 			".dsh-go-usage-rows{display:flex;flex-direction:column;gap:7px}",
 			".dsh-go-usage-row{display:flex;align-items:center;gap:8px}",
@@ -356,8 +366,11 @@ window.__ModuleLoader__.load({
 		function GoUsagePill() {
 			const [state, setState] = react.useState({ status: "loading" });
 			const [open, setOpen] = react.useState(false);
+			// Hover glance: three swatches and their numbers, without the chart.
+			const [hovered, setHovered] = react.useState(false);
 			const wrapRef = react.useRef(null);
 			const panelRef = react.useRef(null);
+			const quickRef = react.useRef(null);
 
 			react.useEffect(() => {
 				let live = true;
@@ -380,13 +393,15 @@ window.__ModuleLoader__.load({
 			}, []);
 
 			// Clamp the panel into view once laid out, and again on resize/rotation.
+			// The hover glance is positioned the same way so the two never disagree
+			// about where the pill is.
 			react.useEffect(() => {
-				if (!open) return undefined;
-				const place = () => placePanel(wrapRef.current, panelRef.current);
+				if (!open && !hovered) return undefined;
+				const place = () => placePanel(wrapRef.current, panelRef.current ?? quickRef.current);
 				place();
 				window.addEventListener("resize", place);
 				return () => window.removeEventListener("resize", place);
-			}, [open]);
+			}, [open, hovered]);
 
 			// Same dismissal behaviour as the context meter.
 			react.useEffect(() => {
@@ -416,6 +431,20 @@ window.__ModuleLoader__.load({
 				react.createElement(UsageRow, { key: g.key, geometry: g, window: byKey[g.key], anchor }),
 			);
 
+			// The hover glance: one swatch and one number per window, nothing else.
+			// A quick read for a pointer, where the full chart would be too much.
+			const quick = ORDER.map((key) => byKey[key])
+				.filter(Boolean)
+				.map((w) =>
+					react.createElement(
+						"span",
+						{ className: "dsh-go-usage-quickrow", key: w.key },
+						react.createElement("span", { className: "dsh-go-usage-swatch", style: { background: COLORS[w.key] } }),
+						w.label,
+						react.createElement("b", { className: "dsh-go-usage-quickval" }, `${Math.round(w.percent ?? 0)}%`),
+					),
+				);
+
 			const note =
 				state.status === "error"
 					? `Unavailable: ${state.message}`
@@ -434,8 +463,15 @@ window.__ModuleLoader__.load({
 						"data-level": level(reading),
 						"aria-haspopup": "dialog",
 						"aria-expanded": open,
-						title: reading === undefined ? "OpenCode Go usage" : `OpenCode Go · 5-hour ${Math.round(reading)}%`,
+						// No `title`: a native tooltip would fight the hover glance, and it
+						// is useless on touch anyway. The ring carries an aria-label.
 						onClick: () => setOpen((value) => !value),
+						// Hover only where a pointer can actually hover; on touch, a tap
+						// fires pointerenter too, which would flash the glance first.
+						onPointerEnter: (event) => {
+							if (event.pointerType === "mouse") setHovered(true);
+						},
+						onPointerLeave: () => setHovered(false),
 					},
 					react.createElement(UsageRing, {
 						percent: reading,
@@ -455,7 +491,13 @@ window.__ModuleLoader__.load({
 								: react.createElement("div", null, "No reading available"),
 							note ? react.createElement("div", { className: "dsh-go-usage-note" }, note) : null,
 						)
-					: null,
+					: hovered && quick.length > 0
+						? react.createElement(
+								"div",
+								{ className: "dsh-go-usage-quick", ref: quickRef, role: "tooltip" },
+								quick,
+							)
+						: null,
 			);
 		}
 
