@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>DSH pane input probe</title>
+<style>
+  /* Tall page so a wheel event has somewhere to scroll. */
+  body { margin: 0; height: 3000px; font: 16px system-ui, sans-serif; background: #f4f4f5; }
+  #hud { position: fixed; top: 0; left: 0; right: 0; z-index: 5;
+         background: #1e293b; color: #fff; padding: 8px 12px;
+         font: 600 14px ui-monospace, monospace; }
+  #drop { position: absolute; top: 200px; left: 200px; width: 220px; height: 110px;
+          background: #334155; color: #fff; display: flex; align-items: center;
+          justify-content: center; user-select: none; }
+  #field { position: absolute; top: 420px; left: 200px; width: 420px;
+           font-size: 20px; padding: 10px; }
+</style>
+
+<div id="hud">scrollY <span id="sy">0</span> | hits <span id="hc">0</span></div>
+<div id="drop">drag me</div>
+<input id="field" placeholder="type here">
+
+<script>
+  // Everything the test reads back lives here, so a single evaluate answers it.
+  window.__input = { keys: [], scrolls: [], drop: null, clicks: 0 }
+
+  addEventListener('scroll', () => {
+    document.getElementById('sy').textContent = Math.round(scrollY)
+    window.__input.scrolls.push(Math.round(scrollY))
+  })
+
+  addEventListener('keydown', (e) => {
+    window.__input.keys.push({ key: e.key, code: e.code })
+  })
+
+  // Drag: mousedown on the box, mousemove carries it, mouseup records where it
+  // was released. Uses mouse events, which is what the pane actually dispatches.
+  const box = document.getElementById('drop')
+  let dragging = false, startX = 0, startY = 0
+  box.addEventListener('mousedown', (e) => {
+    dragging = true; startX = e.clientX; startY = e.clientY
+    box.style.background = '#b45309'
+  })
+  addEventListener('mousemove', (e) => {
+    if (!dragging) return
+    box.style.left = (200 + e.clientX - startX) + 'px'
+    box.style.top = (200 + e.clientY - startY) + 'px'
+  })
+  addEventListener('mouseup', (e) => {
+    if (!dragging) return
+    dragging = false
+    box.style.background = '#166534'
+    window.__input.drop = { x: e.clientX, y: e.clientY }
+  })
+
+  addEventListener('click', () => {
+    window.__input.clicks += 1
+    document.getElementById('hc').textContent = window.__input.clicks
+  })
+
+  window.__readInput = () => ({
+    scrollY: Math.round(scrollY),
+    scrolls: window.__input.scrolls.slice(-6),
+    keys: window.__input.keys.slice(-24),
+    drop: window.__input.drop,
+    clicks: window.__input.clicks,
+    field: document.getElementById('field').value,
+    boxPos: { left: box.style.left, top: box.style.top },
+  })
+
+  window.__resetInput = () => {
+    window.__input = { keys: [], scrolls: [], drop: null, clicks: 0 }
+    scrollTo(0, 0)
+    box.style.left = '200px'; box.style.top = '200px'; box.style.background = '#334155'
+    const f = document.getElementById('field'); f.value = ''; f.blur()
+    return 'reset'
+  }
+</script>

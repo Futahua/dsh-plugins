@@ -44,6 +44,10 @@ the launcher by hand. `boot-dsh.ps1` is the missing first half.
 | [`pane-lease-verify.mjs`](pane-lease-verify.mjs) | Twelve checks on the lease, including that corrupt state denies rather than grants. |
 | [`pane-input-proof.mjs`](pane-input-proof.mjs) | Measures the pane's coordinate transform: dispatches clicks, then you read back what was hit. |
 | [`coord-test.html`](coord-test.html) | The 2×2 target page those clicks are aimed at. |
+| [`pane-input-tests.mjs`](pane-input-tests.mjs) | Measures drag, wheel and keyboard against `input-test.html`. |
+| [`input-test.html`](input-test.html) | Scroll / drag / type target page for the above. |
+| [`phone-eval.mjs`](phone-eval.mjs) | Evaluate JS in a chosen tab of the phone's Chrome over the adb CDP forward. |
+| [`phone-touch-proof.mjs`](phone-touch-proof.mjs) | Aim a real touch at a *fraction* of the pane image, and derive the expected page coordinate from the same fraction. |
 
 ## Pane ownership, and what a lease can actually enforce
 
