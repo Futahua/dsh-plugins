@@ -71,12 +71,32 @@ check("targets a stable frame class", css.includes(".dsh-mobile-rail-frame"));
 check("does NOT depend on a hashed class", !css.includes("pI_x6G"));
 check("collapses the sidebar column", css.includes("width:0!important"));
 check("avoids display:none (it collapsed the centre)", !css.includes("display:none"));
-check("provides a touch reveal", css.includes("[data-rail-revealed]"));
-check("restores width on reveal", css.includes("width:56px!important"));
-check("installs a touchstart listener on run", (() => {
+// The strip is gone: the rail is never re-shown by CSS, because the edge gesture
+// now opens the product's real sidebar instead.
+check("no CSS-revealed strip remains", !css.includes("[data-rail-revealed]"));
+check("no hardcoded rail width", !css.includes("56px"));
+check("provides the edge tap target", css.includes("width:28px"));
+
+console.log("sidebar toggle:");
+// The edge gesture must delegate to the product's own toggle, never fake state.
+check("finds the toggle by aria-expanded", typeof exported.sidebarToggle === "function");
+check("exposes the edge band width", exported.EDGE_PX === 28, String(exported.EDGE_PX));
+check("installs a pointerdown listener on run", (() => {
 	for (const e of effects) e.fn();
-	return listeners.has("touchstart");
-})(), "touchstart");
+	return listeners.has("pointerdown");
+})(), "pointerdown");
+check("does not install touch-only listeners", !listeners.has("touchstart") && !listeners.has("touchmove"));
+
+// Both gestures must resolve to the same product control, so there is one source
+// of truth for whether the sidebar is open.
+const fakeButton = { clicks: 0, click() { this.clicks += 1 }, hasAttribute: () => true };
+const fakeSidebar = { querySelectorAll: () => [fakeButton] };
+const realQuery = globalThis.document.querySelector;
+globalThis.document.querySelector = (selector) =>
+	selector === '[data-slot="sidebar"]' ? fakeSidebar : realQuery.call(globalThis.document, selector);
+const found = exported.sidebarToggle();
+check("prefers a control reporting aria-expanded", found === fakeButton);
+globalThis.document.querySelector = realQuery;
 
 console.log("");
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
