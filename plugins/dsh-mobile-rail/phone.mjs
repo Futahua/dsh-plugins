@@ -73,12 +73,24 @@ export async function newTab(port = CDP_PORT, url = GUI_URL) {
 	const res = await call("Target.createTarget", { url });
 	ws.close();
 	if (res.result?.targetId === undefined) throw new Error(`could not open a tab: ${JSON.stringify(res.error)}`);
+	let found;
 	for (let i = 0; i < 20; i++) {
-		const found = (await tabs(port)).find((t) => t.id === res.result.targetId);
-		if (found !== undefined) return found;
+		found = (await tabs(port)).find((t) => t.id === res.result.targetId);
+		if (found !== undefined) break;
 		await sleep(150);
 	}
-	throw new Error("the new tab never appeared in /json/list");
+	if (found === undefined) throw new Error("the new tab never appeared in /json/list");
+	// Android Chrome sometimes hands back a blank tab instead of navigating the one it
+	// just created, which then waits forever for a page that never arrives. Drive it
+	// explicitly and hand back the refreshed target.
+	if ((found.url ?? "") === "" || (found.url ?? "") === "about:blank") {
+		const blank = await attach(found, { front: false });
+		await blank.call("Page.navigate", { url });
+		blank.close();
+		await sleep(400);
+		found = (await tabs(port)).find((t) => t.id === res.result.targetId) ?? found;
+	}
+	return found;
 }
 
 /** Close a tab by target id. */
@@ -91,10 +103,23 @@ export async function attach(target, { front = true } = {}) {
 	const ws = new WebSocket(target.webSocketDebuggerUrl);
 	let id = 0;
 	const pending = new Map();
+	/**
+	 * Every call is bounded.
+	 *
+	 * A wedged renderer never answers, and an unanswered CDP call used to hang the
+	 * whole script with no clue why. A timeout turns that into a diagnosable error.
+	 */
+	const CALL_TIMEOUT_MS = Number(process.env.DSH_CDP_TIMEOUT_MS ?? 15000);
 	const call = (method, params = {}) =>
 		new Promise((resolve) => {
 			const i = ++id;
-			pending.set(i, resolve);
+			const timer = setTimeout(() => {
+				if (pending.delete(i)) resolve({ timedOut: true, method });
+			}, CALL_TIMEOUT_MS);
+			pending.set(i, (message) => {
+				clearTimeout(timer);
+				resolve(message);
+			});
 			ws.send(JSON.stringify({ id: i, method, params }));
 		});
 	ws.addEventListener("message", (e) => {
@@ -111,6 +136,7 @@ export async function attach(target, { front = true } = {}) {
 
 	const ev = async (expression) => {
 		const r = await call("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+		if (r.timedOut === true) return { __error: `no response to Runtime.evaluate within ${CALL_TIMEOUT_MS}ms (wedged renderer?)` };
 		if (r.result?.exceptionDetails) return { __error: r.result.exceptionDetails.text };
 		return r.result?.result?.value;
 	};

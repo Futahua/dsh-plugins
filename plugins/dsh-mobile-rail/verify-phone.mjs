@@ -19,8 +19,16 @@ const check = (label, ok, detail = "") => {
 };
 
 const created = await newTab(PORT);
-const page = await attach(created);
+/**
+ * Attached inside the try, and closed in `finally`.
+ *
+ * An `attach` that threw used to leave its tab behind, because the try started
+ * after it — which is how the phone accumulated blank tabs, and blank tabs are
+ * what makes Chrome on Android stop loading new ones.
+ */
+let page;
 try {
+	page = await attach(created);
 	await page.waitFor("document.querySelector('.dsh-mobile-rail-frame')!==null", { label: "the app frame" });
 	await page.waitFor("window.__dshMobileRail && window.__dshMobileRail.version>=3", { label: "bundle v3+" });
 	// Waiting for the frame is not enough: on a cold tab the product mounts the
@@ -32,6 +40,45 @@ try {
 		{ label: "the mobile layout to settle" },
 	);
 	await sleep(800);
+
+	// The app gates the whole UI behind its "Internal Testing Notice" until it is
+	// acknowledged: while that dialog is up the frame is `0px 0px 0px`, there is no
+	// sidebar and no conversation, and every geometry assertion below fails for a
+	// reason that has nothing to do with this plugin. Dismiss it first, in this tab.
+	const notice = await page.ev(`(function(){
+    var d=document.querySelector('[class*="_dialog_"]');
+    if(!d) return null;
+    var b=d.querySelector('button');
+    if(!b) return 'no button';
+    var text=(d.innerText||'').trim().slice(0,40);
+    b.click();
+    return text;
+  })()`);
+	if (notice !== null) {
+		console.log(`   dismissed an app dialog first: ${JSON.stringify(notice)}`);
+		await sleep(1200);
+	}
+	// Dismissing a dialog is not the same as being ready: the sidebar remounts after
+	// it, and the first tap below once fired into that gap. Wait for the very control
+	// this plugin drives.
+	await page.waitFor(
+		"document.querySelector('[data-slot=\"sidebar\"] button[aria-label=\"Open sidebar\"]')!==null || document.querySelector('[data-slot=\"sidebar\"] button[aria-label=\"Collapse sidebar\"]')!==null",
+		{ label: "the sidebar toggle to exist" },
+	);
+
+	/**
+	 * Does the app have a conversation on screen?
+	 *
+	 * Its testing notice and its empty state both leave the frame at `0px 0px 0px` —
+	 * no sidebar, no centre column — and in that state a width measurement says
+	 * nothing about this plugin either way. The checks that need a conversation are
+	 * therefore reported as skipped rather than quietly failing.
+	 */
+	const hasConversation = async () => (await state()).centreW > 0;
+	const skippable = async (label, ok, detail) => {
+		if (await hasConversation()) check(label, ok, detail);
+		else console.log(`  skip ${label}  (the app has no conversation open)`);
+	};
 
 	const state = async () => await page.json(STATE_EXPR);
 	/** Are the centre column's own children painted? */
@@ -50,7 +97,7 @@ try {
 	let s = s0;
 	check("sidebar collapsed", s.collapsed === true);
 	check("rail hidden", s.railHidden === true);
-	check("conversation gets the full width", s.centreW === s.viewport, `${s.centreW} of ${s.viewport}`);
+	await skippable("conversation gets the full width", s.centreW === s.viewport, `${s.centreW} of ${s.viewport}`);
 	check("centre content is painted", (await centrePainted()) === "visible");
 
 	console.log("\n2. real touch tap on the left edge (10,400):");
@@ -58,7 +105,7 @@ try {
 	s = await state();
 	check("sidebar opened", s.collapsed === false, JSON.stringify(s));
 	check("it is the real 280px sidebar", s.sidebarW === 280, String(s.sidebarW));
-	check("centre content is blanked", (await centrePainted()) === "hidden", await centrePainted());
+	await skippable("centre content is blanked", (await centrePainted()) === "hidden", await centrePainted());
 	console.log("   shot: " + (await page.shot(`${SHOTS}/verify-open.png`)));
 
 	// The animation: the glow lights on the band tap, and the drawer is caught
@@ -75,11 +122,31 @@ try {
 		(await page.ev("document.querySelector('style[data-plugin=\"dsh-mobile-rail\"]').textContent.includes('animation:dsh-mobile-rail-slide-in')")) === true);
 
 	const glowState = async () => await page.json(`(function(){
-    var g=document.querySelector('.dsh-mobile-rail-glow');
+    var g=document.querySelector('.dsh-mobile-glow[data-edge="left"]');
     return {present:!!g, lit:!!(g&&g.hasAttribute('data-lit')),
       parent:g&&g.parentNode?g.parentNode.tagName:null,
       pointerEvents:g?getComputedStyle(g).pointerEvents:null};
   })()`);
+	/**
+	 * Record whether a flash happened, from inside the page.
+	 *
+	 * The flash lasts FLASH_MS by design, and a CDP round trip over ADB can outlast
+	 * that, so reading the attribute afterwards is a race that produced false
+	 * failures. A MutationObserver in the page cannot miss it.
+	 */
+	const watchFlash = async (side) => await page.ev(`(function(){
+    var g=document.querySelector('.dsh-mobile-glow[data-edge="${side}"]');
+    if(!g) return 'no glow';
+    window.__flash = window.__flash || {};
+    window.__flash["${side}"] = false;
+    if(g.__flashWatcher) g.__flashWatcher.disconnect();
+    g.__flashWatcher = new MutationObserver(function(){
+      if(g.hasAttribute('data-lit')) window.__flash["${side}"] = true;
+    });
+    g.__flashWatcher.observe(g,{attributes:true,attributeFilter:['data-lit']});
+    return 'watching';
+  })()`);
+	const flashed = async (side) => (await page.ev(`!!(window.__flash && window.__flash["${side}"])`)) === true;
 	/**
 	 * Close the drawer, tap the band, and watch the transform while it moves.
 	 * Always resets first: an earlier version tapped the band a second time while
@@ -88,10 +155,9 @@ try {
 	const slideAndGlow = async () => {
 		if ((await state()).collapsed === false) await page.tap(350, 400);
 		const closed = (await state()).collapsed === true;
+		await watchFlash("left");
 		await page.call("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: 10, y: 400 }] });
 		await page.call("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-		// Read the glow inside its 320ms window: the sampling loop below outlives it.
-		const litNow = (await glowState()).lit;
 		let minTx = 0;
 		const samples = [];
 		for (let i = 0; i < 14; i++) {
@@ -104,7 +170,7 @@ try {
 			}
 			await sleep(30);
 		}
-		return { closed, litNow, minTx, samples };
+		return { closed, litNow: await flashed("left"), minTx, samples };
 	};
 
 	const run = await slideAndGlow();
@@ -120,12 +186,12 @@ try {
 	check("the glow element exists", lit.present === true);
 	check("it is mounted on body, not in the frame", lit.parent === "BODY", String(lit.parent));
 	check("it cannot swallow taps", lit.pointerEvents === "none", String(lit.pointerEvents));
-	check("the band tap lit it", run.litNow === true, `lit=${run.litNow} (read inside the 320ms window)`);
+	check("the band tap lit it", run.litNow === true, `lit=${run.litNow} (read inside the flash window)`);
 
 	// Is it actually above the drawer? `elementsFromPoint` skips
 	// pointer-events:none elements, so it is switched on for one reading only.
 	const stack = await page.ev(`(function(){
-    var g=document.querySelector('.dsh-mobile-rail-glow');
+    var g=document.querySelector('.dsh-mobile-glow[data-edge="left"]');
     if(!g) return 'no glow';
     g.style.pointerEvents='auto';
     var hit=document.elementsFromPoint(6,400).map(function(e){return String(e.className).slice(0,30);});
@@ -133,10 +199,55 @@ try {
     return JSON.stringify(hit.slice(0,4));
   })()`);
 	const order = JSON.parse(stack);
-	const glowAt = order.findIndex((c) => c.includes("dsh-mobile-rail-glow"));
+	const glowAt = order.findIndex((c) => c.includes("dsh-mobile-glow"));
 	const drawerAt = order.findIndex((c) => c.includes("sidebarCol"));
 	check("the glow paints above the drawer", glowAt >= 0 && (drawerAt < 0 || glowAt < drawerAt),
 		`glow ${glowAt}, drawer ${drawerAt} in ${stack}`);
+
+	console.log("\n2d. the strip behaves like a button (press highlights, click opens):");
+	/** The strip's two states, plus whether the drawer is still closed. */
+	const stripState = async () => await page.json(`(function(){
+    var g=document.querySelector('.dsh-mobile-glow[data-edge="left"]');
+    var f=document.querySelector('.dsh-mobile-rail-frame');
+    return {held:!!(g&&g.hasAttribute('data-held')), lit:!!(g&&g.hasAttribute('data-lit')),
+      closed:f.hasAttribute('data-sidebar-collapsed')};
+  })()`);
+	const touch = (type, x, y) => page.call("Input.dispatchTouchEvent", { type, touchPoints: type === "touchEnd" ? [] : [{ x, y }] });
+
+	// Reset to closed, then press and hold without lifting.
+	await page.tap(350, 400);
+	check("starting closed for the button test", (await state()).collapsed === true);
+	await touch("touchStart", 10, 400);
+	await sleep(450);
+	const holding = await stripState();
+	check("a held press highlights the strip", holding.held === true);
+	check("and does not open the drawer yet", holding.closed === true);
+	await touch("touchEnd");
+	const justAfter = await stripState();
+	check("the flash fires on the click", (await flashed("left")) === true);
+	check("the highlight is released with the finger", justAfter.held === false);
+	await sleep(500);
+	check("and the release opened the drawer", (await state()).collapsed === false);
+	check("the flash goes out again", (await stripState()).lit === false);
+
+	// A brush: press inside the strip, drag across and away, lift.
+	await page.tap(350, 400);
+	await touch("touchStart", 10, 400);
+	await touch("touchMove", 18, 400);
+	check("the highlight follows a finger still on the strip", (await stripState()).held === true);
+	await touch("touchMove", 70, 400);
+	check("and goes out as the finger leaves it", (await stripState()).held === false);
+	await touch("touchEnd");
+	await sleep(500);
+	check("a brush across the strip never opens it", (await state()).collapsed === true);
+
+	// A scroll that happens to start on the strip: travels, stays in the band.
+	await touch("touchStart", 10, 400);
+	await touch("touchMove", 10, 470);
+	await touch("touchEnd");
+	await sleep(500);
+	check("a scroll beginning on the strip never opens it", (await state()).collapsed === true,
+		"travelled 70px, so it was not a tap");
 
 	console.log("\n2c. the glow goes out by itself:");
 	await page.tap(350, 400);
@@ -144,7 +255,7 @@ try {
 	const settled = await glowState();
 	check("no longer lit", settled.lit === false);
 	check("and it is not left behind as a second element",
-		(await page.ev("document.querySelectorAll('.dsh-mobile-rail-glow').length")) === 1);
+		(await page.ev("document.querySelectorAll('.dsh-mobile-glow[data-edge=\"left\"]').length")) === 1);
 	await page.tap(10, 400);
 	check("drawer can still be opened afterwards", (await state()).collapsed === false);
 	await page.tap(350, 400);
@@ -154,8 +265,8 @@ try {
 	s = await state();
 	check("sidebar collapsed again", s.collapsed === true, JSON.stringify(s));
 	check("rail is gone again", s.railHidden === true);
-	check("conversation back to full width", s.centreW === s.viewport, `${s.centreW} of ${s.viewport}`);
-	check("centre content painted again", (await centrePainted()) === "visible");
+	await skippable("conversation back to full width", s.centreW === s.viewport, `${s.centreW} of ${s.viewport}`);
+	await skippable("centre content painted again", (await centrePainted()) === "visible");
 
 	console.log("\n4. the edge tap works repeatedly:");
 	await page.tap(10, 400);
@@ -210,11 +321,93 @@ try {
 		(await page.ev("getComputedStyle(document.querySelector('.dsh-mobile-rail-frame').children[1].children[0]).visibility")) === "visible");
 	await page.call("Emulation.clearDeviceMetricsOverride", {});
 
+	console.log("\n7. the right edge: the browser pane");
+	/** Everything that decides whether the pane is usable on a phone. */
+	const paneState = async () => await page.json(`(function(){
+    var rail=document.querySelector('[data-dsh-browser-pane="collapsed"]');
+    var panel=document.querySelector('[data-dsh-browser-pane="expanded"]');
+    var r=panel?panel.getBoundingClientRect():null;
+    var f=document.querySelector('.dsh-mobile-rail-frame');
+    return {
+      rail:!!rail, railDisplay:rail?getComputedStyle(rail).display:null,
+      panel:!!panel, panelW:r?Math.round(r.width):null, panelLeft:r?Math.round(r.left):null,
+      margin:document.body.style.marginRight||"none",
+      // The packaged pane writes its width into the inline style; this plugin wins
+      // the cascade with !important, so the COMPUTED value is what decides the
+      // layout. Asserting on the inline value was measuring the wrong thing.
+      marginComputed:getComputedStyle(document.body).marginRight,
+      frameW:f?Math.round(f.getBoundingClientRect().width):null,
+      vw:window.innerWidth,
+      boot:document.documentElement.hasAttribute('data-dsh-pane-boot'),
+      toggle:(function(){
+        var b=document.querySelector('button[aria-label="Expand browser pane"]')
+          ||document.querySelector('button[aria-label="Collapse browser pane"]');
+        return b?b.getAttribute('aria-label'):null;
+      })()
+    };
+  })()`);
+	const rightGlow = `document.querySelector('.dsh-mobile-glow[data-edge="right"]')`;
+
+	let ps = await paneState();
+	check("the pane ships a collapsed rail, which is what used to be the strip", ps.rail === true);
+	check("that rail is not shown on a phone", ps.railDisplay === "none", String(ps.railDisplay));
+	check("the pane reserves no layout space (computed margin is zero)", ps.marginComputed === "0px", `computed ${ps.marginComputed}, inline ${ps.margin}`);
+	check("so the GUI keeps its full width", ps.frameW === ps.vw, `${ps.frameW} of ${ps.vw}`);
+	check("the packaged expanded default was settled on load", ps.panel === false, JSON.stringify(ps));
+	check("and the boot flag is gone", ps.boot === false);
+	check("the pane's own toggle is reachable by name", ps.toggle !== null, String(ps.toggle));
+
+	// Press, release, and watch the panel move.
+	const paneEdge = ps.vw - 10;
+	await watchFlash("right");
+	await page.call("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: paneEdge, y: 300 }] });
+	check("pressing the right edge highlights it",
+		(await page.ev(`!!${rightGlow} && ${rightGlow}.hasAttribute('data-held')`)) === true);
+	check("and does not open the pane yet", (await paneState()).panel === false);
+	await page.call("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+	check("the click flashes it", (await flashed("right")) === true);
+	check("and lights only that edge",
+		(await page.ev(`document.querySelector('.dsh-mobile-glow[data-edge="left"]').hasAttribute('data-lit')`)) === false);
+
+	let minTx = 0;
+	for (let i = 0; i < 12; i++) {
+		const t = String(await page.ev(`(function(){
+      var p=document.querySelector('[data-dsh-browser-pane="expanded"]');
+      return p?getComputedStyle(p).transform:'none';
+    })()`));
+		const m = /matrix\(([^)]+)\)/.exec(t);
+		if (m !== null) {
+			const tx = Number(m[1].split(",")[4]);
+			if (Number.isFinite(tx) && tx > minTx) minTx = tx;
+		}
+		await sleep(25);
+	}
+	check("the pane is caught sliding in from the right", minTx > 20, `rightmost transform translateX ${minTx}px`);
+
+	await sleep(600);
+	ps = await paneState();
+	check("the pane opened", ps.panel === true, JSON.stringify(ps));
+	check("it fits the phone instead of overflowing", ps.panelW <= ps.vw - 17, `${ps.panelW} of ${ps.vw}`);
+	check("the GUI still has its full width behind it", ps.frameW === ps.vw, `${ps.frameW} of ${ps.vw}`);
+	check("and the pane still reserves nothing", ps.marginComputed === "0px", `computed ${ps.marginComputed}, inline ${ps.margin}`);
+
+	console.log("   shot: " + (await page.shot(`${SHOTS}/verify-pane-open.png`)));
+
+	console.log("\n7b. a tap beside it closes it:");
+	await page.tap(Math.max(6, ps.panelLeft - 60), 300);
+	ps = await paneState();
+	check("the pane closed", ps.panel === false, JSON.stringify(ps));
+	check("the rail is hidden again, not left as a strip", ps.railDisplay === "none");
+	check("and nothing was left reserved on the body", ps.marginComputed === "0px", `computed ${ps.marginComputed}, inline ${ps.margin}`);
+
 	console.log("");
 	console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
 } finally {
 	await closeTab(PORT, created.id);
 	console.log("clean tab closed");
-	page.close();
+	page?.close();
 }
 process.exitCode = failures === 0 ? 0 : 1;
+
+
+
