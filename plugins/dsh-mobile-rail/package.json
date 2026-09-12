@@ -2,7 +2,7 @@
   "name": "dsh-mobile-rail",
   "version": "1.0.0",
   "private": true,
-  "description": "Auto-hide the collapsed sidebar rail on narrow viewports so phones get the full width",
+  "description": "Hide the collapsed sidebar rail on phones, open the real sidebar from a left-edge tap, and blank the squeezed remainder",
   "type": "module",
   "main": "index.js",
   "exports": {

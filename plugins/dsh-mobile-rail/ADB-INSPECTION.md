@@ -1,7 +1,7 @@
 # Inspecting the live phone over ADB
 
-The Galaxy Note 10+ is reachable over ADB, which made it possible to read the
-real DOM instead of guessing. This is how to repeat that.
+The Galaxy Note 10+ is reachable over ADB, which is how the phone layout was
+measured instead of guessed. This is how to repeat that.
 
 ## Setup
 
@@ -20,31 +20,38 @@ Device metrics, which decide whether the mobile breakpoint applies:
 & $adb shell wm density   # Physical 420, Override 275
 ```
 
-With that override, Chrome reports `window.innerWidth = 419`, which is why the
-768px media query matches.
+With that override Chrome reports:
+
+| | |
+| --- | --- |
+| `window.innerWidth` | 419 |
+| `window.innerHeight` | 747 |
+| `devicePixelRatio` | 1.71875 |
+
+so `matchMedia('(max-width: 768px)')` matches. **419x747 is the coordinate space
+for everything below** — not 720x1380, which is device pixels.
 
 ## Attach to Chrome
 
-Port 9222 is often already taken, so use a free one:
+Port 9222 is usually taken by desktop Chrome and 9333 was left bound by an earlier
+session, so use a free one:
 
 ```powershell
 & $adb forward --remove-all
-& $adb forward tcp:9333 localabstract:chrome_devtools_remote
+& $adb forward tcp:9444 localabstract:chrome_devtools_remote
 ```
 
-Then read the page. `inspect-phone.mjs` prints viewport, the layout frame's grid,
-its `dataset`, and whether this plugin's stylesheet is live:
+Then run the end-to-end check, which opens a tab of its own, dispatches real
+touches, and asserts geometry:
 
 ```powershell
-node .dsh\profiles\web\plugins\dsh-mobile-rail\inspect-phone.mjs 9333
+node .dsh\profiles\web\plugins\dsh-mobile-rail\verify-phone.mjs
 ```
 
-`measure-phone.mjs` reports the resting and revealed geometry, including a
-synthetic `touchstart` to exercise the phone's reveal path (which has no hover):
-
-```powershell
-node .dsh\profiles\web\plugins\dsh-mobile-rail\measure-phone.mjs 9333
-```
+`phone.mjs` is the harness it uses: attach, real taps
+(`Input.dispatchTouchEvent`), screenshots, and `STATE_EXPR`, the one reading of
+frame state every probe shares. `CDP_PORT`, `DSH_URL`, `DSH_HOST_MATCH` and
+`DSH_SHOT_DIR` override its defaults.
 
 Clean up when finished:
 
@@ -52,37 +59,69 @@ Clean up when finished:
 & $adb forward --remove-all
 ```
 
-## What this found
+## What the measurements established
 
-The rail fix was **correct and working**; the report that the strip was still
-visible came from a page state before the fix had loaded.
+At `innerWidth = 419`:
 
-Live measurements on the phone (`innerWidth = 419`):
-
-| State | Computed grid | Rail | Center |
+| State | Grid | Sidebar | Centre |
 | --- | --- | --- | --- |
-| Resting | `0px 418.909px 0px` | **0px** | 419px (full width) |
-| Touch near left edge | `56px 362.909px 0px` | 56px | 363px |
-| Release | `0px 418.909px 0px` | 0px | 419px |
+| Closed | `0px 418.909px 0px` | 0px | 419px, painted |
+| Drawer open | `280px 138.909px 0px` | 280px | 139px, blanked |
+| After a tap beside it | `0px 418.909px 0px` | 0px | 419px, painted |
 
-Also confirmed at rest: the frame carries `data-sidebar-collapsed`, matches
-`[data-sidebar-collapsed]:not([data-rail-revealed])`, `matchMedia('(max-width: 768px)')`
-is true, and exactly one stylesheet with that selector is registered.
+Four facts that decided the implementation, none of them guessable from the
+source:
 
-## Two false alarms worth remembering
+1. The sidebar toggle is `[data-slot="sidebar"] button[aria-label="Open sidebar"]`,
+   and the label becomes `Collapse sidebar` once open — the button is swapped, not
+   relabelled in place.
+2. While the rail is hidden that toggle computes `visibility:hidden`, so no finger
+   can ever hit-test it. `HTMLButtonElement.click()` skips hit-testing and the
+   product's React handler still runs. This is the only thing that opens the real
+   sidebar.
+3. The product does **not** close the sidebar on an outside tap: a real touch at
+   (300,700) with the drawer open left it open. Hence the plugin's own rule.
+4. The centre column paints no background (`rgba(0,0,0,0)`), so hiding its content
+   reveals the frame's own colour (`rgb(21,21,23)` against the sidebar's
+   `rgb(27,27,28)`). Blanking needs no colour of its own.
 
-1. **Grepping the bundle for `768px` fails.** The source is
-   `` `@media (max-width: ${NARROW_MAX_PX}px){` `` — a template literal resolved
-   at runtime, so the delivered bundle stores the expression, not the result.
-   Search for the rule text instead, or inspect the live CSSOM.
-2. **A forced inline override corrupts a later reading.** Setting
-   `grid-template-columns` with `!important` from the console changes the
-   computed value for the *rest* of that page's life. A measurement taken
-   afterwards reflects the override, not the plugin. Reload before re-measuring.
+## Traps worth remembering
 
-## Note on screenshots
+1. **`/json/new` is refused on Android Chrome** (`500 Could not create new page`).
+   `Target.createTarget` on the **browser** socket works. `newTab()` uses that.
+2. **Coordinates are CSS pixels.** Sampling `elementFromPoint(600,300)` on a
+   419x747 viewport returns `null`, because 600 is off-screen. Device pixels and
+   CSS pixels differ here by 1.71875.
+3. **The sidebar slot is `display:contents`.** `[data-slot="sidebar"]` measures
+   0x0 in every state, open or closed. The width lives on the frame's first grid
+   child; measuring the slot reports 0 and looks exactly like a broken plugin.
+4. **Grepping the served bundle for `768px` fails.** The source is
+   `` `@media (max-width: ${NARROW_MAX_PX}px){` `` — a template literal resolved at
+   runtime, so the bundle stores the expression, not the result. Search for the
+   rule text, or read the live CSSOM.
+5. **A forced inline override corrupts later readings.** Setting
+   `grid-template-columns` with `!important` from the console changes the computed
+   value for the rest of that page's life. Reload before re-measuring.
+6. **A fullscreen right-panel document tab covers the whole layout.** It renders
+   into the frame's `overlayLayer`, on top of both the sidebar and the centre
+   column, so the state under test is invisible and unreachable. Two
+   byte-identical screenshots looked like a frozen CDP surface; they were simply
+   what the tab displayed. Open a tab of your own (`newTab()`) instead of driving
+   whatever the user has open.
 
-`adb shell screencap -p /sdcard/x.png` then `adb pull` works, but the model
-serving this session cannot accept images, so layout was verified numerically
-via the CSSOM instead. That is more precise anyway: it reports exact pixel
-widths rather than an eyeballed strip.
+## Screenshots
+
+Two independent paths, and they agreed:
+
+```powershell
+# 1. through CDP, in the tab being driven (what verify-phone.mjs writes)
+# 2. the phone's actual display, as ground truth
+& $adb shell screencap -p /sdcard/dsh-screen.png
+& $adb pull /sdcard/dsh-screen.png shots\phone-screen.png
+```
+
+Pull rather than piping `exec-out screencap` through a redirect: PowerShell's `>`
+corrupts binary output.
+
+Note that a background tab does not repaint, so `attach()` calls
+`Page.bringToFront` before capturing.

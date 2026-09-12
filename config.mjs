@@ -26,7 +26,7 @@ const DSH_HOME = HOME
 const PLUGIN_DIR = process.env.DSH_PLUGIN_DIR ?? `${HOME}\\profiles\\web\\plugins`
 
 /** Local port forwarded to the phone's `chrome_devtools_remote` socket. */
-const CDP_PORT = Number(process.env.CDP_PORT ?? 9333)
+const CDP_PORT = Number(process.env.CDP_PORT ?? 9444)
 
 /** Trusted-host flag value the layout fence needs; must match Serve exactly. */
 const TRUSTED_HOST = process.env.DSH_TRUSTED_HOST ?? AUTHORITY

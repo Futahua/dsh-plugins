@@ -4,7 +4,16 @@
 import { connect } from 'node:net'
 
 const PORT = Number(process.argv[2] ?? 3094)
-import { TRUSTED_HOST as AUTHORITY } from '../../config.mjs'
+
+// `config.mjs` sits at the repository root; the live profile has no such file, so
+// fall back to the documented default. One source file, two layouts.
+let config = {}
+try {
+	config = await import('../../config.mjs')
+} catch {
+	// live profile layout: no config.mjs next to the plugin
+}
+const AUTHORITY = process.env.DSH_TRUSTED_HOST ?? config.TRUSTED_HOST ?? 'sloptop.taild88607.ts.net:3080'
 
 function raw({ hostHeader, path = '/api/rpc' }) {
   return new Promise((resolve) => {

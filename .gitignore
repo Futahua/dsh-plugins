@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+
+# Screenshots written by verify-phone.mjs: evidence, not source.
+shots/

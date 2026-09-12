@@ -1,6 +1,6 @@
 # dsh-mobile-rail
 
-Stops the collapsed sidebar rail from eating a phone's left edge.
+Gives a phone its left edge back, and opens the real sidebar from it.
 
 ## The problem
 
@@ -18,79 +18,151 @@ The frame then writes that as an **inline style**:
 style: { gridTemplateColumns: `${cols.sidebar}px minmax(0, 1fr) ${cols.rightbar}px` }
 ```
 
-On a ~430px phone that strip costs ~13% of the usable width, permanently. Its own
-source calls it "the 56px rail" (`dsh-client-ui-sidebar/lib/client.js:80`).
+On a ~419px phone that strip costs ~13% of the usable width, permanently.
 
-## The fix
+Expanding the sidebar has the opposite problem: the product keeps laying the
+conversation out in what is left of the row. Measured at 419px, the drawer is
+280px and the remainder is **139px**, in which the header, the tab strip, the
+messages, the file cards and the composer all render as an unreadable sandwich of
+squeezed controls.
 
-The width is an inline style, so no class name or CSS variable can override it.
-But the frame publishes `data-sidebar-collapsed` (`ui-layout:281`), set exactly
-when the 56px rail is in effect. That is the hook:
+## What this does
 
-| Selector | Effect |
-| --- | --- |
-| `[data-sidebar-collapsed]` under `max-width: 768px` | track goes to `0px` |
-| `::before` on that frame | a 14px edge target to bring it back |
-| `:hover` on that frame | rail returns in place, overlaying rather than reflowing |
-| `[data-rail-revealed]` | same, driven by touch on devices without hover |
+Four behaviours, all measured on a Galaxy Note 10+ over ADB + CDP rather than
+inferred:
 
-`!important` is load-bearing: the width arrives as an inline `style` attribute,
-which otherwise outranks every stylesheet.
+| # | Behaviour | Hook |
+| --- | --- | --- |
+| 1 | Hide the rail | `[data-sidebar-collapsed] > :first-of-type` under `max-width: 768px` |
+| 2 | Left-edge tap opens the **real** sidebar | capture `pointerdown`, `clientX <= 24` |
+| 3 | Tap beside the open drawer closes it | capture `pointerdown`, `clientX > sidebar right edge` |
+| 4 | Blank the squeezed remainder | `:not([data-sidebar-collapsed]) > :nth-child(2) > *` |
+| 5 | Glow the band, slide the drawer in | `@keyframes dsh-mobile-rail-slide-in`, `.dsh-mobile-rail-glow[data-lit]` |
 
-Nothing is shadowed, replaced, or removed — this only adds CSS gated on a
-breakpoint and an attribute the product already publishes. Wide viewports and the
-expanded sidebar are untouched.
+**Why the width cannot simply be overridden.** It arrives as an inline `style`
+attribute, which outranks every stylesheet. A matching `!important` rule was
+confirmed by the browser's own matched-styles API to be winning the cascade, and
+the track *still* computed to 56px; a freshly injected identical sheet had no
+effect either. Collapsing the sidebar **column** works, which is what rule 1
+does. `width:0;overflow:hidden` is used rather than `display:none`, because
+removing a grid child outright also collapsed the centre column.
+
+**Why the product's own toggle is clicked.** The toggle is the only thing that
+knows how to open the sidebar. Its measured identity is
+`[data-slot="sidebar"] button[aria-label="Open sidebar"]`, and once open the label
+becomes `Collapse sidebar` — the button is swapped, not relabelled in place.
+While the rail is hidden that button computes `visibility:hidden`, so no finger
+can hit-test it; `HTMLButtonElement.click()` skips hit-testing entirely and the
+product's React handler runs normally. An earlier attempt faked the reveal in CSS
+instead, which left the sidebar unreachable.
+
+**Why the blank needs no colour.** The centre column paints no background of its
+own (`rgba(0,0,0,0)`), so hiding its content reveals the frame's background — the
+app's own base colour (`rgb(21,21,23)`, against the sidebar's `rgb(27,27,28)`).
+That is correct in light and dark without hard-coding anything, and the
+stylesheet contains no `background` declaration or hex colour at all.
 
 ## Behaviour
 
-- **Phone (≤768px), rail collapsed:** the strip is gone. Swipe/hover from the
-  left edge, or move the pointer there, and the rail slides in over the
-  conversation; it hides again a few seconds after you let go.
-- **Tablet / desktop:** unchanged. The breakpoint is deliberately *below* the
-  1024px auto-collapse so tablets keep the normal rail.
-- **Expanded sidebar:** unchanged — the rules only match the collapsed state.
+- **Phone (≤768px), rail collapsed:** no strip. Tap the left edge (24px band) and
+  the real sidebar opens; tap anywhere beside it and it closes. Nothing is left
+  covering the conversation, so scrolling and typing are unaffected.
+- **Phone, sidebar open:** the drawer plus a flat blank remainder.
+- **Tablet / desktop:** untouched. The breakpoint is deliberately *below* the
+  1024px auto-collapse so tablets keep the normal rail. Verified at 1280px: the
+  edge band is inert and nothing is blanked.
+- **Scroll gestures that start inside the 24px band** also open the drawer: a tap
+  cannot be told from a drag until the finger moves, and the open has to feel
+  immediate. Same trade-off as an iOS edge swipe.
 
-Touch has no hover, so a `touchstart` within 24px of the left edge sets
-`data-rail-revealed` for 4 seconds, which drives the same rule the hover path
-uses. That listener is installed through `ctx.effect`, so it is removed when the
-plugin unloads.
+## The animation, and the one preference it ignores
+
+A tap that rearranges the whole screen should have a beginning, so the band glows
+and the drawer slides in behind the light:
+
+- **The glow** is an injected `position:fixed` element on `body`, not on the frame
+  — the frame is a grid, so a new child would become a grid item and could disturb
+  the tracks this plugin is careful not to fight. It carries
+  `pointer-events:none`, so it can never swallow a tap, and `z-index:15` puts it
+  above the drawer column and the resize handle (11) but below the overlay layer
+  (20) that holds dialogs. Measured on the phone: `elementsFromPoint(6,400)` while
+  lit returns the glow first, then the sidebar column.
+- **The slide** is a `transform` on the drawer column, not on the grid track: the
+  track changes in a single commit, so there is nothing to transition. It has no
+  `animation-fill-mode`, because a transform left behind would make the column a
+  containing block for anything fixed-position inside it.
+- The glow is `rgba(88,150,255,…)`. The app exposes **no** accent colour to borrow
+  — checked: no blue custom properties anywhere, no coloured links — so this is a
+  chosen blue that reads on the `#151517` base.
+
+**It deliberately does not honour `prefers-reduced-motion`.** That is measured, not
+overlooked: on the target phone Android's `animator_duration_scale`,
+`transition_animation_scale` and `window_animation_scale` are all `0.0`, so Chrome
+reports `reduce` — a speed preference set in Developer options, not a statement
+about motion sensitivity — and honouring it meant the requested animation could
+never be seen. `verify-phone.mjs` therefore asserts the slide *on a device that
+reports `reduce`*, which is the case that used to be invisible. Restoring
+`@media (prefers-reduced-motion: reduce){...}` with `animation:none` and
+`transition:none` is all it takes to reverse the decision.
+
+## Failure modes
+
+Stated plainly, because an earlier revision failed silently and looked like it
+had worked:
+
+- If DSH renames the toggle, the finder matches `/^(open|collapse|close|expand|show|hide)\s+sidebar$/i`
+  and misses. The rail still hides; only the edge tap stops working. A miss is
+  reported once to the console rather than swallowed.
+- The selectors rely on DSH continuing to publish `data-sidebar-collapsed`, on the
+  sidebar staying the frame's first grid child, and on the centre column staying
+  the second. `verify-client.mjs` and the phone probe both assert the centre
+  column is still `centerCol`.
+- A DSH release that hides the rail by itself would make rules 1–3 unnecessary.
 
 ## Files
 
 | File | Role |
 | --- | --- |
-| `lib/client.js` | The whole behaviour: CSS injection + touch reveal |
+| `lib/client.js` | The whole behaviour: injected CSS + edge taps |
 | `index.js` | Empty host stub — client-modules only discovers bundles through a loader row |
 | `cordis.patch.yml` | The loader row |
-| `verify-client.mjs` | Structural check: envelope, exports, and that the CSS targets the real hook |
-| `check-scratch.mjs` | End-to-end check against a running instance |
+| `verify-client.mjs` | Self-check: envelope, CSS, the toggle finder, and the gesture logic against a stub DOM |
+| `verify-phone.mjs` | End-to-end check on a real phone: real touches, real geometry |
+| `phone.mjs` | The ADB + CDP harness `verify-phone.mjs` drives the phone with |
+| `check-live.mjs` | Asks the running GUI whether it serves this bundle |
+| `check-scratch.mjs` | Same, against a scratch instance, using a cookie jar |
+| `ADB-INSPECTION.md` | How the phone is driven, and the traps that cost time |
 
 ## Verifying
 
 ```
 node .dsh\profiles\web\plugins\dsh-mobile-rail\verify-client.mjs
-node .dsh\profiles\web\plugins\dsh-mobile-rail\check-scratch.mjs <launch-token>
+node .dsh\profiles\web\plugins\dsh-mobile-rail\check-live.mjs
+node .dsh\profiles\web\plugins\dsh-mobile-rail\verify-phone.mjs
 ```
 
-`check-scratch.mjs` also asserts the usage route answers, so it covers both
-plugins. Point it at a scratch instance (`--port 3096`) rather than the live one.
+`verify-client.mjs` needs no browser and no server. `verify-phone.mjs` drives the
+real phone and needs `adb forward tcp:9444 localabstract:chrome_devtools_remote`
+first (see `ADB-INSPECTION.md`): it opens a tab of its own, dispatches real touch
+events, and asserts geometry — rail hidden at 419px wide, a 280px drawer after an
+edge tap, the centre blanked while it is open, everything restored after a tap
+beside it, the 1280px layout untouched, and the corner-tap regression below.
 
-Confirmed on a scratch instance running this profile: the served combo bundle
-returns **HTTP 200, 11 MB**, and contains both this bundle (`data-rail-revealed`)
-and the usage pill (`dsh-go-usage-button`).
+`lib/client.js` hot-reloads in the browser; no server restart. The live bundle
+publishes `window.__dshMobileRail.version`, so "is the new build running?" is a
+measurement rather than an assumption — a screenshot once predated an HMR swap
+and made a working fix look broken.
 
 ## Tuning
 
-The media query is the only knob. To hide the rail on tablets too, raise
-`NARROW_MAX_PX` in `lib/client.js` to `1024`; to keep it on small laptops, lower
-it. Editing `lib/client.js` hot-reloads in the browser — no server restart.
+`NARROW_MAX_PX` (768) decides where the phone behaviour applies: raise it to 1024
+to hide the rail on tablets too. `EDGE_PX` (24, about 6mm at the phone's 3.6
+device-pixel ratio) is the width of the tap band.
 
-## Caveats
+## History worth keeping
 
-- Targets a **data attribute the product publishes**, not a hashed class name, so
-  it should survive rebuilds; but it does rely on DSH continuing to write
-  `data-sidebar-collapsed`, and on the sidebar being the first grid child.
-- The 14px edge target sits over the conversation's left edge. If that proves
-  intrusive with certain gestures, narrow it.
-- A future DSH release that makes the rail hideable on its own would make this
-  plugin unnecessary.
+`click()` dispatches its MouseEvent at `(0,0)`. The guard that swallows the
+compatibility click after a handled tap therefore also swallowed the toggle's own
+activation for a tap in the top-left corner, so the drawer refused to open from
+the spot a thumb reaches most easily. `verify-client.mjs` now runs that exact
+case, and the phone probe taps `(8,8)` for real.

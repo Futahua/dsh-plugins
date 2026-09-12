@@ -7,7 +7,7 @@ developed and verified against a live installation.
 | --- | --- |
 | [`dsh-opencode-go-usage`](plugins/dsh-opencode-go-usage/) | Shows OpenCode Go subscription usage: a progress ring in the composer, and a nested-window panel on click |
 | [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
-| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Auto-hides the collapsed sidebar rail on narrow viewports so phones get the full width |
+| [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a phone its left edge back: hides the collapsed rail, opens the real sidebar from an edge tap (glowing band, sliding drawer), closes it on a tap beside it, and blanks the squeezed remainder |
 
 ## Where this runs
 
@@ -27,6 +27,8 @@ from environment variables so it can be pointed elsewhere:
 | `DSH_HOME` | the Harness home directory | `D:\Letters\MatTroiSeConMoc\.dsh` |
 | `DSH_AUTHORITY` | the host:port serving the Web GUI | `sloptop.taild88607.ts.net:3080` |
 | `DSH_PLUGIN_DIR` | where these plugin directories are installed | `$DSH_HOME/profiles/web/plugins` |
+| `CDP_PORT` | local port forwarded to the phone's Chrome DevTools socket | `9444` |
+| `DSH_URL` | the GUI URL **as the phone reaches it** (phone scripts) | `http://$DSH_AUTHORITY/` |
 
 ## Installing
 
@@ -97,13 +99,21 @@ node plugins\dsh-opencode-go-usage\verify.mjs
 # client half: bundle envelope, seat wiring, panel placement maths
 node plugins\dsh-opencode-go-usage\verify-client.mjs
 
+# mobile rail: envelope, CSS, the toggle finder, and the gesture logic (no browser needed)
+node plugins\dsh-mobile-rail\verify-client.mjs
+
+# mobile rail end to end, on a real phone over ADB (real touches, real geometry)
+adb forward tcp:9444 localabstract:chrome_devtools_remote
+node plugins\dsh-mobile-rail\verify-phone.mjs
+
 # both plugins are actually served by a running instance
 node plugins\dsh-mobile-rail\check-live.mjs
 ```
 
 `check-live.mjs` and the other live scripts need a running GUI; point them with
 `DSH_AUTHORITY`. `verify-client.mjs` needs nothing — it stubs the DOM and module
-table and evaluates the real bundle.
+table and evaluates the real bundle. `verify-phone.mjs` needs the ADB forward
+above and opens a tab of its own, so it never disturbs what you have open.
 
 ## Notes from building these
 
@@ -127,6 +137,36 @@ Findings that cost real debugging time, recorded so they need not be rediscovere
   and the track still computed to its old value; a freshly injected identical
   sheet had no effect either. Sizing the column instead works. See
   [`dsh-mobile-rail/README.md`](plugins/dsh-mobile-rail/README.md).
+
+- **The product's own toggle is the only thing that opens the sidebar.** Measured
+  identity: `[data-slot="sidebar"] button[aria-label="Open sidebar"]`, relabelled
+  to `Collapse sidebar` when open. While the rail is hidden by CSS that button is
+  `visibility:hidden`, so no finger can hit-test it — but `click()` skips
+  hit-testing and the React handler still runs. An earlier attempt faked the
+  reveal in CSS and left the sidebar unreachable.
+
+- **`click()` dispatches its event at (0,0).** The guard that swallowed the
+  compatibility click after a handled tap therefore also swallowed the toggle's
+  own activation for a tap in the top-left corner. Both the stub-DOM check and the
+  phone check now tap that corner specifically.
+
+- **A fullscreen right-panel document tab hides the entire layout.** It renders
+  into the frame's `overlayLayer`, above both the sidebar and the centre column.
+  Two byte-identical screenshots looked like a frozen CDP surface; they were
+  simply what the tab showed. Open a tab of your own rather than driving the one
+  the user has open.
+
+- **`/json/new` is refused on Android Chrome** (`500 Could not create new page`),
+  while `Target.createTarget` on the browser socket works. Phone coordinates are
+  CSS pixels — 419x747 here, not the 720x1380 of a screenshot.
+
+- **A phone with Android's animation scales at `0.0` reports
+  `prefers-reduced-motion: reduce`.** That is a Developer-options speed setting,
+  and honouring it meant an explicitly requested animation could never be seen, so
+  `dsh-mobile-rail` animates anyway and says so in the stylesheet. Check with
+  `adb shell settings get global animator_duration_scale`. The phone test asserts
+  the slide *on a device that reports `reduce`*, which is the case that used to be
+  invisible.
 
 - **`tailscale serve` plus the Host fence.** Plain-HTTP Serve preserves the
   client's `Host` header, which DSH's `/api` fence rejects with 403 for a non-loopback
