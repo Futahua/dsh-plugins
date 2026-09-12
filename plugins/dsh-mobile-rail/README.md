@@ -224,8 +224,9 @@ worked:
 | `index.js` | Empty host stub — client-modules only discovers bundles through a loader row |
 | `cordis.patch.yml` | The loader row |
 | `verify-client.mjs` | Self-check: envelope, CSS, both toggle finders, and the gesture logic against a stub DOM |
-| `verify-phone.mjs` | End-to-end check on a real phone: real touches, real geometry, both edges |
+| `verify-phone.mjs` | End-to-end check on a real phone: real touches, real geometry, both edges, and the keyboard stand-down |
 | `phone.mjs` | The ADB + CDP harness `verify-phone.mjs` drives the phone with |
+| `connect-phone.mjs` | Makes the phone reachable wirelessly, re-asserts the forward, and confirms DevTools answers |
 | `check-live.mjs` | Asks the running GUI whether it serves this bundle |
 | `check-scratch.mjs` | Same, against a scratch instance, using a cookie jar |
 | `ADB-INSPECTION.md` | How the phone is driven, and the traps that cost time |
@@ -235,16 +236,20 @@ worked:
 ```
 node .dsh\profiles\web\plugins\dsh-mobile-rail\verify-client.mjs
 node .dsh\profiles\web\plugins\dsh-mobile-rail\check-live.mjs
+node .dsh\profiles\web\plugins\dsh-mobile-rail\connect-phone.mjs
 node .dsh\profiles\web\plugins\dsh-mobile-rail\verify-phone.mjs
 ```
 
 `verify-client.mjs` needs no browser and no server. `verify-phone.mjs` drives the
-real phone and needs `adb forward tcp:9444 localabstract:chrome_devtools_remote`
-first (see `ADB-INSPECTION.md`): it opens a tab of its own, dispatches real touch
-events, and asserts geometry for both edges — the rail hidden at 419px wide, the
-drawer and the pane caught mid-slide, the pane never wider than the screen and never
-reserving space, everything restored when a tap lands beside it, the 1280px layout
-untouched, and the corner-tap regression below.
+real phone and needs the phone reachable first — `connect-phone.mjs` does that over
+Wi-Fi (see `ADB-INSPECTION.md` for the one-time pairing): it opens a tab of its own,
+dispatches real touch events, and asserts geometry for both edges and for the
+keyboard — the rail hidden at 419px wide, the drawer and the pane caught mid-slide,
+the pane never wider than the screen and never reserving space, everything restored
+when a tap lands beside it, a focused composer with no keyboard leaving the bands
+working, a focused composer *under* a keyboard standing them down (and the tap
+dismissing the field rather than being swallowed), the 1280px layout untouched, and
+the corner-tap regression below.
 
 `lib/client.js` hot-reloads in the browser; no server restart. The live bundle
 publishes `window.__dshMobileRail.version`, so "is the new build running?" is a

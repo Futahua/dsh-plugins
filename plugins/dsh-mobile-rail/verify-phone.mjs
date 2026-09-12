@@ -400,6 +400,77 @@ try {
 	check("the rail is hidden again, not left as a strip", ps.railDisplay === "none");
 	check("and nothing was left reserved on the body", ps.marginComputed === "0px", `computed ${ps.marginComputed}, inline ${ps.margin}`);
 
+	console.log("\n8. typing on a real device");
+	/** What the app thinks is focused, and what the viewport looks like. */
+	const typingState = async () => await page.json(`(function(){
+    var a=document.activeElement;
+    return {
+      activeIsComposer: !!(a&&a.closest&&a.closest('[data-composer-input]')),
+      activeIsEditable: !!(a&&a.isContentEditable),
+      collapsed: document.querySelector('.dsh-mobile-rail-frame').hasAttribute('data-sidebar-collapsed'),
+      innerHeight: window.innerHeight,
+      vvHeight: window.visualViewport?Math.round(window.visualViewport.height):null
+    };
+  })()`);
+	/** Focus the composer the way the app itself does. */
+	const focusComposer = async () => await page.ev(`(function(){
+    var c=document.querySelector('[data-composer-input]');
+    if(!c) return 'no composer';
+    c.focus();
+    return document.activeElement===c ? 'focused' : 'focus refused';
+  })()`);
+
+	check("the app's composer exists and can take focus", (await focusComposer()) === "focused");
+	let ts = await typingState();
+	check("the composer is focused", ts.activeIsComposer === true && ts.activeIsEditable === true, JSON.stringify(ts));
+
+	// Case 1: focused, but NO keyboard. The full height has to be forced, because the
+	// phone's own keyboard may be up during a run — measured once: the visual viewport
+	// at 413 while innerHeight stayed 747 — and then this is not the case under test.
+	await page.tap(350, 400);
+	const fullHeight = ts.innerHeight;
+	await page.call("Emulation.setDeviceMetricsOverride", { width: 419, height: fullHeight, deviceScaleFactor: 1.71875, mobile: true });
+	await sleep(400);
+	await focusComposer();
+	const focusedFull = await typingState();
+	await page.tap(10, 400);
+	ts = await typingState();
+	check("a focused composer with no keyboard does NOT block the bands",
+		focusedFull.vvHeight === focusedFull.innerHeight && ts.collapsed === false,
+		`viewport ${focusedFull.innerHeight}/${focusedFull.vvHeight} -> collapsed ${ts.collapsed}`);
+	await page.tap(350, 400);
+
+	// Case 2: focused AND the keyboard up. A shorter window is a faithful simulation:
+	// measured on this phone, the keyboard leaves innerHeight alone and shrinks the
+	// visual viewport, which is exactly what a height override reproduces.
+	await focusComposer();
+	await page.call("Emulation.setDeviceMetricsOverride", { width: 419, height: 420, deviceScaleFactor: 1.71875, mobile: true });
+	await sleep(500);
+	await focusComposer();
+	const shrunk = await typingState();
+	check("the simulated keyboard really did shrink the layout viewport",
+		shrunk.innerHeight < focusedFull.innerHeight - 120, `${focusedFull.innerHeight} -> ${shrunk.innerHeight}`);
+
+	const underKeyboard = await page.ev(`(function(){
+    var g=document.querySelector('.dsh-mobile-glow[data-edge="left"]');
+    return g?g.hasAttribute('data-held'):null;
+  })()`);
+	check("no highlight under the keyboard", underKeyboard === false);
+	await page.tap(10, 400);
+	ts = await typingState();
+	check("tapping the band under the keyboard does not open the drawer", ts.collapsed === true, JSON.stringify(ts));
+	check("and it dismissed the field instead (the app received the tap)",
+		ts.activeIsComposer === false, `activeIsComposer ${ts.activeIsComposer}`);
+
+	// Case 3: keyboard up but nothing focused — the bands are live again.
+	await page.tap(10, 400);
+	ts = await typingState();
+	check("with nothing focused the band works even while the window is short",
+		ts.collapsed === false, JSON.stringify(ts));
+	await page.tap(350, 400);
+	await page.call("Emulation.clearDeviceMetricsOverride", {});
+	await sleep(400);
+
 	console.log("");
 	console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
 } finally {
@@ -408,6 +479,8 @@ try {
 	page?.close();
 }
 process.exitCode = failures === 0 ? 0 : 1;
+
+
 
 
 

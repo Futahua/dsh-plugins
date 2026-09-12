@@ -31,18 +31,45 @@ With that override Chrome reports:
 so `matchMedia('(max-width: 768px)')` matches. **419x747 is the coordinate space
 for everything below** — not 720x1380, which is device pixels.
 
-## Attach to Chrome
+## Connect, then attach to Chrome
 
-Port 9222 is usually taken by desktop Chrome and 9333 was left bound by an earlier
-session, so use a free one:
+Wireless first — the phone is usually across the room, and once it has been paired
+with this computer ADB reconnects over mDNS by itself whenever both are on the same
+Wi-Fi:
 
 ```powershell
-& $adb forward --remove-all
-& $adb forward tcp:9444 localabstract:chrome_devtools_remote
+node .dsh\profiles\web\plugins\dsh-mobile-rail\connect-phone.mjs
 ```
 
-Then run the end-to-end check, which opens a tab of its own, dispatches real
-touches, and asserts geometry:
+That script reports each step rather than assuming any of them: it waits for a
+device, tries the mDNS-advertised endpoint if none appears, re-asserts the DevTools
+forward (which dies with the transport), and confirms Chrome's DevTools answers on
+`127.0.0.1:9444`. `--status` reports without changing anything.
+
+First-time pairing cannot be automated — Android shows a six-digit code that only a
+human can read:
+
+```
+1. Phone: Settings -> Developer options -> Wireless debugging -> ON
+2. Phone: "Pair device with pairing code"  -> shows  <ip>:<pair-port>  and a code
+3. Here:  adb pair <ip>:<pair-port> <code>      (once; then mDNS reconnects forever)
+```
+
+Notes that cost time:
+
+- **The device serial changes with the transport.** Over USB it is `RF8M73S4NEM`; over
+  wireless it is `adb-RF8M73S4NEM-JO3DeB._adb-tls-connect._tcp`. Anything using
+  `adb -s RF8M73S4NEM ...` stops working the moment the cable comes out.
+- **The forward does not survive the transport changing.** Unplugging the cable kills
+  `adb forward tcp:9444`, and the next CDP call fails with `ECONNREFUSED` — which
+  looks like the phone being offline. Re-assert the forward (the script does).
+- **mDNS does not cross networks.** Not to another subnet, and not over Tailscale,
+  even though the phone is on the tailnet. Same Wi-Fi or a cable.
+- Port 9222 is usually taken by desktop Chrome and 9333 was left bound by an earlier
+  session, so 9444 is the local port used here.
+
+Then run the end-to-end check, which opens a tab of its own, dispatches real touches,
+and asserts geometry:
 
 ```powershell
 node .dsh\profiles\web\plugins\dsh-mobile-rail\verify-phone.mjs
@@ -51,9 +78,10 @@ node .dsh\profiles\web\plugins\dsh-mobile-rail\verify-phone.mjs
 `phone.mjs` is the harness it uses: attach, real taps
 (`Input.dispatchTouchEvent`), screenshots, and `STATE_EXPR`, the one reading of
 frame state every probe shares. `CDP_PORT`, `DSH_URL`, `DSH_HOST_MATCH` and
-`DSH_SHOT_DIR` override its defaults.
+`DSH_SHOT_DIR` override its defaults, and every CDP call is bounded — a wedged
+renderer surfaces as a timeout naming the page, instead of hanging the script.
 
-Clean up when finished:
+Clean up when finished (the forward only; the wireless connection is worth keeping):
 
 ```powershell
 & $adb forward --remove-all

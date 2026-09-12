@@ -301,12 +301,59 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * The tallest layout viewport seen while no text field had focus.
+		 *
+		 * Android resizes the LAYOUT viewport for the keyboard — unlike iOS — so the only
+		 * way to tell "the keyboard took 300px" from "the phone is in landscape" is to
+		 * remember what the viewport measured before the keyboard appeared. Seeded at
+		 * install, when a keyboard cannot be up (showing one needs a user gesture), and
+		 * refreshed whenever the window resizes and nothing is focused.
+		 */
+		let viewportBaseline = null;
+
+		/** Remember the keyboard-free viewport height. */
+		function rememberViewport() {
+			if (viewportBaseline === null || !isTyping()) viewportBaseline = Math.round(window.innerHeight);
+		}
+
+		/**
+		 * Is the on-screen keyboard covering part of the window?
+		 *
+		 * Both signals are checked because platforms differ, and the measurement that
+		 * settled it came from the phone this was built for: with the software keyboard
+		 * up, that Android Chrome reported `innerHeight 747` and
+		 * `visualViewport.height 413` — the visual viewport shrinking, exactly as iOS
+		 * does. The layout-viewport signal covers the other configuration
+		 * (`interactive-widget=resizes-content`, where both shrink together and the gap
+		 * is zero), and the baseline covers a layout shrink that arrives before any
+		 * comparable measurement.
+		 */
+		function keyboardUp() {
+			const vv = window.visualViewport ?? null;
+			if (vv !== null && window.innerHeight - vv.height >= MIN_KEYBOARD_PX) return true;
+			return viewportBaseline !== null && viewportBaseline - window.innerHeight >= MIN_KEYBOARD_PX;
+		}
+
+		/**
+		 * Should the edge bands stand down?
+		 *
+		 * Only while a text field is focused AND the keyboard is really up, because the
+		 * tap that leaves the keyboard is a tap on a band. Focus alone is not enough: the
+		 * app focuses the composer as soon as a session loads — measured, with the visual
+		 * viewport still at its full 747px — and standing down then would cost a tap for
+		 * nothing.
+		 */
+		function keyboardCovering() {
+			return isTyping() && keyboardUp();
+		}
+
+		/**
 		 * Should this band respond at all?
 		 *
-		 * Only while its own panel is closed, and never while the user is typing.
+		 * Only while its own panel is closed, and never under the keyboard.
 		 */
 		function bandLive(edge) {
-			if (!isNarrow() || isTyping()) return false;
+			if (!isNarrow() || keyboardCovering()) return false;
 			return edge.closed(frame());
 		}
 
@@ -438,9 +485,10 @@ window.__ModuleLoader__.load({
 				if (!isNarrow()) return;
 				// Only the primary button ever opens or closes a panel.
 				if (event.pointerType === "mouse" && event.button !== 0) return;
-				// Typing: the tap belongs to the app. Return before anything is claimed --
-				// not even `stopPropagation` -- so the field blurs and the keyboard goes.
-				if (isTyping()) return;
+				// Under the keyboard: the tap belongs to the app. Return before anything is
+				// claimed -- not even `stopPropagation` -- so the field blurs and the
+				// keyboard goes.
+				if (keyboardCovering()) return;
 				const el = frame();
 
 				// 1. Something is open and this tap is beside it: close it, at once.
@@ -674,6 +722,9 @@ window.__ModuleLoader__.load({
 			let pinned = false;
 
 			const update = () => {
+				// The baseline has to be current before the keyboard test below, and the
+				// window resize that a keyboard causes is exactly when it must NOT move.
+				rememberViewport();
 				const covered = Math.round(window.innerHeight - vv.height);
 				const wanted = isTyping() &&
 					(vv.scale ?? 1) <= SCALE_TOLERANCE &&
@@ -834,12 +885,15 @@ window.__ModuleLoader__.load({
 		 * swap; a version on the window makes "is the new bundle running?" a measurement
 		 * instead of an assumption.
 		 */
-		const VERSION = 10;
+		const VERSION = 11;
 
 		const inject = [];
 
 		function apply(ctx) {
 			ensureStyles();
+			// Seed the keyboard-free viewport baseline, so the Android keyboard test works
+			// from the very first tap rather than waiting for a resize.
+			rememberViewport();
 			if (typeof window !== "undefined") {
 				window.__dshMobileRail = {
 					version: VERSION,

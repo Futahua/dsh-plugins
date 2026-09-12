@@ -220,7 +220,7 @@ exported.apply({ effect: (fn, label) => effects.push({ fn, label }) });
 check("registers all three effects", effects.length === 3, String(effects.length));
 check("labels every effect", effects.every((e) => typeof e.label === "string"));
 check("publishes a build marker with both edges",
-	globalThis.window.__dshMobileRail?.version === 10 &&
+	globalThis.window.__dshMobileRail?.version === 11 &&
 		JSON.stringify(globalThis.window.__dshMobileRail?.edges) === '["left","right"]',
 	JSON.stringify({ version: globalThis.window.__dshMobileRail?.version, edges: globalThis.window.__dshMobileRail?.edges }));
 
@@ -397,7 +397,7 @@ release(1270, 400);
 check("the right band is inert at 1280px", paneOpen === false && activations === 0);
 globalThis.window.innerWidth = 419;
 
-console.log("standing down while a text field has focus:");
+console.log("standing down under the keyboard:");
 /** A focused element that counts as typing, shaped the way the page sees one. */
 const textField = (tag, extra = {}) => ({
 	tagName: tag,
@@ -406,20 +406,43 @@ const textField = (tag, extra = {}) => ({
 	closest: () => null,
 	...extra,
 });
+/** The keyboard is up: the visual viewport shrinks while the layout viewport does not. */
+const keyboardUp = (up) => {
+	viewport.height = up ? 1024 - 346 : 1024;
+	viewport.offsetTop = 0;
+	viewport.emit("resize");
+};
+
+// Focus alone must NOT stand the bands down: the app focuses the composer as soon as a
+// session loads (measured on the phone: `activeIsComposer: true` with the visual
+// viewport still at its full height), and standing down then would cost a tap.
 frameOpen = false;
 paneOpen = false;
 activations = 0;
-documentStub.activeElement = textField("TEXTAREA");
-const whileTyping = press(10, 400);
+keyboardUp(false);
+documentStub.activeElement = textField("DIV", { isContentEditable: true });
+press(10, 400);
+release(10, 400);
+check("a focused composer with NO keyboard leaves the bands working",
+	frameOpen === true && activations === 1);
+press(300, 400);
+
+// Now with the keyboard up, both bands must stand down.
+keyboardUp(true);
+documentStub.activeElement = textField("DIV", { isContentEditable: true });
+frameOpen = false;
+activations = 0;
+const underKeyboard = press(10, 400);
 check("the tap is NOT swallowed: the app must receive it to blur the field",
-	whileTyping.propagationStopped === false && whileTyping.defaultPrevented === false);
-check("the left band does not highlight while typing", heldOn(EDGE) === false);
+	underKeyboard.propagationStopped === false && underKeyboard.defaultPrevented === false);
+check("the left band does not highlight under the keyboard", heldOn(EDGE) === false);
 release(10, 400);
 check("and tapping it does not open the sidebar", frameOpen === false && activations === 0);
 
 activations = 0;
-const rightWhileTyping = press(RIGHT, 400);
-check("the right band is inert too", rightWhileTyping.propagationStopped === false && heldOn(PANE) === false);
+const rightUnderKeyboard = press(RIGHT, 400);
+check("the right band is inert too",
+	rightUnderKeyboard.propagationStopped === false && heldOn(PANE) === false);
 release(RIGHT, 400);
 check("and does not open the pane", paneOpen === false && activations === 0);
 
