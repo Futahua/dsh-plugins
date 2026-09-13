@@ -41,7 +41,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { Connection } from "./connection.js";
-import { encodeEventId, hasGap, isAfter, readCursor } from "./cursor.js";
+import { classifyResume, encodeEventId, isAfter, readCursor } from "./cursor.js";
 import { classify, readChunk, serialize } from "./jsonrpc.js";
 
 /** The longest a single request body may be before it is refused. */
@@ -147,7 +147,18 @@ class SseConnection extends Connection {
 			writeSse(res, undefined, {
 				jsonrpc: "2.0",
 				method: "_dsh/log/gap",
-				params: { requestedAfter: query.after, firstRetainedEventId: query.gapFirstRetainedEventId },
+				params: { requestedAfter: query.after, firstRetainedEventId: query.gapFirstRetainedEventId, reason: "below_floor" },
+			});
+		}
+		// The other direction, and the one that looks like success: a cursor
+		// from before a crash that lost the log's tail sits *ahead* of the
+		// recovered high-water mark, so the client would be told "nothing to
+		// replay" and would never learn that events it never saw are gone.
+		if (query.cursorAheadOfLog !== undefined) {
+			writeSse(res, undefined, {
+				jsonrpc: "2.0",
+				method: "_dsh/log/gap",
+				params: { requestedAfter: query.after, lastEventId: query.cursorAheadOfLog, reason: "ahead_of_log" },
 			});
 		}
 
@@ -444,12 +455,13 @@ export async function startHttpTransport({
 				// different meaning by v2. See that module's header.
 				const cursor = readCursor({ url, headers: req.headers });
 				const sessionId = url.searchParams.get("session") ?? undefined;
-				const floor = plane.log.firstRetainedEventId;
+				const resume = classifyResume(cursor.after, plane.log);
 				connection.attachStream(res, plane.log, {
 					after: cursor.after,
 					cursorSource: cursor.source,
 					sessionId,
-					gapFirstRetainedEventId: hasGap(cursor.after, floor) ? floor : undefined,
+					gapFirstRetainedEventId: resume.kind === "below_floor" ? resume.firstRetainedEventId : undefined,
+					cursorAheadOfLog: resume.kind === "ahead_of_log" ? resume.lastEventId : undefined,
 				});
 				return;
 			}

@@ -380,6 +380,62 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 		const badParams = await command(ctx, "_dsh/session/rename", { sessionId, title: "  " });
 		check("a blank title is invalidParams, not a silent success", badParams.ok === false && badParams.data?.type === "invalid_params");
 
+		console.log("\n--- a read must not write -------------------------------------");
+		const beforeRead = await lastEventId(ctx);
+		const readOne = await command(ctx, "_dsh/session/state", { sessionId });
+		const afterRead = await lastEventId(ctx);
+		check("a state read appends no event at all", afterRead === beforeRead, `${beforeRead} -> ${afterRead}`);
+		check(
+			"a state read reports which commands the state admits",
+			readOne.result?.availableCommands?.prompt === true && readOne.result?.availableCommands?.fork === true,
+			JSON.stringify(readOne.result?.availableCommands),
+		);
+		await delay(30);
+		const readTwo = await ctx.request("_dsh/session/state", { sessionId });
+		// The old version logged `{read: true}`, which bumped `updatedAt` and so
+		// could reorder `session/list`: polling a session made it look active.
+		check(
+			"a state read does not move updatedAt",
+			readTwo.updatedAt === readOne.result?.updatedAt,
+			`${readOne.result?.updatedAt} -> ${readTwo.updatedAt}`,
+		);
+
+		console.log("\n--- idempotency key ------------------------------------------");
+		// The key is written as a literal on purpose: it is the wire contract,
+		// and hardcoding it here is what would catch an accidental rename.
+		const IDEMPOTENCY = "dsh-acp-control/idempotency-key";
+		const firstRun = await ctx.request("session/prompt", {
+			sessionId,
+			prompt: [{ type: "text", text: "idempotent turn" }],
+			_meta: { [IDEMPOTENCY]: "verify-key-1" },
+		});
+		const headAfterFirst = await lastEventId(ctx);
+		const retried = await ctx.request("session/prompt", {
+			sessionId,
+			prompt: [{ type: "text", text: "idempotent turn" }],
+			_meta: { [IDEMPOTENCY]: "verify-key-1" },
+		});
+		const headAfterRetry = await lastEventId(ctx);
+		check("a retried prompt with the same key returns the same stop reason", retried?.stopReason === firstRun?.stopReason, `${firstRun?.stopReason} vs ${retried?.stopReason}`);
+		// Without the key this second call would be *admitted* — the first turn
+		// already returned the session to `idle` — and would run a second turn.
+		check("a retried prompt with the same key runs no second turn", headAfterRetry === headAfterFirst, `log advanced ${headAfterFirst} -> ${headAfterRetry}`);
+		const distinct = await ctx.request("session/prompt", {
+			sessionId,
+			prompt: [{ type: "text", text: "idempotent turn" }],
+			_meta: { [IDEMPOTENCY]: "verify-key-2" },
+		});
+		check("a different key does run a new turn", (await lastEventId(ctx)) > headAfterRetry && distinct !== undefined);
+
+		console.log("\n--- a cursor ahead of the log is reported ---------------------");
+		const ahead = await ctx.request("_dsh/events/replay", { sessionId, after: 999_999 });
+		check(
+			"a cursor ahead of the log is reported, not treated as 'nothing to replay'",
+			ahead.gap?.kind === "ahead_of_log" && ahead.gap.lastEventId === ahead.lastEventId,
+			JSON.stringify(ahead.gap),
+		);
+		check("and the replay that comes back is empty rather than wrong", ahead.events.length === 0);
+
 		console.log("\n--- delete ----------------------------------------------------");
 		assertCommitted("session/delete succeeds from idle", await command(ctx, "session/delete", { sessionId }));
 		const gone = await command(ctx, "_dsh/session/state", { sessionId });

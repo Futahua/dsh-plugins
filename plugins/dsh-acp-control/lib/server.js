@@ -31,7 +31,8 @@ import {
 	resultFrame,
 } from "./jsonrpc.js";
 import { EventType } from "./eventlog.js";
-import { Command, SessionState, allows } from "./state.js";
+import { classifyResume } from "./cursor.js";
+import { Command, SessionState, allows, availableCommands } from "./state.js";
 import { EXTENSION_PREFIX, SESSION_CHANGED, SessionRecord } from "./session.js";
 import { promptToText } from "./backends.js";
 
@@ -57,8 +58,40 @@ const STUBS = Object.freeze({
 	[AGENT_METHODS.logout]: { reason: "this server authenticates its transport, not the ACP session" },
 });
 
-/** Cap on how many events one replay may return, so a cursor of -1 cannot flood a socket. */
+/** Cap on how many replay events one call may return, so a cursor of -1 cannot flood a socket. */
 const REPLAY_LIMIT_MAX = 5000;
+
+/**
+ * This plugin's idempotency key, inside the schema-sanctioned `params._meta`.
+ *
+ * DSH's own session API carries the same idea in `SessionPromptRequest.requestId`
+ * ("client-minted identity persisted on the exact accepted user message"), so a
+ * client-minted key is the ecosystem's established shape rather than an
+ * invention of this plugin. Namespaced like every other extension key here.
+ */
+export const IDEMPOTENCY_KEY = "dsh-acp-control/idempotency-key";
+
+/**
+ * Methods whose repetition must not repeat the effect.
+ *
+ * `session/new` is absent deliberately: it has no session id to key on, and
+ * creating a session twice is what a client asking twice means. Reads are
+ * absent because running them twice is free.
+ */
+const IDEMPOTENT_METHODS = new Set([
+	AGENT_METHODS.sessionPrompt,
+	AGENT_METHODS.sessionCancel,
+	AGENT_METHODS.sessionClose,
+	AGENT_METHODS.sessionDelete,
+	AGENT_METHODS.sessionResume,
+	"_dsh/session/rename",
+	"_dsh/session/archive",
+	"_dsh/session/unarchive",
+	"_dsh/session/fork",
+]);
+
+/** How many idempotency records to keep before evicting the oldest. */
+const IDEMPOTENCY_MAX = 256;
 
 /**
  * Turn a `clientInfo.name` into an actor label.
@@ -98,6 +131,12 @@ export class ControlPlane {
 	#logger;
 	#connections = new Set();
 	#capabilities;
+	/**
+	 * In-flight and settled idempotent operations, keyed
+	 * `sessionId \0 clientKey`. Bounded by {@link IDEMPOTENCY_MAX}.
+	 * @type {Map<string, Promise<any>>}
+	 */
+	#idempotency = new Map();
 
 	/**
 	 * @param {object} options - plane options.
@@ -205,8 +244,61 @@ export class ControlPlane {
 		}
 	}
 
-	/** Route one request. */
+	/**
+	 * Route one request, applying the idempotency key first when the client
+	 * supplied one.
+	 *
+	 * A CP transport can deliver the same request twice — a retry after a
+	 * dropped connection, a client that resends because it never saw the
+	 * response — and without a key the second delivery simply runs again. For
+	 * `session/prompt` that is not a duplicate response, it is a **second
+	 * agent turn**: the first has already returned the session to `idle`, so
+	 * the retry is admitted rather than refused. The key makes the retry
+	 * re-observe the first outcome instead (DESIGN.md §5).
+	 */
 	async #request(connection, method, params, signal) {
+		if (IDEMPOTENT_METHODS.has(method) && typeof params?.sessionId === "string") {
+			return this.#idempotent(params.sessionId, params, () => this.#dispatchRequest(connection, method, params, signal));
+		}
+		return this.#dispatchRequest(connection, method, params, signal);
+	}
+
+	/**
+	 * Run `operation` once per `(sessionId, client key)`.
+	 *
+	 * The promise is cached **before** it settles, so a duplicate that arrives
+	 * while the first is still in flight joins it and observes the same
+	 * outcome rather than racing it. A cached rejection is kept on purpose:
+	 * the same key must yield the same answer, including a failure, or a client
+	 * retrying a genuinely failed command would quietly turn it into a retry
+	 * loop.
+	 *
+	 * The cache is bounded and evicted oldest-first, so a client that mints a
+	 * fresh key per request cannot grow it without limit.
+	 */
+	#idempotent(sessionId, params, operation) {
+		const key = params?._meta?.[IDEMPOTENCY_KEY];
+		if (typeof key !== "string" || key.length === 0 || key.length > 200) return operation();
+		const composite = `${sessionId}\u0000${key}`;
+		const existing = this.#idempotency.get(composite);
+		if (existing !== undefined) {
+			this.#logger(`idempotent replay: ${sessionId} key ${JSON.stringify(key).slice(0, 60)}`);
+			return existing;
+		}
+		const promise = operation();
+		this.#idempotency.set(composite, promise);
+		// A joined retry may be the only consumer of a rejection, so keep Node
+		// from reporting it as unhandled while the original caller awaits it.
+		promise.catch(() => {});
+		while (this.#idempotency.size > IDEMPOTENCY_MAX) {
+			const oldest = this.#idempotency.keys().next().value;
+			this.#idempotency.delete(oldest);
+		}
+		return promise;
+	}
+
+	/** Route one request. */
+	async #dispatchRequest(connection, method, params, signal) {
 		switch (method) {
 			case AGENT_METHODS.initialize:
 				return this.#initialize(connection, params);
@@ -381,7 +473,7 @@ export class ControlPlane {
 		const session = this.#requireSessionParam(params);
 		await this.#registry.admit(session, Command.close, connection.actor, async (record) => {
 			await this.#disposeBackend(record, connection.actor);
-			this.#registry.setState(record, SessionState.closed, "closed", connection.actor);
+			await this.#registry.setStateDurable(record, SessionState.closed, "closed", connection.actor);
 			this.#registry.commit(record, { actor: connection.actor, type: EventType.closed, data: {} });
 		});
 		this.#logger(`session ${session.sessionId} closed by ${connection.actor}`);
@@ -464,7 +556,7 @@ export class ControlPlane {
 		// `session/close` has already taken it to `closing` and disposed the
 		// backend. Overwriting those would be the silent-clobber bug in a new
 		// costume, so each case is handled rather than assumed.
-		await this.#registry.queue(session, () => {
+		await this.#registry.queue(session, async () => {
 			if (failure !== undefined) {
 				this.#registry.commit(session, {
 					actor: agentActor,
@@ -477,6 +569,15 @@ export class ControlPlane {
 			if (session.state === SessionState.generating || session.state === SessionState.awaitingPermission || session.state === SessionState.cancelling) {
 				session.turnId = undefined;
 				session.turnAbort = undefined;
+				// Deliberately the *non*-durable variant, and the one place that
+				// is right. This is a turn return edge, not a command edge: the
+				// work has already happened, and the session must come back to
+				// rest regardless of the disk. Blocking the movement on a write
+				// that may have failed would strand the session in `generating`
+				// — a worse outcome than a state change that outlives a log
+				// entry. The flush below still fails the *prompt response* if
+				// the turn's events did not persist, so the client is not told
+				// the turn succeeded.
 				this.#registry.setState(
 					session,
 					SessionState.idle,
@@ -488,6 +589,15 @@ export class ControlPlane {
 				session.turnId = undefined;
 				session.turnAbort = undefined;
 			}
+			// The turn's own streamed updates were appended as they happened and
+			// are on the same write chain, so awaiting it here means the client
+			// is not told the turn ended until the turn's events are durable.
+			await this.#log.flush().catch((error) => {
+				throw internalError(
+					`the turn ended but its events could not be written to the log: ${error instanceof Error ? error.message : String(error)}`,
+					{ type: "durability_failed", sessionId: session.sessionId, turnId, logPath: this.#log.path },
+				);
+			});
 		});
 
 		if (failure === undefined) return { stopReason };
@@ -516,6 +626,16 @@ export class ControlPlane {
 			return;
 		}
 		await this.#registry.admit(session, Command.cancel, connection.actor, async (record) => {
+			// The cancellation is recorded before it is performed. The previous
+			// version committed nothing here, which is exactly the case the
+			// strengthened admission check now catches: it leaned on the
+			// automatic state edge to look non-silent while its own effect left
+			// no trace of having been asked.
+			this.#registry.commit(record, {
+				actor: connection.actor,
+				type: EventType.cancel,
+				data: { turnId: record.turnId ?? null },
+			});
 			record.backendSession?.cancel?.();
 			record.turnAbort?.abort();
 		});
@@ -554,7 +674,7 @@ export class ControlPlane {
 			type: EventType.permission,
 			data: { toolCallId, options, phase: "asked" },
 		});
-		this.#registry.setState(session, SessionState.awaitingPermission, "permission_requested", agentActor);
+		await this.#registry.setStateDurable(session, SessionState.awaitingPermission, "permission_requested", agentActor);
 
 		let outcome = null;
 		try {
@@ -580,7 +700,7 @@ export class ControlPlane {
 			outcome = null;
 		} finally {
 			if (session.state === SessionState.awaitingPermission) {
-				this.#registry.setState(session, SessionState.generating, "permission_answered", agentActor);
+				await this.#registry.setStateDurable(session, SessionState.generating, "permission_answered", agentActor);
 			}
 		}
 		this.#registry.commit(session, {
@@ -602,7 +722,10 @@ export class ControlPlane {
 		const trimmed = title.trim();
 		return this.#registry.admit(session, Command.rename, connection.actor, async (record) => {
 			const previous = record.title;
-			record.title = trimmed;
+			// Commit, then mutate. Assigning first meant a failed append — a
+			// durability failure, say — left the title changed while the caller
+			// was told the rename failed.
+			//
 			// The effect is published on the *stable* wire: `session_info_update`
 			// is Completed in the ACP schema, so a client that has never heard
 			// of `_dsh/` still sees the rename. The extension exists only
@@ -619,6 +742,13 @@ export class ControlPlane {
 						_meta: { actor: connection.actor, eventId },
 					}),
 			});
+			// Durability before the mutation. `commit` only queues the write, so
+			// mutating straight after it still exposes the title to a disk that
+			// is gone — the rename would report `durability_failed` and have
+			// applied anyway. verify/core-checks.mjs deletes the log directory
+			// and asserts this ordering.
+			await this.#registry.durable("the rename");
+			record.title = trimmed;
 			return { sessionId: record.sessionId, title: trimmed, eventId: event.eventId, previous: previous ?? null };
 		});
 	}
@@ -628,7 +758,7 @@ export class ControlPlane {
 		const command = archived ? Command.archive : Command.unarchive;
 		return this.#registry.admit(session, command, connection.actor, async (record) => {
 			const previous = record.archived;
-			record.archived = archived;
+			// Commit, then mutate — same reason as rename.
 			const event = this.#registry.commit(record, {
 				actor: connection.actor,
 				type: archived ? EventType.archived : EventType.unarchived,
@@ -644,6 +774,8 @@ export class ControlPlane {
 						eventId,
 					}),
 			});
+			await this.#registry.durable("the archive flag");
+			record.archived = archived;
 			return { sessionId: record.sessionId, archived, eventId: event.eventId };
 		});
 	}
@@ -683,12 +815,20 @@ export class ControlPlane {
 
 	async #state(connection, params) {
 		const session = this.#requireSessionParam(params);
+		// Routed through `admit` so the transition table stays the single place
+		// that decides what is permitted, but it is a READ_ONLY_COMMAND: it
+		// commits nothing. It used to append a `{read: true}` event, which
+		// bumped the session's `updatedAt` and could reorder `session/list` —
+		// so polling a session made it look active.
 		return this.#registry.admit(session, Command.state, connection.actor, async (record) => {
-			// Reading state is still a command, and still leaves a trace: an
-			// observable-read event is what makes "who looked at this session,
-			// and when" answerable from the log alone.
-			this.#registry.commit(record, { actor: connection.actor, type: EventType.state, data: { read: true } });
-			return record.toWire();
+			const state = record.toWire();
+			return {
+				...state,
+				// The admitted commands are derived from the same table that
+				// admitted this read, so a client never has to hardcode the
+				// rules to decide what to enable.
+				availableCommands: availableCommands(state.state),
+			};
 		});
 	}
 
@@ -700,20 +840,31 @@ export class ControlPlane {
 		const limit = typeof rawLimit === "number" && rawLimit > 0 ? Math.min(Math.floor(rawLimit), REPLAY_LIMIT_MAX) : undefined;
 		const events = this.#log.read({ sessionId, after, limit });
 		const floor = this.#log.firstRetainedEventId;
-		const gap = after >= 0 && after < floor - 1 ? { firstRetainedEventId: floor } : undefined;
-		if (gap !== undefined) {
+		// The bounds are captured **before** the diagnostic below is appended.
+		// Reporting `lastEventId` afterwards would describe a log that already
+		// includes the notice about the log, so the number a client uses as its
+		// next cursor would not be the number it was told about.
+		const head = this.#log.lastEventId;
+		// A cursor can be wrong in two directions, and the one that looks like
+		// success is the dangerous one: a client holding a cursor from before a
+		// crash that lost the tail of the log is *ahead* of the recovered
+		// high-water mark, so it is told "nothing to replay", receives only new
+		// events numbered above its cursor, and silently never sees the gap.
+		// `classifyResume` reports whichever applies, with the remedy.
+		const resume = classifyResume(after, { firstRetainedEventId: floor, lastEventId: head });
+		if (resume.kind !== "ok") {
 			this.#log.append({
 				sessionId: sessionId ?? null,
 				actor: "system:acp-control",
 				type: EventType.gap,
-				data: { requestedAfter: after, firstRetainedEventId: floor },
+				data: { requestedAfter: after, ...resume },
 			});
 		}
 		return {
 			events,
-			lastEventId: this.#log.lastEventId,
+			lastEventId: head,
 			firstRetainedEventId: floor,
-			...(gap === undefined ? {} : { gap }),
+			...(resume.kind === "ok" ? {} : { gap: resume }),
 		};
 	}
 

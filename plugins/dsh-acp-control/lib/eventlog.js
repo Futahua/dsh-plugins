@@ -56,6 +56,8 @@ export const EventType = {
 	permission: "session.permission",
 	/** A turn ended. */
 	turnEnd: "session.turn_end",
+	/** A cancellation was accepted. Recorded before it is performed, so a cancel that was asked for is never invisible. */
+	cancel: "session.cancel",
 	/** A turn or backend failed. */
 	error: "session.error",
 	/** A command was refused. Logged so a client that missed the response still learns of it. */
@@ -88,6 +90,16 @@ export class EventLog {
 	#subscribers = new Set();
 	#exhausted = false;
 	#closed = false;
+	/**
+	 * The most recent failed disk write, if any.
+	 *
+	 * A failed append must not be swallowed: `flush()` rethrows this, and the
+	 * registry turns that into a failed command (DESIGN.md §5). The chain keeps
+	 * running so one bad write does not wedge the log for the rest of the
+	 * process, which is why the error is *recorded* rather than allowed to
+	 * reject the chain.
+	 */
+	#writeError;
 	/** What recovery found, for the boot log line. */
 	#recovered = { dropped: 0, lastEventId: 0 };
 
@@ -238,10 +250,12 @@ export class EventLog {
 		if (this.#bytes >= this.#maxBytes) this.#exhausted = true;
 		this.#writeChain = this.#writeChain
 			.then(() => appendFile(this.#path, line, "utf8"))
-			.catch(() => {
-				// A failed write is not silently swallowed: the event stays in
-				// the in-memory index and `flush()` surfaces the failure to
-				// whoever is waiting on durability.
+			.catch((error) => {
+				// Recorded, not swallowed, and not re-thrown: re-throwing would
+				// reject the chain and make every later append inherit the
+				// failure. `flush()` is where this surfaces, which is what makes
+				// "the command succeeded" mean "the event is on disk".
+				this.#writeError = error;
 			});
 		for (const subscriber of this.#subscribers) {
 			try {
@@ -271,7 +285,11 @@ export class EventLog {
 			data: { maxBytes: this.#maxBytes, lastEventId: this.#nextEventId - 2, path: this.#path },
 		};
 		this.#events.push(record);
-		this.#writeChain = this.#writeChain.then(() => appendFile(this.#path, `${JSON.stringify(record)}\n`, "utf8")).catch(() => {});
+		this.#writeChain = this.#writeChain
+			.then(() => appendFile(this.#path, `${JSON.stringify(record)}\n`, "utf8"))
+			.catch((error) => {
+				this.#writeError = error;
+			});
 		for (const subscriber of this.#subscribers) {
 			try {
 				subscriber(record);
@@ -315,9 +333,42 @@ export class EventLog {
 		return () => this.#subscribers.delete(listener);
 	}
 
-	/** Await every queued disk write. */
+	/**
+	 * Await every queued disk write, and **throw if any of them failed**.
+	 *
+	 * This is the whole durability contract (DESIGN.md §5): a command does not
+	 * report success until the events it produced are on disk. Before this,
+	 * `flush()` merely awaited a chain whose errors had already been swallowed,
+	 * so a rename could return success, reach live clients, advance every
+	 * cursor, and be gone after a restart — a durability claim that was simply
+	 * false.
+	 *
+	 * A recorded failure is thrown once and cleared. Once-and-cleared rather
+	 * than sticky, because a transient failure (a full disk that is emptied, a
+	 * file handle that is restored) should not wedge the process forever; and a
+	 * *persistent* failure re-records itself on the very next append, so the
+	 * next flush reports it again.
+	 *
+	 * With concurrent commands, the failure may be reported to whichever
+	 * command flushes first rather than to the one whose write failed. That is
+	 * deliberate: the alternative is per-event attribution machinery, and the
+	 * property that matters is that the failure is *reported to someone* rather
+	 * than lost.
+	 *
+	 * @throws the most recent write failure, if there was one.
+	 */
 	async flush() {
 		await this.#writeChain;
+		if (this.#writeError !== undefined) {
+			const error = this.#writeError;
+			this.#writeError = undefined;
+			throw error;
+		}
+	}
+
+	/** @returns {Error|undefined} the pending write failure, without clearing it. */
+	get writeError() {
+		return this.#writeError;
 	}
 
 	/** Stop accepting writes and await the tail. */

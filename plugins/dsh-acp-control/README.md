@@ -13,9 +13,9 @@ draft ACP RFDs so migration is mechanical when they stabilise.
 
 | Half | State |
 | --- | --- |
-| Protocol core, state machine, event log, replay | **built and verified** (`verify/core-checks.mjs` 49/49) |
-| stdio transport | **built and verified** (`verify/stdio-client.mjs`, 49/49) |
-| Loopback HTTP+SSE with token auth | **built and verified** (`verify/http-client.mjs` 22/22) |
+| Protocol core, state machine, event log, replay | **built and verified** (`verify/core-checks.mjs` 65/65) |
+| stdio transport | **built and verified** (`verify/stdio-client.mjs`, 58/58 over a real child process) |
+| Loopback HTTP+SSE with token auth | **built and verified** (`verify/http-client.mjs` 32/32) |
 | `dsh` backend in a real profile | **built and verified** (`verify/plugin-boot.mjs` 12/12, real agent turn) |
 | Loaded in the running `dsh web` | **not yet** — see *Loading it* |
 
@@ -26,9 +26,21 @@ Read these before relying on the plugin. Full reasoning is in
 
 | # | What | Status |
 | --- | --- | --- |
-| 1 | **The stream model does not conform to the RFD.** It requires one connection-scoped stream *plus* one session-scoped stream per session, concurrently attachable. This serves **one stream per connection** with an optional `?session=` filter, so a client that follows the RFD and opens both gets its connection stream torn down by its session stream and stops receiving responses. | Known defect. **Slice 2, item 1.** |
+| 0 | **This is discovery, not attachment.** GUI-originated sessions are listed (`backendOnly`, artificial `closed`) but never entered into the registry, so they cannot be prompted, renamed, archived, forked or state-queried. | **Blocking product gap. Slice 2, item 1.** The investigation is done and recorded in DESIGN.md: attachment needs **no DSH core change** — `ctx.agents.get(sessionId)` returns the live agent, `agent.ctx` is the scoped event surface, and `ctx.sessionController` is the canonical mutation service. It requires co-residence in the GUI's process. |
+| 1 | **The stream model does not conform to the RFD.** It requires one connection-scoped stream *plus* one session-scoped stream per session, concurrently attachable. This serves **one stream per connection** with an optional `?session=` filter, so a client that follows the RFD and opens both gets its connection stream torn down by its session stream and stops receiving responses. | Known defect. Slice 2, item 2. |
 | 2 | `_dsh/session/refused` is an **invention** — ACP is silent on how a refused *notification* is reported, since a notification has no response channel. The log entry is the part that needs no permission; the notification is this plugin's own mechanism. | Deliberate, labelled as ours |
 | 3 | The SSE `id:` field is used as the replay cursor. The RFD does **not** define event ids in v1 — it defers them to v2 as a "last replay ID". Unclaimed today and pointing v2's way, but v2 could assign it a different meaning. | Contained in `lib/cursor.js` |
+| 4 | **`archive` is modelled twice.** This plugin keeps an `archived` flag on its own session record; DSH keeps a workspace-scoped `archivedSessionIds` set behind `ctx.workspaceController.archiveSession`. Two sources of truth for one fact is a bug regardless of which is right. | Known defect |
+| 5 | **`session/delete` is plugin-local.** There is no host "delete a session" method — `WorkspaceDeleteRequest` deletes a *workspace*, and the only `_deleteSession` is private inside `dsh-session-query-sqlite`. | Not parity with the GUI, and should not be described as such |
+
+### What the replay guarantee does *not* cover
+
+It is gapless for **logged event frames across a transient stream disconnect
+within one process** — it is not exactly-once delivery of commands. Duplicate
+command delivery is covered for clients that send an idempotency key; an
+outstanding `session/request_permission` frame and a long-running
+`session/prompt` response are not recoverable from the log (the *state* and the
+turn's *events* are). The full table is in DESIGN.md §5.
 
 Two things worth knowing when reading the ACP schema:
 
@@ -277,14 +289,17 @@ Checks are the reason this works — each of them caught a real bug during
 development, listed at the bottom of this file.
 
 ```powershell
-# protocol, state machine, replay over the real stdio transport, in process
-node plugins\dsh-acp-control\verify\core-checks.mjs        # 50 checks
+# protocol, state machine, replay, plus durability and rollback against a log
+# whose directory is deleted out from under a running plane
+node plugins\dsh-acp-control\verify\core-checks.mjs        # 65 checks
 
-# the same, over a real child process's pipes, driven by the official ACP client
-node plugins\dsh-acp-control\verify\stdio-client.mjs       # 50 checks
+# the same scenario over a real child process's pipes, driven by the official
+# ACP client (the durability section needs the plane object, so it is in-process only)
+node plugins\dsh-acp-control\verify\stdio-client.mjs       # 58 checks
 
-# loopback HTTP+SSE: auth, the RFD's POST contract, and the reconnect guarantee
-node plugins\dsh-acp-control\verify\http-client.mjs        # 26 checks
+# loopback HTTP+SSE: auth, the RFD's POST contract, the reconnect guarantee,
+# cursor edge cases, and idempotency
+node plugins\dsh-acp-control\verify\http-client.mjs        # 32 checks
 
 # mounted in a live DSH profile, with the dsh backend and a real agent turn
 node plugins\dsh-acp-control\verify\plugin-boot.mjs        # 12 checks

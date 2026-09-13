@@ -244,7 +244,17 @@ export const EDGES = Object.freeze({
 		to: S.closing,
 	}),
 	[Command.delete]: Object.freeze({ from: [S.idle, S.closed, S.failed], to: S.closed }),
-	[Command.resume]: Object.freeze({ from: [S.closed, S.failed], to: S.idle }),
+	/**
+	 * Resume deliberately has **no automatic edge**.
+	 *
+	 * It used to move `closed`/`failed` → `idle` in the transition table, before
+	 * the effect ran — so a failed backend resume left the session marked
+	 * `idle` with no valid handle, ready to accept a prompt it could not run.
+	 * The effect now owns both halves in order: reopen the backend, and only
+	 * then move the state. The states it is *admitted* in are still declared
+	 * here, so refusals still name them.
+	 */
+	[Command.resume]: Object.freeze({ from: [], to: null }),
 	[Command.rename]: Object.freeze({ from: [], to: null }), // metadata: no state change
 	[Command.archive]: Object.freeze({ from: [], to: null }),
 	[Command.unarchive]: Object.freeze({ from: [], to: null }),

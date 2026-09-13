@@ -11,8 +11,67 @@ against an alternative, and the alternative is named.
 
 ## Read this first: status, known deviations, and what is invented here
 
-Three things a reader should know before trusting anything below, because each
+Four things a reader should know before trusting anything below, because each
 one is a place where this implementation is *not* simply "what the spec says".
+
+### 0. The blocking product gap: this is discovery, not attachment
+
+**Co-presence does not work yet, and it is slice 2's first job — ahead of the
+stream fix below.**
+
+`backend-dsh.js` discovers the GUI's sessions through
+`sessionQuery.listSessions()`, but `server.js` marks them `backendOnly: true`,
+gives them an artificial `closed` state, and never enters them into
+`SessionRegistry`. Every mutating path starts at `registry.require(sessionId)`,
+so a GUI-originated session cannot be resumed, prompted, renamed, archived,
+forked or state-queried through this server. `SessionRegistry.recover()` only
+rebuilds from *our own* `session.created` records, so a boot does not adopt
+them either.
+
+The topology is therefore **discovery-only**: this server can list the
+sessions a human is working in and cannot touch a single one of them. A more
+conformant controller that still cannot drive the session the human is looking
+at misses the point of the project, which is why attachment outranks the
+transport deviation below.
+
+**The investigation is done, and the answer is that attachment needs no DSH
+core change** — provided the plugin is co-resident in the same process as the
+GUI. What the installed packages actually expose:
+
+| Question | Answer |
+| --- | --- |
+| Does `ctx.agents` expose an already-live agent by session id? | **Yes.** `AgentRegistry.get(id: SessionId): Agent \| undefined`, plus `list()`, `roots()`, `isOwnedBy()`. There is no `attach()` that hands back a `dispose` handle for an agent you did not create — and that is the right shape, because a second controller must not be able to tear down the first one's agent. |
+| What can the live `Agent` do? | `followup(message)`, `steer`, `inject`, `send`, `cancel(cause, options)`, `whenIdle()`, `runMaintenance`, and it carries `id`, `options`, `session`, `status: 'idle'\|'running'`, and **`ctx` — the agent-scoped Context**, which is the same object `setup` receives at create/resume time. So a scoped `agent.ctx.on('session/event', …)` subscription is available on an agent this plugin never created. |
+| Who owns the live handle for a session the user opens? | `ctx.sessionController` (`@deepseek-ai/dsh-api-session-controller`, `super(ctx, "sessionController")`), whose private `ApiSessionAgentController` is the singleton authority: `resolveAgent(sessionId)` "deduplicating concurrent resumes", `ensureSession(...)` "creating or resuming it once". Its public face is `ctx.sessionController.resolveAgent(sessionId)` → `{agent} \| {error}`. |
+| Is there a canonical mutation service? | **Mostly.** `sessionController.rename({sessionId, title})`, `.selectModel(...)`, `.prompt({requestId, mode, content})`, `.fork({sessionId, atSeq?})`, `.cancel(...)`; **access mode** via `ctx.planMode`, presets via `ctx.permissionPresets`; **archive** via `ctx.workspaceController.archiveSession({sessionId})` → `ctx.workspaceRegistry`, where it is a *workspace-scoped `archivedSessionIds` set*, not a session property. |
+| Is there a canonical event stream? | **Two.** `ctx.sessionController.follow({address, maxMessages?, assistantStream?})` yields a `snapshot` frame carrying `{header, cursor, records, hasMore, projections}` followed by durable events and opted-in live assistant frames — the GUI's own transcript stream. Lower down, `ctx.on('session/event', …)` at the plugin fiber sees committed events for **all** sessions, including ones the plugin did not create; the third-party `dushaobindoudou/dsh-acp` relies on exactly that. |
+
+Two consequences worth stating plainly, because both contradict something this
+plugin currently implies:
+
+- **`archive` is modelled wrongly today.** This plugin keeps an `archived` flag
+  on its own session record; DSH keeps a workspace-scoped set of archived
+  session ids. Two sources of truth for one fact is a bug regardless of which
+  one is right, and it is recorded here rather than quietly left.
+- **`delete` has no canonical implementation to delegate to.** There is no host
+  "delete session" method — `WorkspaceDeleteRequest` deletes a *workspace* —
+  and the only `_deleteSession` is private inside `dsh-session-query-sqlite`.
+  So `session/delete` is necessarily plugin-local, and should be described that
+  way rather than as parity with the GUI.
+
+**Slice 2 item 1 is therefore: adopt live sessions into the registry, drive
+them through `agent.followup`/`cancel`, observe them through `agent.ctx`, and
+delegate mutations to the canonical services above — never disposing a handle
+this plugin did not create.** A standalone HTTP server has no live agents and
+must *refuse* to `resume()` a session the GUI holds, rather than guess: the
+first-party server already throws `session is already active` in that case, and
+this plugin should pre-check with `agents.get()` and refuse in its own words.
+
+The one thing genuinely absent is a **policy seam**: nothing in DSH says what
+should happen when two frontends drive one agent, so "who may prompt right now"
+would be decided independently by each side. That is a design decision above
+this plugin, and attachment is worth building without it — but it should be a
+recorded decision rather than an accident.
 
 ### 1. Known deviation: the stream model (slice 2, and it is a real non-conformance)
 
@@ -133,7 +192,7 @@ The rule that ties them together:
 Concretely, every command produces **exactly one** of two observable outcomes:
 
 - **Accepted** — the effect happens *and* at least one event is appended to
-  the log; or
+  the log **by that command's own effect**, and that event is **on disk**; or
 - **Refused** — a structured error is returned naming the state that blocked
   it, the states it would have been allowed in, and the current log position.
 
@@ -145,6 +204,49 @@ This is the whole point. DSH's own rename dialog once accepted text and
 silently discarded it while a session was generating; that is a *third
 outcome* — accepted-and-discarded — and this model has no room for it. A
 refusal is a first-class, logged, replayable record, not an absence.
+
+### What "accepted" is now measured to mean
+
+Two words in the paragraph above are load-bearing, and an earlier revision
+used both of them loosely. Both are now enforced and checked.
+
+**"by that command's own effect."** The check used to be a counter of events
+appended for the session. But every command with a state edge appended its edge
+event *before* running its effect, so `prompt`, `cancel`, `close`, `delete` and
+`resume` all satisfied the check **vacuously** — the counter had already moved
+before their effects did anything. Worse, `cancel`'s effect committed nothing
+at all and was passing purely on its edge.
+
+Each admission now opens a *command scope* with a unique id. Only events the
+effect itself commits count toward it; the automatic edge event is appended
+outside the scope. Every event carries `commandId` in the log, so the log
+answers "which command produced this" rather than leaving it to be inferred.
+Commands whose effects genuinely changed nothing had to start recording
+themselves: `session/cancel` now appends an explicit `session.cancel`.
+
+**"on disk."** `EventLog.append` only *queues* a write. Success used to be
+reported as soon as the event was in memory and on the wire, so a rename could
+return success, reach every live client, advance every cursor, and be gone
+after a restart — the durability claim was simply false. Success now means the
+events are written: `admit` awaits the write before answering.
+
+That, in turn, is why effects order themselves **append → await durability →
+mutate**. Awaiting durability *after* mutating would leave the failure mode
+exactly where it was: a reported failure with the effect applied. The check
+proves this rather than asserting it — it deletes the log's directory out from
+under a running control plane and asserts that a rename fails *and* that the
+title is unchanged (`verify/core-checks.mjs`).
+
+The two places that deliberately do **not** wait are named in the code: the
+turn's return edge (`generating` → `idle`), because the turn is over and
+stranding the session would be worse than a state change that outlives a log
+entry; and streaming `session/update` events, whose durability is confirmed
+once, at turn settlement, rather than per chunk.
+
+Every read is exempt in the opposite direction: `_dsh/session/state` is a
+read-only command that commits nothing at all. It used to append a
+`{read: true}` event, which bumped the session's `updatedAt` and could
+therefore reorder `session/list` — polling a session made it look active.
 
 ### Sessions are state machines
 
@@ -411,7 +513,27 @@ the log hits `maxLogBytes` the plugin emits `log.exhausted` once and *refuses*
 further mutations with that reason, rather than dropping events to stay under
 the cap.
 
-### The cursor is one module, because v2 may re-define it
+### What the replay guarantee does and does not cover
+
+The claim, stated precisely, because the loose version of it was too strong:
+
+> **Gapless for logged event frames, across a transient stream disconnect,
+> within one process.** A client that names the last `eventId` it received gets
+> every subsequent logged frame, in order, exactly once.
+
+It is **not** exactly-once delivery of commands, and the following are outside
+it. Each is listed with what happens instead, so the gap is a known bound
+rather than a surprise:
+
+| Not covered | What happens |
+| --- | --- |
+| **Duplicate command delivery.** A client that resends `session/prompt` because it never saw the response used to run a *second turn* — the first had already returned the session to `idle`, so the retry was admitted rather than refused. | **Fixed for clients that opt in.** A client-minted key in `params._meta["dsh-acp-control/idempotency-key"]` makes a repeat re-observe the first outcome instead of re-running it, including while the first is still in flight. Keys are cached per session, bounded at 256, evicted oldest-first. DSH's own session API carries the same idea in `SessionPromptRequest.requestId`, so this is the ecosystem's shape rather than an invention. A client that sends no key gets no protection. |
+| **Outstanding `session/request_permission` frames.** The permission *event* is logged, but the JSON-RPC request frame is transient — replaying it would ask a reconnected client to answer a question it may have already answered. | The **state** carries the truth: a reconnecting client sees `awaiting_permission` in `_dsh/session/state`, and the permission event in the log. It cannot re-answer the prompt, which is the honest outcome — the turn is still parked on the original client. |
+| **Long-running prompt responses.** A `session/prompt` response is produced at turn settlement and written straight to the reply channel, not to the log. If the stream dies mid-turn, the response frame is lost with it. | The turn's *events* are all in the log, so a reconnecting client can see exactly what happened; what it cannot recover is the correlated `stopReason` for that one request. A client that needs the outcome should re-issue the prompt with an idempotency key. |
+| **A cursor ahead of the log.** A crash that lost the tail of the file, or a restart against a different data directory, leaves a client holding a cursor *above* the recovered high-water mark. It would be told "nothing to replay", receive only new events numbered above its cursor, and silently never see the missing ones. | **Fixed.** `cursor.js#classifyResume` reports `ahead_of_log` and the client is sent a `_dsh/log/gap` with `reason: "ahead_of_log"` and the current `lastEventId`, so it knows its position is stale rather than current. `_dsh/events/replay` reports the same in its `gap` field. This was the one gap that *looked* like success, which is why it was worth closing rather than documenting. |
+| **Log retention.** Slice 1 never truncates, so the retained floor is always 1. | Nothing is dropped, and the `below_floor` gap notice exists so that adding retention later cannot silently start losing a client's events. |
+
+
 
 The RFD does not define event ids in v1; it defers them to v2, where streamed
 chunks carry an id described as a "last replay ID" for retry and resumption.
@@ -591,9 +713,9 @@ a transcript, and each one found at least one real bug.
 
 | Check | What it drives | Result |
 | --- | --- | --- |
-| `verify/core-checks.mjs` | the scenario below, over the real `serveStdio` on in-process pipes | **50/50** |
-| `verify/stdio-client.mjs` | the same, over a real child process's OS pipes | **50/50** |
-| `verify/http-client.mjs` | the loopback HTTP+SSE transport from real `fetch` calls on a real socket | **26/26** |
+| `verify/core-checks.mjs` | the scenario below plus the durability/rollback section, over the real `serveStdio` on in-process pipes | **65/65** |
+| `verify/stdio-client.mjs` | the same scenario, over a real child process's OS pipes (the durability section needs the plane object, so it runs only in-process) | **58/58** |
+| `verify/http-client.mjs` | the loopback HTTP+SSE transport from real `fetch` calls on a real socket | **32/32** |
 | `verify/plugin-boot.mjs` | the plugin mounted in a live DSH profile, `dsh` backend, a real agent turn | **12/12** |
 
 **The client is the reference implementation, not this plugin's own code.** The
@@ -605,22 +727,35 @@ library and itself is not. The SDK is a *verification* dependency only.
 What the stdio scenario asserts, in order of importance:
 
 1. **The anti-silent-discard invariant, over a state × command matrix.** Every
-   accepted command must advance the log; every rejected one must be a
-   structured refusal carrying `data.state` and `data.allowedIn`. A command
-   that returns success without moving `lastEventId` fails the check.
-2. `_dsh/session/rename` is **accepted mid-turn** and its `session_info_update`
+   accepted command must advance the log *by its own effect*; every rejected
+   one must be a structured refusal carrying `data.state` and `data.allowedIn`.
+   A command that returns success without moving `lastEventId` fails the check.
+2. **Durability and rollback, against a log that is genuinely broken.** The
+   check deletes the event log's directory out from under a running control
+   plane and asserts that a rename fails with `durability_failed`, that the
+   failure does *not* claim the effect was applied, and — the part that matters
+   — that **the title is unchanged**. No mock and no stubbed `appendFile`: the
+   write fails with a real `ENOENT`.
+3. `_dsh/session/rename` is **accepted mid-turn** and its `session_info_update`
    reaches the client while the turn is still running — the deliberate design
    choice of §2, asserted rather than asserted-about.
-3. `session/request_permission` parks the session in `awaiting_permission`, and
+4. `session/request_permission` parks the session in `awaiting_permission`, and
    that state is observable *while the question is outstanding* (the check's
    client deliberately delays its answer, because an instant answer would make
    the window unobservably short and prove nothing).
-4. `session/cancel` settles the prompt with `stopReason: "cancelled"`.
-5. Refusals are **logged**, so a client that never saw the response still
+5. `session/cancel` settles the prompt with `stopReason: "cancelled"`, and a
+   cancel is recorded as its own `session.cancel` event.
+6. **A read writes nothing.** `_dsh/session/state` appends no event and does not
+   move `updatedAt`, and it reports the commands the state admits.
+7. **The idempotency key.** A prompt retried with the same key returns the same
+   stop reason and runs **no second turn**; a different key does run one.
+8. **A cursor ahead of the log is reported**, not treated as "nothing to
+   replay".
+9. Refusals are **logged**, so a client that never saw the response still
    learns of it: the check provokes a refusal and then reads `session.refused`
    back out of the replay.
-6. `_dsh/events/replay` returns exactly the events after a cursor, and is
-   idempotent for a repeated cursor.
+10. `_dsh/events/replay` returns exactly the events after a cursor, and is
+    idempotent for a repeated cursor.
 
 What the HTTP check asserts:
 

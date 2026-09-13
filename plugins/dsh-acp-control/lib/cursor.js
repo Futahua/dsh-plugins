@@ -126,3 +126,41 @@ export function isAfter(eventId, after) {
 export function hasGap(after, firstRetainedEventId) {
 	return after >= 0 && after < firstRetainedEventId - 1;
 }
+
+/**
+ * Whether a cursor sits **ahead of** everything the log has.
+ *
+ * This is the mirror of {@link hasGap}, and the more dangerous of the two
+ * because it looks like success. A client that reconnects holding cursor 50
+ * against a log whose high-water mark is 45 — which is what a crash that lost
+ * the tail of the file, or a server restarted against a different data
+ * directory, produces — is told "nothing to replay", then receives new events
+ * numbered 46 upward and **never sees 46–50 at all**, because its cursor is
+ * already past them. It has silently lost events and no way to know.
+ *
+ * `hasGap` cannot see this: it only looks downward from the cursor.
+ *
+ * @param {number} after - the client's cursor.
+ * @param {number} lastEventId - the log's high-water mark.
+ * @returns {boolean} true when the client's cursor is beyond the log.
+ */
+export function isAhead(after, lastEventId) {
+	return after > lastEventId;
+}
+
+/**
+ * Classify a resume attempt so the caller can tell the client what to do.
+ *
+ * One function rather than two checks at each call site: the conditions are
+ * mutually exclusive, and a caller that tested them in the wrong order would
+ * report the wrong remedy.
+ *
+ * @param {number} after - the client's cursor.
+ * @param {{firstRetainedEventId: number, lastEventId: number}} log - the log's bounds.
+ * @returns {{kind: 'ok'}|{kind: 'below_floor', firstRetainedEventId: number}|{kind: 'ahead_of_log', lastEventId: number}}
+ */
+export function classifyResume(after, log) {
+	if (isAhead(after, log.lastEventId)) return { kind: "ahead_of_log", lastEventId: log.lastEventId };
+	if (hasGap(after, log.firstRetainedEventId)) return { kind: "below_floor", firstRetainedEventId: log.firstRetainedEventId };
+	return { kind: "ok" };
+}

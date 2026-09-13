@@ -412,6 +412,87 @@ async function main() {
 		);
 		await plain.dropStream();
 
+		console.log("\n--- cursor edge cases -----------------------------------------");
+		// A cursor ahead of the log looks exactly like "nothing to replay". It
+		// must be reported, or a client that reconnects after a crash that lost
+		// the tail silently never learns which events it missed.
+		const aheadClient = new HttpAcpClient(base, "verify-secret-token");
+		aheadClient.connectionId = client.connectionId;
+		await aheadClient.openStream({ after: 999_999, useQuery: true });
+		await delay(60);
+		const gapFrames = aheadClient.allFrames.filter((entry) => entry.frame?.method === "_dsh/log/gap");
+		check(
+			"a stream opened ahead of the log is told so, with reason ahead_of_log",
+			gapFrames.some((entry) => entry.frame.params?.reason === "ahead_of_log" && typeof entry.frame.params?.lastEventId === "number"),
+			JSON.stringify(gapFrames.map((entry) => entry.frame.params)),
+		);
+		check(
+			"and no log frame is sent as if it were the answer",
+			aheadClient.allFrames.filter((entry) => entry.id !== undefined).length === 0,
+		);
+		await aheadClient.dropStream();
+
+		// An explicit `?after=` must win over a stale `Last-Event-ID`, because a
+		// browser's EventSource supplies the header automatically on every
+		// reconnect and a client that wants to override it has no other way.
+		const precedence = new HttpAcpClient(base, "verify-secret-token");
+		precedence.connectionId = client.connectionId;
+		const headNow = control.log.lastEventId;
+		await precedence.openStream({ after: headNow - 1, lastId: 1 });
+		await delay(60);
+		const precedenceIds = precedence.allFrames.filter((entry) => entry.id !== undefined).map((entry) => entry.id);
+		check(
+			"?after= wins over a stale Last-Event-ID header",
+			precedenceIds.length > 0 && precedenceIds.every((id) => id > headNow - 1),
+			`head ${headNow}, got [${precedenceIds.join(", ")}]`,
+		);
+		await precedence.dropStream();
+
+		// A malformed cursor must fall back, not be read as 0 — reading it as 0
+		// would replay the whole log to a client that wanted the tail, and
+		// reading it as "none" would drop events.
+		const malformed = new HttpAcpClient(base, "verify-secret-token");
+		malformed.connectionId = client.connectionId;
+		await malformed.openStream({ after: "not-a-number", useQuery: true });
+		await delay(60);
+		check(
+			"a malformed ?after= falls back to 'everything' rather than to 0 or to nothing",
+			malformed.allFrames.filter((entry) => entry.id !== undefined).length > 0,
+		);
+		await malformed.dropStream();
+
+		console.log("\n--- idempotency over HTTP ------------------------------------");
+		const idem = new HttpAcpClient(base, "verify-secret-token");
+		idem.connectionId = client.connectionId;
+		await idem.openStream({ after: -1 });
+		await delay(40);
+		const idemSession = await idem.request("session/new", { cwd: dataDir, mcpServers: [] });
+		const idemSessionId = idemSession.result?.sessionId;
+		const key = "http-verify-key-1";
+		const firstTurn = await idem.request("session/prompt", {
+			sessionId: idemSessionId,
+			prompt: [{ type: "text", text: "http idempotent" }],
+			_meta: { "dsh-acp-control/idempotency-key": key },
+		});
+		const headAfterTurn = control.log.lastEventId;
+		const retryTurn = await idem.request("session/prompt", {
+			sessionId: idemSessionId,
+			prompt: [{ type: "text", text: "http idempotent" }],
+			_meta: { "dsh-acp-control/idempotency-key": key },
+		});
+		check(
+			"a prompt retried over HTTP with the same key returns the same stop reason",
+			retryTurn.result?.stopReason === firstTurn.result?.stopReason,
+			`${firstTurn.result?.stopReason} vs ${retryTurn.result?.stopReason}`,
+		);
+		check(
+			"and it appended no further events",
+			control.log.lastEventId === headAfterTurn,
+			`${headAfterTurn} -> ${control.log.lastEventId}`,
+		);
+		await idem.request("session/delete", { sessionId: idemSessionId });
+		await idem.dropStream();
+
 		console.log("\n--- delete, and the session-scoped filter ---------------------");
 		const filtered = new HttpAcpClient(base, "verify-secret-token");
 		filtered.connectionId = client.connectionId;

@@ -51,6 +51,32 @@ export const SESSION_CHANGED = "_dsh/session/changed";
 export const REFUSED = "_dsh/session/refused";
 
 /**
+ * Commands that change nothing and therefore commit nothing.
+ *
+ * Only `state` qualifies: it is a read, and a read that writes is a read that
+ * lies — the previous version appended a `{read: true}` event, which bumped the
+ * session's `updatedAt` and therefore its position in `session/list`, so merely
+ * polling a session made it look recently active and reordered the list
+ * (DESIGN.md §2). Reads are exempt from the commit requirement because they are
+ * required to be silent, not despite it.
+ */
+const READ_ONLY_COMMANDS = new Set([Command.state]);
+
+/**
+ * Event types that do not constitute session activity, and so must not move
+ * `updatedAt`.
+ *
+ * Empty today — removing the read event removed the only offender — and kept as
+ * an explicit, named policy rather than an implicit "every event counts", so
+ * that the next bookkeeping event someone adds has an obvious place to
+ * register.
+ */
+const NON_ACTIVITY_EVENTS = new Set([]);
+
+/** Monotonic counter behind `scope.id`, so a command id is unique within a process. */
+let commandSeq = 0;
+
+/**
  * One session's record.
  *
  * `state` is the single source of truth about what may happen next; it is never
@@ -81,6 +107,16 @@ export class SessionRecord {
 	backendSession;
 	/** @type {number} events appended for this session. */
 	committed = 0;
+	/**
+	 * The command scope currently running an effect on this session, if any.
+	 *
+	 * Set by {@link SessionRegistry.admit} for exactly the duration of the
+	 * effect and read by {@link SessionRegistry.commit}. Safe as implicit state
+	 * because commands are serialized on `queue`, so no second scope can be
+	 * open on this session at the same time.
+	 * @type {{id: string, commits: number}|undefined}
+	 */
+	scope;
 	/** @type {Promise<unknown>} serializes commands within this session. */
 	queue = Promise.resolve();
 	/** @type {AbortController|undefined} aborts the in-flight turn. */
@@ -141,7 +177,13 @@ export class SessionRegistry {
 			const session = record.sessionId === null ? undefined : this.#sessions.get(record.sessionId);
 			if (session !== undefined) {
 				session.committed += 1;
-				session.updatedAt = record.ts;
+				// `updatedAt` tracks real activity only. Reads no longer log
+				// anything at all (see READ_ONLY_COMMANDS), so every remaining
+				// event is a genuine change — but the exemption list is kept
+				// explicit so that adding a bookkeeping event later cannot
+				// silently make `session/list` reorder itself when nobody did
+				// anything.
+				if (!NON_ACTIVITY_EVENTS.has(record.type)) session.updatedAt = record.ts;
 			}
 			if (record.frame !== undefined) this.#sink(record.frame, record);
 		});
@@ -329,10 +371,14 @@ export class SessionRegistry {
 			}
 
 			const edge = nextState(command, session.state);
-			const before = session.committed;
 			if (edge !== null) {
 				const from = session.state;
-				session.state = edge;
+				// Commit **before** mutating. Appending first means a failed
+				// append leaves the session exactly as it was, so a reported
+				// failure never carries an applied effect; assigning first —
+				// which this did — left the state moved while the caller was
+				// told the command failed. The frame factory only needs the
+				// captured locals, so it does not depend on the mutation.
 				this.#log.append({
 					sessionId: session.sessionId,
 					actor,
@@ -348,16 +394,57 @@ export class SessionRegistry {
 							eventId,
 						}),
 				});
+				// Durable before the state moves: otherwise a failed write
+				// leaves the session in the new state while the caller is told
+				// the command failed — which is how a prompt could be reported
+				// as failed and still strand its session in `generating`.
+				await this.durable(`${command}'s state transition`);
+				session.state = edge;
 			}
 
-			const result = await effect(session);
+			// The effect's own commits are counted in `scope`, which is set on
+			// the session for exactly as long as the effect runs. The automatic
+			// edge event above deliberately does **not** count: it is appended
+			// before the effect, so counting it would satisfy the check below
+			// vacuously for every command that has an edge — which is how the
+			// previous version of this check passed `prompt`, `cancel`, `close`,
+			// `delete` and `resume` without ever proving their effects did
+			// anything at all.
+			const scope = { id: `${command}#${++commandSeq}`, commits: 0 };
+			session.scope = scope;
+			let result;
+			try {
+				result = await effect(session);
+			} finally {
+				session.scope = undefined;
+			}
 
-			if (session.committed === before) {
+			if (!READ_ONLY_COMMANDS.has(command) && scope.commits === 0) {
 				throw internalError(
-					`${command} was admitted in state ${session.state} but committed no event; refusing to report success for an effect that left no trace`,
-					{ type: "invariant_violation", command, sessionId: session.sessionId, state: session.state },
+					`${command} was admitted in state ${session.state} but its effect committed no event; refusing to report success for an effect that left no trace`,
+					{ type: "invariant_violation", command, commandId: scope.id, sessionId: session.sessionId, state: session.state },
 				);
 			}
+
+			// Durability is part of success (DESIGN.md §5). Until this awaited
+			// flush, a command could return success, reach live clients, advance
+			// every cursor, and be gone after a restart, because the write chain
+			// swallowed its own failures.
+			await this.#log.flush().catch((error) => {
+				throw internalError(
+					`${command} was applied but its events could not be written to the log: ${error instanceof Error ? error.message : String(error)}`,
+					{
+						type: "durability_failed",
+						command,
+						commandId: scope.id,
+						sessionId: session.sessionId,
+						state: session.state,
+						logPath: this.#log.path,
+						effectApplied: true,
+					},
+				);
+			});
+
 			return result;
 		};
 
@@ -393,13 +480,57 @@ export class SessionRegistry {
 	}
 
 	/**
+	 * Await durability of everything appended so far, or fail.
+	 *
+	 * This is the step that makes "commit before mutate" mean something. An
+	 * append only *queues* a write, so a mutation performed immediately after
+	 * one is still exposed to a disk that is full or gone — which is exactly
+	 * what `verify/core-checks.mjs` demonstrated when it deleted the log
+	 * directory and watched a rename report `durability_failed` while the title
+	 * had already changed.
+	 *
+	 * Effects therefore order themselves: append, await this, *then* mutate.
+	 * Commands pay one disk round trip at their mutation point, which is the
+	 * price of the guarantee and is nowhere near a streaming path.
+	 *
+	 * @throws {RpcError} `data.type === 'durability_failed'` when the write failed.
+	 */
+	async durable(what) {
+		try {
+			await this.#log.flush();
+		} catch (error) {
+			throw new RpcError(
+				ErrorCode.internalError,
+				`${what} could not be written to the event log: ${error instanceof Error ? error.message : String(error)}`,
+				{ type: "durability_failed", logPath: this.#log.path, reason: error instanceof Error ? error.message : String(error) },
+			);
+		}
+	}
+
+	/**
 	 * Append an event for a session.
+	 *
+	 * When an admission scope is open (see {@link admit}), the append counts
+	 * toward it and the record carries the command id — so the log answers "which
+	 * command produced this event", which is what makes the admission check
+	 * mean something and what a reader needs to reconstruct intent from the log.
+	 *
 	 * @param {SessionRecord} session - the session.
-	 * @param {object} input - `{actor, type, data, frame}`.
+	 * @param {object} input - `{actor, type, data, frame, scope}`.
 	 * @returns {object} the stored record.
 	 */
 	commit(session, input) {
-		return this.#log.append({ sessionId: session.sessionId, ...input });
+		const scope = input.scope ?? session.scope;
+		const record = this.#log.append({
+			sessionId: session.sessionId,
+			...(scope === undefined ? {} : { commandId: scope.id }),
+			actor: input.actor,
+			type: input.type,
+			data: input.data,
+			frame: input.frame,
+		});
+		if (scope !== undefined) scope.commits += 1;
+		return record;
 	}
 
 	/**
@@ -431,6 +562,9 @@ export class SessionRegistry {
 	 * command's effect owns (`generating` → `idle` when a turn ends,
 	 * `closing` → `closed` when teardown finishes).
 	 *
+	 * Commit first, mutate second, for the same reason as everywhere else: a
+	 * failed append must leave the session as it was.
+	 *
 	 * @param {SessionRecord} session - the session.
 	 * @param {string} to - the destination state.
 	 * @param {string} reason - what caused the move, recorded in the event.
@@ -439,15 +573,44 @@ export class SessionRegistry {
 	 */
 	setState(session, to, reason, actor) {
 		const from = session.state;
-		session.state = to;
-		if (to !== SessionState.generating && to !== SessionState.awaitingPermission) session.turnId = undefined;
-		return this.commit(session, {
+		const record = this.commit(session, {
 			actor,
 			type: EventType.state,
 			data: { from, to, reason },
 			frame: (eventId) =>
 				notificationFrame(STATE_CHANGED, { sessionId: session.sessionId, from, to, command: reason, actor, eventId }),
 		});
+		session.state = to;
+		if (to !== SessionState.generating && to !== SessionState.awaitingPermission) session.turnId = undefined;
+		return record;
+	}
+
+	/**
+	 * {@link setState}, but the state moves only once the transition is on disk.
+	 *
+	 * Used wherever a caller is entitled to treat the movement as part of the
+	 * command's success — resume in particular, where a backend that refuses to
+	 * reopen must leave the session `closed` rather than `idle` with no handle.
+	 *
+	 * @param {SessionRecord} session - the session.
+	 * @param {string} to - the destination state.
+	 * @param {string} reason - what caused the move.
+	 * @param {string} actor - who caused it.
+	 * @returns {Promise<object>} the stored record.
+	 */
+	async setStateDurable(session, to, reason, actor) {
+		const from = session.state;
+		const record = this.commit(session, {
+			actor,
+			type: EventType.state,
+			data: { from, to, reason },
+			frame: (eventId) =>
+				notificationFrame(STATE_CHANGED, { sessionId: session.sessionId, from, to, command: reason, actor, eventId }),
+		});
+		await this.durable(`${reason} state transition`);
+		session.state = to;
+		if (to !== SessionState.generating && to !== SessionState.awaitingPermission) session.turnId = undefined;
+		return record;
 	}
 
 	/**
@@ -475,7 +638,7 @@ export class SessionRegistry {
 		try {
 			session.backendSession = await this.#backend.create({ sessionId, cwd });
 		} catch (error) {
-			this.setState(session, SessionState.failed, "backend_create_failed", "system:acp-control");
+			await this.setStateDurable(session, SessionState.failed, "backend_create_failed", "system:acp-control");
 			this.commit(session, {
 				actor: "system:acp-control",
 				type: EventType.error,
@@ -491,13 +654,21 @@ export class SessionRegistry {
 
 	/**
 	 * Reopen a recovered or closed session's backend handle.
+	 *
+	 * The backend is asked **first** and the handle is stored **last**: a
+	 * backend that refuses to resume must leave the session `closed`, not
+	 * `idle` with no handle. `resume` therefore has no automatic transition
+	 * edge (see `EDGES` in lib/state.js) and this method owns both halves in
+	 * order.
+	 *
 	 * @param {SessionRecord} session - the session.
 	 * @param {string} actor - who asked.
 	 * @returns {Promise<SessionRecord>} the session.
 	 */
 	async reopen(session, actor) {
-		session.backendSession = await this.#backend.resume({ sessionId: session.sessionId, cwd: session.cwd });
-		this.setState(session, SessionState.idle, "resumed", actor);
+		const backendSession = await this.#backend.resume({ sessionId: session.sessionId, cwd: session.cwd });
+		await this.setStateDurable(session, SessionState.idle, "resumed", actor);
+		session.backendSession = backendSession;
 		return session;
 	}
 }
