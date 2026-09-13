@@ -11,7 +11,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { PROTOCOL_METHODS, RpcError, ErrorCode, requestCancelled } from "./jsonrpc.js";
+import { PROTOCOL_METHODS, RpcError, ErrorCode, isExtensionFrame, requestCancelled } from "./jsonrpc.js";
 
 /**
  * One peer.
@@ -57,6 +57,27 @@ export class Connection {
 	}
 
 	/**
+	 * Whether this peer may be sent a frame.
+	 *
+	 * The extension gate, and the **only** copy of it. A client that did not
+	 * opt in through `initialize` must never be sent a method it has never
+	 * heard of — a standard client is entitled to treat an unknown method as a
+	 * protocol violation, and being handed the entire `_dsh/*` history on
+	 * reconnect would be exactly that.
+	 *
+	 * It lives on the connection rather than in the broadcaster because the
+	 * live path and the replay path must agree. They did not, once: the filter
+	 * was applied only where frames were broadcast, so replay sent extension
+	 * frames to everyone. Both paths now call this.
+	 *
+	 * @param {object} frame - the frame about to be written.
+	 * @returns {boolean} true when this peer may receive it.
+	 */
+	allowsFrame(frame) {
+		return isExtensionFrame(frame) === false || this.extensions === true;
+	}
+
+	/**
 	 * Write one frame.
 	 *
 	 * `record` is accepted and ignored here; the HTTP transport overrides this
@@ -68,6 +89,7 @@ export class Connection {
 	 */
 	send(frame, record) {
 		if (this.closed) return;
+		if (!this.allowsFrame(frame)) return;
 		try {
 			this.#write(frame);
 		} catch (error) {

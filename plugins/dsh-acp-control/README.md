@@ -19,6 +19,29 @@ draft ACP RFDs so migration is mechanical when they stabilise.
 | `dsh` backend in a real profile | **built and verified** (`verify/plugin-boot.mjs` 12/12, real agent turn) |
 | Loaded in the running `dsh web` | **not yet** — see *Loading it* |
 
+## Known deviations
+
+Read these before relying on the plugin. Full reasoning is in
+[`DESIGN.md`](DESIGN.md), at the top.
+
+| # | What | Status |
+| --- | --- | --- |
+| 1 | **The stream model does not conform to the RFD.** It requires one connection-scoped stream *plus* one session-scoped stream per session, concurrently attachable. This serves **one stream per connection** with an optional `?session=` filter, so a client that follows the RFD and opens both gets its connection stream torn down by its session stream and stops receiving responses. | Known defect. **Slice 2, item 1.** |
+| 2 | `_dsh/session/refused` is an **invention** — ACP is silent on how a refused *notification* is reported, since a notification has no response channel. The log entry is the part that needs no permission; the notification is this plugin's own mechanism. | Deliberate, labelled as ours |
+| 3 | The SSE `id:` field is used as the replay cursor. The RFD does **not** define event ids in v1 — it defers them to v2 as a "last replay ID". Unclaimed today and pointing v2's way, but v2 could assign it a different meaning. | Contained in `lib/cursor.js` |
+
+Two things worth knowing when reading the ACP schema:
+
+- **`session/fork` looks stable and is not.** The constant is present in the
+  schema shipped with `@agentclientprotocol/sdk` 1.4.0, but it is marked
+  unstable, sits behind the `unstable_session_fork` flag, and ships in the
+  *unstable* schema artifact; the stable v1 schema holds only completed
+  features, and the RFD status (Draft since 2025-11-20) is authoritative. Fork
+  therefore stays in `_dsh/` and is not advertised in `sessionCapabilities`.
+- **`session/cancel` is a notification**, so a disallowed cancel has no response
+  channel. The refusal is recorded in the log, and — for clients that opted into
+  `_dsh/` — also sent as `_dsh/session/refused`.
+
 ## Why this exists
 
 Two ACP servers for DSH already exist. Neither closes the hole this one is
@@ -233,7 +256,11 @@ deliberately **not** `fork`, whose RFD is still Draft.
 | `_dsh/events/replay` | `{sessionId?, after, limit?}` → events, `lastEventId`, `firstRetainedEventId` |
 | `_dsh/log/info` | log position, size, cap, backend, connection count |
 
-Plus the `_dsh/session/state_changed` and `_dsh/session/changed` notifications.
+Plus the `_dsh/session/state_changed`, `_dsh/session/changed`, and
+`_dsh/session/refused` notifications. The last is an **invention** — ACP does
+not define how a refused notification is reported, because a notification has no
+response channel. A standard client never sees it; an opted-in client may rely
+on it; the log entry is the part that needs no permission.
 
 **Refused by name, never silently**: `session/load` (`unimplemented`, pointing
 at `_dsh/events/replay` — replay is a cursor, not a load), `session/set_mode`,
@@ -251,13 +278,13 @@ development, listed at the bottom of this file.
 
 ```powershell
 # protocol, state machine, replay over the real stdio transport, in process
-node plugins\dsh-acp-control\verify\core-checks.mjs        # 49 checks
+node plugins\dsh-acp-control\verify\core-checks.mjs        # 50 checks
 
 # the same, over a real child process's pipes, driven by the official ACP client
-node plugins\dsh-acp-control\verify\stdio-client.mjs       # 49 checks
+node plugins\dsh-acp-control\verify\stdio-client.mjs       # 50 checks
 
 # loopback HTTP+SSE: auth, the RFD's POST contract, and the reconnect guarantee
-node plugins\dsh-acp-control\verify\http-client.mjs        # 22 checks
+node plugins\dsh-acp-control\verify\http-client.mjs        # 26 checks
 
 # mounted in a live DSH profile, with the dsh backend and a real agent turn
 node plugins\dsh-acp-control\verify\plugin-boot.mjs        # 12 checks

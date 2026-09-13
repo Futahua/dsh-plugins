@@ -153,20 +153,16 @@ export class ControlPlane {
 	/**
 	 * Deliver one live frame to every connection.
 	 *
-	 * Extension frames are filtered per connection: `_dsh/*` goes only to
-	 * clients that opted in at `initialize`. Filtering here rather than at the
-	 * call site means no future notification can forget to check.
+	 * The extension gate is **not** applied here: it lives on the connection
+	 * (`Connection#allowsFrame`), because the live path and the replay path must
+	 * make the same decision and there must be one copy of it. This method's
+	 * job is only to reach every peer.
 	 *
 	 * @param {object} frame - the frame, straight off the log record.
 	 * @param {object} record - the log record it came from.
 	 */
 	broadcast(frame, record) {
-		const method = typeof frame.method === "string" ? frame.method : "";
-		const extension = method.startsWith(EXTENSION_PREFIX);
-		for (const connection of this.#connections) {
-			if (extension && connection.extensions !== true) continue;
-			connection.send(frame, record);
-		}
+		for (const connection of this.#connections) connection.send(frame, record);
 	}
 
 	/**
@@ -308,6 +304,8 @@ export class ControlPlane {
 						`${EXTENSION_PREFIX}events/replay`,
 						`${EXTENSION_PREFIX}log/info`,
 					],
+					/** Notifications an opted-in client will receive. `session/refused` is this plugin's own mechanism; ACP does not define one. */
+					notifications: [`${EXTENSION_PREFIX}session/state_changed`, `${EXTENSION_PREFIX}session/changed`, `${EXTENSION_PREFIX}session/refused`],
 				},
 			},
 		};

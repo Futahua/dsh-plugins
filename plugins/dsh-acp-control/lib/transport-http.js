@@ -41,6 +41,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { Connection } from "./connection.js";
+import { encodeEventId, hasGap, isAfter, readCursor } from "./cursor.js";
 import { classify, readChunk, serialize } from "./jsonrpc.js";
 
 /** The longest a single request body may be before it is refused. */
@@ -91,6 +92,11 @@ class SseConnection extends Connection {
 	 * @param {object} [record] - the log record, when the frame came from one.
 	 */
 	send(frame, record) {
+		if (this.closed) return;
+		// The extension gate, before anything is buffered or written. Checked
+		// here as well as in the base class because this override is the whole
+		// write path for an SSE connection.
+		if (!this.allowsFrame(frame)) return;
 		const sessionId = record?.sessionId ?? frame?.params?.sessionId;
 		if (this.sessionFilter !== undefined && sessionId !== undefined && sessionId !== this.sessionFilter) return;
 		if (this.sessionFilter !== undefined && sessionId === undefined && record !== undefined) return;
@@ -150,6 +156,12 @@ class SseConnection extends Connection {
 		let replayed = 0;
 		for (const record of missed) {
 			if (record.frame === undefined) continue;
+			if (!isAfter(record.eventId, query.after)) continue;
+			// The same extension gate the live path uses. Applying it at the
+			// broadcaster only would hand a non-opted-in client the entire
+			// `_dsh/*` history on reconnect — and it did, until this check
+			// caught it.
+			if (!this.allowsFrame(record.frame)) continue;
 			writeSse(res, record.eventId, record.frame);
 			replayed += 1;
 		}
@@ -164,9 +176,20 @@ class SseConnection extends Connection {
 			res.write(`: ping ${Date.now()}\n\n`);
 		}, HEARTBEAT_MS);
 		this.#heartbeat.unref?.();
-		this.#logger(`stream attached to ${this.id}: replayed ${replayed} frame(s) after event ${query.after}`);
+		this.#logger(
+			`stream attached to ${this.id}: replayed ${replayed} frame(s) after event ${query.after} ` +
+				`(cursor from ${query.cursorSource ?? "none"})`,
+		);
 
 		const detach = () => {
+			// Only if this response is *still* the current one. A re-attach
+			// ends the previous stream and installs a new one, and the old
+			// response's `close` fires afterwards — so an unguarded detach
+			// clears the NEW stream and sends every subsequent live frame into
+			// `pending`, where nobody reads it. Replay still works (it writes
+			// straight to the response), so the symptom is a client that
+			// reconnects, receives its backlog, and then goes silently deaf.
+			if (this.stream !== res) return;
 			clearInterval(this.#heartbeat);
 			this.stream = undefined;
 			this.touchedAt = Date.now();
@@ -191,7 +214,8 @@ class SseConnection extends Connection {
 /** Write one SSE frame. `id` is omitted when the frame has no log position. */
 function writeSse(res, eventId, frame) {
 	if (res.writableEnded) return;
-	const id = eventId === undefined ? "" : `id: ${eventId}\n`;
+	const encoded = encodeEventId(eventId);
+	const id = encoded === undefined ? "" : `id: ${encoded}\n`;
 	try {
 		res.write(`${id}data: ${JSON.stringify(frame)}\n\n`);
 	} catch {
@@ -415,22 +439,17 @@ export async function startHttpTransport({
 					res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown Acp-Connection-Id" }));
 					return;
 				}
-				// Cursor precedence: an explicit query parameter wins, then the
-				// standard SSE resume header a browser sends by itself, then
-				// -1 meaning "everything", which is the OpenHands convention.
-				const rawAfter = url.searchParams.get("after");
-				const lastEventId = req.headers["last-event-id"];
-				let after = -1;
-				if (rawAfter !== null && rawAfter !== "" && Number.isFinite(Number(rawAfter))) after = Math.floor(Number(rawAfter));
-				else if (typeof lastEventId === "string" && lastEventId !== "" && Number.isFinite(Number(lastEventId))) {
-					after = Math.floor(Number(lastEventId));
-				}
+				// All cursor semantics live in lib/cursor.js — including the fact
+				// that this field is unclaimed by v1 and may be assigned a
+				// different meaning by v2. See that module's header.
+				const cursor = readCursor({ url, headers: req.headers });
 				const sessionId = url.searchParams.get("session") ?? undefined;
 				const floor = plane.log.firstRetainedEventId;
 				connection.attachStream(res, plane.log, {
-					after,
+					after: cursor.after,
+					cursorSource: cursor.source,
 					sessionId,
-					gapFirstRetainedEventId: after >= 0 && after < floor - 1 ? floor : undefined,
+					gapFirstRetainedEventId: hasGap(cursor.after, floor) ? floor : undefined,
 				});
 				return;
 			}

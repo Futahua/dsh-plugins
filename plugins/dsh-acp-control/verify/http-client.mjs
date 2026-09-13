@@ -154,7 +154,7 @@ class HttpAcpClient {
 	 * `Last-Event-ID` — unless `useQuery` is set, which exercises the explicit
 	 * `?after=` form and proves both spellings agree.
 	 */
-	async openStream({ after, useQuery = false, session, lastId } = {}) {
+	async openStream({ after, useQuery = after !== undefined, session, lastId } = {}) {
 		const params = new URLSearchParams();
 		if (this.token !== undefined) params.set("token", this.token);
 		if (this.connectionId !== undefined) params.set("connection", this.connectionId);
@@ -362,6 +362,55 @@ async function main() {
 			`missing ids ${missing.join(", ")}`,
 		);
 		console.log(`  after reconnect                 → replayed ${afterReconnect.length} frame(s); ${expected.length} expected`);
+
+		console.log("\n--- a standard client is never sent _dsh/* ---------------------");
+		// Extension notifications only reach connections that opted in through
+		// `clientCapabilities._meta` at `initialize`. A client that did not opt
+		// in must never be sent a method it has never heard of — that is the
+		// difference between an extension namespace and a protocol violation.
+		// The `client` connection must be the one holding the active stream for
+		// the in-band half of this check — one stream per connection, and the
+		// reconnect probes above took it over.
+		await client.openStream({ after: -1 });
+		await delay(40);
+		const plain = new HttpAcpClient(base, "verify-secret-token");
+		const plainInit = await plain.post({
+			jsonrpc: "2.0",
+			id: 1,
+			method: "initialize",
+			params: { protocolVersion: 1, clientInfo: { name: "plain-stdlib-client", version: "1.0.0" } },
+		});
+		check("a client that does not opt in still initializes", plainInit.status === 200);
+		await plain.openStream({ after: -1 });
+		await delay(40);
+		const plainSession = await plain.request("session/new", { cwd: dataDir, mcpServers: [] });
+		const plainSessionId = plainSession.result?.sessionId;
+		// Provoke a real refusal, so the plugin emits `_dsh/session/refused`.
+		const refused = await plain.request("session/resume", { sessionId: plainSessionId });
+		check(
+			"the standard client receives the refusal as a normal JSON-RPC error",
+			refused.error?.data?.type === "refused",
+			JSON.stringify(refused.error?.data),
+		);
+		await delay(80);
+		const leaked = plain.allFrames.filter((entry) => typeof entry.frame?.method === "string" && entry.frame.method.startsWith("_dsh/"));
+		check(
+			"a standard client receives no _dsh/* frame at all",
+			leaked.length === 0,
+			`leaked ${leaked.map((entry) => entry.frame.method).join(", ")}`,
+		);
+		check(
+			"an OPTED-IN client does receive the same refusal in-band",
+			client.allFrames.some(
+				(entry) => entry.frame?.method === "_dsh/session/refused" && entry.frame.params?.command === "resume",
+			),
+			`opted-in client saw: ${client.allFrames
+				.filter((entry) => entry.frame?.method !== undefined)
+				.map((entry) => entry.frame.method)
+				.slice(-6)
+				.join(", ") || "(no notification frames)"}`,
+		);
+		await plain.dropStream();
 
 		console.log("\n--- delete, and the session-scoped filter ---------------------");
 		const filtered = new HttpAcpClient(base, "verify-secret-token");

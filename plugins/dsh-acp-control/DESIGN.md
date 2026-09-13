@@ -9,6 +9,74 @@ against an alternative, and the alternative is named.
 
 ---
 
+## Read this first: status, known deviations, and what is invented here
+
+Three things a reader should know before trusting anything below, because each
+one is a place where this implementation is *not* simply "what the spec says".
+
+### 1. Known deviation: the stream model (slice 2, and it is a real non-conformance)
+
+**The ACP remote-transport RFD requires one connection-scoped stream *plus* one
+session-scoped stream per session, all concurrently attachable**, and its
+message-flow diagram shows them open together across the session lifecycle. A
+connection-scoped stream carries what cannot be session-scoped — the responses
+to `session/new` and `session/load`, which a client cannot receive on a stream
+it does not yet have an id for — while session-scoped streams carry that
+session's updates, permission requests, and the responses to its POSTs.
+
+**Slice 1 serves one stream per connection, with an optional `?session=`
+filter.** That is not the RFD's model, and it is not a matter of taste: a client
+that follows the RFD and opens both at once gets its session stream replaced by
+its connection stream, and stops receiving that session's responses. Nothing in
+slice 1's checks catches this, because they attach one stream at a time.
+
+Slice 1 shipped this way deliberately — one stream was enough to build and
+demonstrate the replay guarantee, which is the part the RFD does not provide —
+but it is a defect against the transport spec, it is the **first** item of slice
+2, and it is recorded here rather than discovered later. See §7 for the current
+behaviour and what the fix touches.
+
+### 2. Which ACP surface is stable, and one trap
+
+| Surface | Status | What this plugin does |
+| --- | --- | --- |
+| `session/list`, `resume`, `close`, `delete`, `set_config_option`, `set_mode` | **Completed** | uses the stable method where implemented; refuses the rest by name |
+| session config options, message ID, `$/cancel_request` | **Completed** | message ids are carried; `$/cancel_request` is honoured |
+| `session_info_update` | **Completed** | rename's *effect* is published on it (§4) |
+| session fork | **Draft** (2025-11-20) | kept in `_dsh/`; see the trap below |
+| v2 prompt lifecycle | **Draft** (2026-04-23) | not used |
+| Streamable HTTP & WebSocket transport | **Active**, targets v1, does not replay in-flight messages and defers resumability to v2 | transport shape followed; replay added here (§5) |
+
+**The trap:** `AGENT_METHODS.session_fork = "session/fork"` is present in the
+schema that ships with `@agentclientprotocol/sdk` 1.4.0, so the next person to
+read that file will conclude fork is stable and promote it. It is not: the
+constant is marked unstable, sits behind the `unstable_session_fork` feature
+flag, and ships in the **unstable** schema artifact, whereas the stable v1
+schema contains only completed features. **The RFD status is authoritative, not
+the presence of a method constant.** Fork therefore stays in `_dsh/`, and this
+plugin does not advertise it in `sessionCapabilities`.
+
+### 3. Two things here are inventions, not spec-sanctioned mechanisms
+
+Labelled because an unlabelled invention reads as a guarantee.
+
+- **Refusing a notification (§2, §4).** A JSON-RPC notification has no response
+  channel, so when a client sends `session/cancel` in a state that refuses it,
+  there is **no in-band way to answer**. The spec is silent on the case; it does
+  not address it and it does not forbid what is done here. Two mechanisms stand
+  in: every refusal is appended to the log as `session.refused` (an audit trail,
+  which needs nobody's permission), and — this plugin's own addition — an
+  opted-in client additionally receives `_dsh/session/refused` so it learns of
+  the refusal when it happens rather than only on replay.
+- **The SSE `id:` field as the replay cursor (§5).** The RFD does **not** define
+  event ids in v1. It defers them to v2, where streamed chunks carry an id
+  described as a "last replay ID" for retry and resumption. So the field is
+  unclaimed today and points where v2 is going — the good case — but v2 could
+  still assign it a different meaning. The exposure is contained in
+  `lib/cursor.js` (§5).
+
+---
+
 ## 1. The gap this fills
 
 Two ACP servers for DSH already exist, and neither closes the hole this plugin
@@ -236,6 +304,17 @@ Plus one notification:
 | Notification | Payload |
 | --- | --- |
 | `_dsh/session/state_changed` | `{sessionId, from, to, command, eventId, actor}` |
+| `_dsh/session/changed` | `{sessionId, changed, archived, actor, eventId}` |
+| `_dsh/session/refused` | `{sessionId, command, state, allowedIn, reason, actor, eventId}` |
+
+**`_dsh/session/refused` is an invention.** A JSON-RPC notification has no
+response channel, so a refused notification cannot be answered in-band. The spec
+does not address the case. Sending this notification is therefore this plugin's
+own mechanism, not something ACP sanctions — an opted-in client may rely on it,
+a standard client is unaffected (it never sees `_dsh/*`), and a client that
+wants only what the spec guarantees has the log entry. Both halves are asserted
+in `verify/`: the refusal is recorded, *and* it reaches an opted-in client
+in-band, *and* it reaches a non-opted-in client not at all.
 
 **Why `_dsh/` and not `dsh/`.** The third-party plugin already uses the bare
 `dsh/` namespace for different methods with different shapes. Two
@@ -332,6 +411,31 @@ the log hits `maxLogBytes` the plugin emits `log.exhausted` once and *refuses*
 further mutations with that reason, rather than dropping events to stay under
 the cap.
 
+### The cursor is one module, because v2 may re-define it
+
+The RFD does not define event ids in v1; it defers them to v2, where streamed
+chunks carry an id described as a "last replay ID" for retry and resumption.
+Using the SSE `id:` field as the log position is therefore **unclaimed today and
+pointing the same way v2 is going** — the good case — but it also means v2 could
+assign the field a meaning that differs from ours.
+
+All cursor semantics live in `lib/cursor.js`: `readCursor` (precedence between
+`?after=`, `Last-Event-ID`, and "everything"), `encodeEventId` (what goes in
+`id:`), `decodeCursor`, `isAfter`, and `hasGap`. The transport calls those and
+never parses a cursor itself. If v2 redefines the id as an opaque token rather
+than a log position, the change is confined to that file — `transport-http.js`
+keeps calling the same functions, and the log keeps its own monotonic
+`eventId`.
+
+Deliberately *not* abstracted: the fact that the cursor is a log position at
+all. Hiding that behind an opaque cursor type today would be ceremony for a
+problem that does not exist yet, and it would make the replay guarantee harder
+to read — which is the one thing this design cannot afford.
+
+Every attach also logs which channel supplied the cursor (`cursor from query`,
+`last-event-id`, or `none`), because "which channel did the client use" is the
+difference between diagnosing a stuck reconnect and guessing at it.
+
 ### Why an event log rather than replaying the transcript
 
 `session/load` semantics (re-derive updates from the session log) were
@@ -399,6 +503,36 @@ DELETE /acp        close the connection
 GET    /healthz    liveness, unauthenticated, no data
 ```
 
+#### Deviation from the RFD: one stream per connection, not one-per-connection plus one-per-session
+
+The RFD requires **one connection-scoped stream plus one session-scoped stream
+per session, concurrently attachable**, and shows them open together across the
+lifecycle. Slice 1 instead serves **one stream per connection**, with an
+optional `?session=` filter to scope it.
+
+Why this is a defect and not a simplification: a client that follows the RFD
+opens both at once, and the second attach replaces the first — so its
+connection-scoped stream (which carries the `session/new` response it cannot
+get anywhere else) is torn down by its session stream. It then stops receiving
+responses, and nothing tells it why.
+
+Why it shipped anyway: one stream is sufficient to build and demonstrate the
+replay guarantee, which is the part the RFD does *not* provide and therefore the
+part slice 1 exists to prove. The checks attach one stream at a time and so do
+not catch it.
+
+What the fix touches, recorded now so slice 2 starts from the shape rather than
+rediscovering it: `SseConnection` holds a single `stream` field and must hold a
+set keyed by scope (`connection` plus zero or more `sessionId`s); `send` must
+fan out to the matching scopes instead of filtering one stream by session;
+`attachStream`'s "a re-attach replaces the previous stream" rule must become
+"a re-attach replaces only the stream with the same scope"; and the reaper and
+`close()` must count streams rather than connections. The cursor and replay
+logic is already per-stream and needs no change — which is the main reason the
+replay layer was worth building first.
+
+**Slice 2, item 1.**
+
 **Auth is Goose's pattern**, because Goose shipped it and it is the shape that
 actually works for browsers:
 
@@ -457,9 +591,9 @@ a transcript, and each one found at least one real bug.
 
 | Check | What it drives | Result |
 | --- | --- | --- |
-| `verify/core-checks.mjs` | the scenario below, over the real `serveStdio` on in-process pipes | **49/49** |
-| `verify/stdio-client.mjs` | the same, over a real child process's OS pipes | **49/49** |
-| `verify/http-client.mjs` | the loopback HTTP+SSE transport from real `fetch` calls on a real socket | **22/22** |
+| `verify/core-checks.mjs` | the scenario below, over the real `serveStdio` on in-process pipes | **50/50** |
+| `verify/stdio-client.mjs` | the same, over a real child process's OS pipes | **50/50** |
+| `verify/http-client.mjs` | the loopback HTTP+SSE transport from real `fetch` calls on a real socket | **26/26** |
 | `verify/plugin-boot.mjs` | the plugin mounted in a live DSH profile, `dsh` backend, a real agent turn | **12/12** |
 
 **The client is the reference implementation, not this plugin's own code.** The
@@ -504,6 +638,10 @@ What the HTTP check asserts:
    replayed ids `41, 42, 44, 45, 47` — precisely the frames after 40, with the
    frame-less log positions skipped — and `Last-Event-ID: 45` replayed `47`
    alone.
+5. **The extension gate holds on both paths.** A client that opts into `_dsh/`
+   receives `_dsh/session/refused` in-band for a refused command; a client that
+   does not opt in receives the same refusal as an ordinary JSON-RPC error and
+   **no `_dsh/*` frame at all**.
 
 What the profile check asserts: the plugin mounts inside DeepSeek Harness and
 answers `initialize` with `backend: "dsh"`; `session/list` returns the **live
@@ -538,6 +676,18 @@ ticks:
   produced.
 - **Shutdown hung on long-lived SSE sockets**, because `server.close()` waits
   for connections to go idle and a stream never does.
+- **The extension filter was applied only where frames were broadcast, not
+  where they were replayed.** A standard client that reconnected was handed the
+  entire `_dsh/*` history — a protocol violation, since it had never opted in
+  and is entitled to treat an unknown method as one. The gate now lives on the
+  connection (`Connection#allowsFrame`) and both paths call it, so there is one
+  copy of the policy rather than two that agree by luck.
+- **A stale stream's `close` handler cleared the *new* stream.** Re-attaching
+  ends the previous response and installs a new one; the old response's `close`
+  then fired and set `this.stream = undefined` unconditionally. Replay kept
+  working — it writes straight to the response — so the symptom was a client
+  that reconnected, received its backlog, and then went **silently deaf** to
+  every live frame. This one would have hit real clients on every reconnect.
 
 ---
 
@@ -557,6 +707,11 @@ Not implemented, and refused by name rather than ignored: WebSocket upgrade
 and elicitation capabilities; log rotation; and durable fork execution — fork
 creates the child session and records lineage, but copying the parent's turn
 prefix is slice 2.
+
+**Slice 2 opens with the stream-model deviation** described at the top of this
+document and in §7: replacing the single-stream-per-connection model with the
+RFD's connection-scoped plus per-session streams. It is a conformance defect,
+not an enhancement, and it is listed first so it is not mistaken for polish.
 
 The session backend is a port (`lib/backends.js`) with two adapters:
 

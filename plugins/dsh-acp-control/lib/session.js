@@ -9,18 +9,46 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { CLIENT_METHODS, notificationFrame, ErrorCode, RpcError, internalError, notFound } from "./jsonrpc.js";
+import { CLIENT_METHODS, EXTENSION_PREFIX, notificationFrame, ErrorCode, RpcError, internalError, notFound } from "./jsonrpc.js";
 import { EventLog, EventType } from "./eventlog.js";
 import { Command, SessionState, allows, nextState, refusal } from "./state.js";
 
-/** The `_dsh/` namespace prefix. One prefix test, and it cannot collide with the `dsh/` namespace the other plugin uses. */
-export const EXTENSION_PREFIX = "_dsh/";
+/**
+ * Re-exported from `lib/jsonrpc.js`, which is where the wire facts live.
+ * Kept here so the modules that already import it from this file keep working.
+ */
+export { EXTENSION_PREFIX };
 
 /** Notification carrying the full state record whenever a session moves. */
 export const STATE_CHANGED = "_dsh/session/state_changed";
 
 /** Notification carrying metadata changes that stable ACP cannot express. */
 export const SESSION_CHANGED = "_dsh/session/changed";
+
+/**
+ * Notification carrying a refusal.
+ *
+ * **This notification is an invention, not a spec-sanctioned mechanism.** ACP
+ * is silent on how an agent reports a notification it refused — a
+ * notification has no response channel by construction (JSON-RPC 2.0 §4), so
+ * for `session/cancel` there is no in-band way to answer. The spec does not
+ * address the case; it does not forbid this either.
+ *
+ * Two honest halves, therefore:
+ *
+ *  - the refusal is **appended to the log** as `session.refused`, always, for
+ *    every command — that is an audit trail, and it needs no permission from
+ *    anyone;
+ *  - this notification additionally makes it **observable in-band** to clients
+ *    that opted into the `_dsh/` namespace, so such a client learns of a
+ *    refused `session/cancel` when it happens rather than only on replay.
+ *
+ * Because it rides the ordinary wire-frame path, it is filtered to opted-in
+ * connections by `ControlPlane#broadcast` (a standard client never sees it) and
+ * it replays like any other frame, so a client that was disconnected when the
+ * refusal happened still receives it on resume.
+ */
+export const REFUSED = "_dsh/session/refused";
 
 /**
  * One session's record.
@@ -270,6 +298,12 @@ export class SessionRegistry {
 					eventId: this.#log.lastEventId,
 					actor,
 				});
+				// Logged *and* framed. The log entry is the audit trail — it is
+				// the only report a refused notification can have, since a
+				// notification has no response channel. The frame additionally
+				// lets an opted-in client observe the refusal in-band; the
+				// plane filters `_dsh/*` away from everyone else, so a standard
+				// client is never sent a method it did not ask to hear about.
 				this.#log.append({
 					sessionId: session.sessionId,
 					actor,
@@ -280,6 +314,16 @@ export class SessionRegistry {
 						reason: error.data.reason,
 						allowedIn: error.data.allowedIn,
 					},
+					frame: (eventId) =>
+						notificationFrame(REFUSED, {
+							sessionId: session.sessionId,
+							command,
+							state: session.state,
+							reason: error.data.reason,
+							allowedIn: error.data.allowedIn,
+							actor,
+							eventId,
+						}),
 				});
 				throw error;
 			}

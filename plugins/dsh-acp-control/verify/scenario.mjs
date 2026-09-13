@@ -61,6 +61,7 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 
 	const updates = [];
 	const permissionRequests = [];
+	const refusals = [];
 	// A real client answers the permission prompt. An unanswered one would hold
 	// the session in `awaiting_permission` forever, and the check would prove
 	// nothing about the state machine.
@@ -134,6 +135,10 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 		.onNotification("_dsh/session/state_changed", (params) => params, (ctx) => {
 			line("←", "_dsh/session/state_changed", ctx.params);
 		})
+		.onNotification("_dsh/session/refused", (params) => params, (ctx) => {
+			refusals.push(ctx.params);
+			line("←", "_dsh/session/refused", ctx.params);
+		})
 		.onRequest("session/request_permission", async (ctx) => {
 			permissionRequests.push(ctx.params);
 			line("←", "session/request_permission", ctx.params);
@@ -197,18 +202,27 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 		);
 		assertRefused("idle: session/resume is refused (already open)", await command(ctx, "session/resume", { sessionId }), "idle");
 		// `session/cancel` is a *notification*, so there is no response channel
-		// to refuse down. The refusal is recorded in the log instead, which is
-		// the only place it can be observed — and this check is what proves the
-		// plugin does not simply drop it.
+		// to refuse down. Two things must therefore be true, and both are
+		// asserted: the refusal is recorded in the log (the only report a
+		// refused notification can have), and — because this client opted into
+		// the extension namespace — it is also observable in-band as
+		// `_dsh/session/refused`, which is this plugin's own mechanism rather
+		// than anything the spec provides.
 		check("idle: cancelling with nothing in flight is recorded, not dropped", await (async () => {
 			const before = await lastEventId(ctx);
+			const seen = refusals.length;
 			await ctx.notify("session/cancel", { sessionId });
 			line("→", "session/cancel (notification)", { sessionId });
-			await delay(40);
+			await delay(60);
 			const events = (await ctx.request("_dsh/events/replay", { sessionId, after: before })).events;
-			const refusal = events.find((event) => event.type === "session.refused" && event.data?.command === "cancel");
-			if (refusal !== undefined) line("←", "logged refusal", refusal.data);
-			return refusal !== undefined && refusal.data.state === "idle";
+			const logged = events.find((event) => event.type === "session.refused" && event.data?.command === "cancel");
+			const inBand = refusals.slice(seen).find((params) => params.command === "cancel");
+			check(
+				"idle: the refused cancel is also observable in-band by an opted-in client",
+				inBand !== undefined && inBand.state === "idle" && Array.isArray(inBand.allowedIn),
+				JSON.stringify(inBand),
+			);
+			return logged !== undefined && logged.data.state === "idle";
 		})());
 
 		console.log("\n--- generating: start a turn, then probe it -------------------");

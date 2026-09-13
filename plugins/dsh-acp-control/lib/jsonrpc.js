@@ -55,6 +55,27 @@ export const PROTOCOL_METHODS = {
 };
 
 /**
+ * The prefix marking this plugin's extension namespace.
+ *
+ * A *wire* fact, so it lives with the other wire facts: it decides which
+ * methods only an opted-in client may be sent. It is `_dsh/` and not `dsh/`
+ * because the third-party DSH ACP plugin already uses the bare `dsh/`
+ * namespace for different methods with different shapes, and two incompatible
+ * things must not claim one namespace. The leading underscore matches ACP's own
+ * convention for reserved/extension space (`_meta`, `$/cancel_request`).
+ */
+export const EXTENSION_PREFIX = "_dsh/";
+
+/**
+ * Whether a frame belongs to the extension namespace.
+ * @param {object} frame - a JSON-RPC frame.
+ * @returns {boolean} true when its method is extension-scoped.
+ */
+export function isExtensionFrame(frame) {
+	return typeof frame?.method === "string" && frame.method.startsWith(EXTENSION_PREFIX);
+}
+
+/**
  * Error codes. The first five are JSON-RPC's; the next four are the subset of
  * ACP's own server-error range this server uses; `refused` is this plugin's,
  * and is documented in DESIGN.md §2.
