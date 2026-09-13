@@ -55,7 +55,11 @@
 export const SURFACES = {
   dsh: {
     busy: 'button[aria-label="Stop generating"]',
-    answer: '[class*="assistant"], [data-role="assistant"]',
+    // Measured against the live page, not guessed: the finished reply of a turn
+    // is the element carrying data-turn-process-answer. Class names here are
+    // hashed per build (_markdown_kcgor_5, Sixlwa_bubble) so matching on them
+    // breaks at the next release; the data attribute is stable and semantic.
+    answer: '[data-turn-process-answer="true"]',
     limit: null,
   },
   chatgpt: {
@@ -80,7 +84,7 @@ export const PAGE_SOURCE = String.raw`
   const surfaces = {
     dsh: {
       busy: 'button[aria-label="Stop generating"]',
-      answer: '[class*="assistant"], [data-role="assistant"]',
+      answer: '[data-turn-process-answer="true"]',
       limit: false,
     },
     chatgpt: {
@@ -103,9 +107,18 @@ export const PAGE_SOURCE = String.raw`
 
   const busy = (s) => document.querySelectorAll(s.busy).length > 0;
 
+  /**
+   * The latest answer, or null when the selector matches nothing.
+   *
+   * Null rather than a fallback slice of the body. A fallback felt harmless and
+   * was not: document.body.innerText.slice(-3000) is ALWAYS 3000 characters, so
+   * the "has the text stopped changing" test compared 3000 to 3000 forever and
+   * the watcher sat in settling and never reported finished. A detector that
+   * cannot find the answer must say so, not substitute something stable-looking.
+   */
   const answer = (s) => {
     const all = [...document.querySelectorAll(s.answer)];
-    return all.length ? all[all.length - 1].innerText : '';
+    return all.length ? all[all.length - 1].innerText : null;
   };
 
   /**
@@ -122,7 +135,13 @@ export const PAGE_SOURCE = String.raw`
       stillSince: 0,
       lastChars: -1,
     };
-    return { armed: true, surface: s.name, baselineChars: window.__answerWatch.baselineAnswer.length };
+    const baseline = window.__answerWatch.baselineAnswer;
+    return {
+      armed: true,
+      surface: s.name,
+      baselineChars: baseline === null ? null : baseline.length,
+      answerNodeFound: baseline !== null,
+    };
   }
 
   /**
@@ -139,8 +158,8 @@ export const PAGE_SOURCE = String.raw`
     const now = Date.now();
     const text = answer(s);
 
-    if (s.limit && LIMIT.test(body)) return { status: 'message-limit', chars: text.length };
-    if (BLOCKED.test(body)) return { status: 'blocked', chars: text.length };
+    if (s.limit && LIMIT.test(body)) return { status: 'message-limit', chars: text ? text.length : 0 };
+    if (BLOCKED.test(body)) return { status: 'blocked', chars: text ? text.length : 0 };
 
     const running = busy(s);
     w.sawBusy = w.sawBusy || running;
@@ -155,8 +174,15 @@ export const PAGE_SOURCE = String.raw`
 
     if (running) {
       w.stillSince = 0;
-      w.lastChars = text.length;
-      return { status: 'running', chars: text.length, elapsedMs: now - w.armedAt };
+      w.lastChars = text === null ? -1 : text.length;
+      return { status: 'running', chars: text === null ? null : text.length, elapsedMs: now - w.armedAt };
+    }
+
+    // Not running, and the answer node cannot be found. The turn is over but
+    // this watcher cannot read its result, which is a broken selector, not a
+    // finished answer. Say which selector failed so it is fixable.
+    if (text === null) {
+      return { status: 'no-answer-node', selector: s.answer, elapsedMs: now - w.armedAt };
     }
 
     // Indicator gone. Require the text to stop moving too — a tool call between
