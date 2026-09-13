@@ -241,7 +241,13 @@ worked:
   `setTimeout` and retries for six seconds, and a check forbids rAF returning.
 - If the pane mounts later than six seconds after load it is shown at its packaged
   default rather than being settled. It is still clamped and still reserves nothing;
-  it just is not auto-collapsed.
+  it just is not auto-collapsed. This used to be worse than "not settled": the decision
+  was recorded as made as soon as the panel existed, *before* the collapse was driven, so
+  a panel whose own control was not mounted yet left the pane expanded for the whole
+  session — measured in a tab showing the app's welcome screen, where every left-edge tap
+  then hit "tap beside the open pane" and closed the pane instead of opening the sidebar.
+  The decision is now only recorded once the drive actually succeeded, and the six-second
+  retry keeps trying until it does.
 - A DSH release that hides its own rails would make rules 1, 2, 5 and 8 unnecessary.
 
 ## Files
@@ -305,6 +311,20 @@ drawer's state polled every 50ms) and prints it when anything fails. A CDP tap s
 before the app re-renders, so reading state straight afterwards races it; the trace is
 what tells a state change nobody asked for from one the tap caused. A frame the app
 replaced shows up in it as `REPLACED`.
+
+Before it measures anything, the suite establishes four things that make a run mean
+something, because when one of them is false the failures that follow are all the same
+failure wearing fifteen hats:
+
+| Precondition | Why |
+| --- | --- |
+| The app has a **session** open (the composer is editable) | the welcome screen has no conversation, no model chip and no usable composer; one fresh tab is tried, then it says so |
+| The pane's packaged default is **settled closed** | otherwise the first left-edge tap is "tap beside the open pane" and closes the pane instead |
+| A real touch **arrives** at the page (a brush, which opens nothing) | with Chrome backgrounded on Android, every page query answers while input is delivered nowhere — this is the check that says so instead of fifteen failures |
+| The plugin's `gates` are read **before every tap** | so a failure names the gate that closed rather than leaving it to be guessed |
+
+For a device run, Chrome must be the app **in front** on the phone, with the screen on.
+`connect-phone.mjs` wakes the screen and reports which app is in front before you start.
 
 ## Tuning
 

@@ -106,10 +106,51 @@ if (STATUS_ONLY) {
 adb("forward", `tcp:${PORT}`, "localabstract:chrome_devtools_remote");
 console.log(`forward: ${adb("forward", "--list")}`);
 
+// Wake the phone before anything is measured on it.
+//
+// A sleeping phone makes a bad test rig, and the failures are silent and misleading:
+// measured, a run that began with the screen off failed section 2 completely -- the
+// band tap "did nothing" -- because the app had auto-focused the composer and the
+// on-screen keyboard was up, and the band stands down under the keyboard on purpose.
+// `Page.captureScreenshot` also returns nothing while the page is not being composited,
+// which killed the run outright rather than reporting it.
+const woke = adb("shell", "input", "keyevent", "KEYCODE_WAKEUP");
+adb("shell", "wm", "dismiss-keyguard");
+console.log(`woke the screen${woke ? `: ${woke}` : ""}`);
+
+/**
+ * Is Chrome actually the app in front?
+ *
+ * It has to be, and this is not a formality: a backgrounded Chrome on Android does not
+ * composite its pages, and touch events dispatched over DevTools are then delivered
+ * nowhere. Measured, with the phone in someone's hand and another app in front: a real
+ * touch at x=10 produced no `pointerdown` at all — not even on `window` capture — while
+ * every page query kept answering normally, so a whole run reported fifteen failures that
+ * were all this one fact. Bringing Chrome forward is the user's call, not this script's,
+ * so it says what it found and leaves it alone.
+ */
+const focus = adb("shell", "dumpsys", "window");
+const focused = /mCurrentFocus=Window\{[^}]*\s([^\s}]+)/.exec(focus)?.[1] ?? null;
+const chromeInFront = focused !== null && /chrome/i.test(focused);
+if (chromeInFront) {
+	console.log(`foreground app: ${focused} (Chrome is in front)`);
+} else {
+	console.log(`foreground app: ${focused ?? "unknown"} — NOT Chrome`);
+	console.log(`
+  Chrome must be the app in front on the phone for a device run. A backgrounded Chrome
+  does not composite its pages, and DevTools touch events are delivered nowhere: the
+  page still answers every query, so the run fails everywhere for one invisible reason.
+  Open Chrome on the phone (the DeepSeek Harness tab), leave the screen on, and rerun.`);
+}
+
 try {
 	const version = await (await fetch(`http://127.0.0.1:${PORT}/json/version`)).json();
 	console.log(`Chrome: ${version.Browser} — DevTools reachable on 127.0.0.1:${PORT}`);
-	console.log("\nReady: verify-phone.mjs can drive this phone now.");
+	console.log(
+		chromeInFront
+			? "\nReady: verify-phone.mjs can drive this phone now."
+			: "\nDevTools is reachable, but bring Chrome to the front before a device run.",
+	);
 } catch (error) {
 	console.log(`DevTools NOT reachable on 127.0.0.1:${PORT}: ${error.message}`);
 	console.log("Open Chrome on the phone at least once, then rerun.");

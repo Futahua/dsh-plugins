@@ -75,6 +75,16 @@ const button = (label, onClick) => ({
 	},
 });
 
+/**
+ * Set while the pane's panel exists but its own collapse control does not.
+ *
+ * Measured on the phone: in a tab showing the app's welcome screen the panel was mounted
+ * with no control reachable, the plugin marked the boot decision done anyway, and the
+ * pane stayed expanded for the whole session — so every left-edge tap hit "tap beside the
+ * open pane" and closed the pane instead of opening the sidebar.
+ */
+let paneToggleMissing = false;
+
 /** The sidebar toggle: it swaps its label with the state, and clicking toggles. */
 const sidebarToggle = button(SIDEBAR_TOGGLE, () => { frameOpen = !frameOpen; });
 /** The pane toggle, exactly as measured: the label names the next action. */
@@ -128,7 +138,10 @@ const documentStub = {
 		return styleTags.find((t) => `style[data-plugin-css="${t.dataset.pluginCss}"]` === selector) ?? null;
 	},
 	querySelectorAll: (selector) => {
-		if (selector === "button[aria-label]") return [sidebarToggle, paneToggle, ...OTHER_LABELS.map((l) => button(l))];
+		if (selector === "button[aria-label]") {
+			// `paneToggleMissing` models the panel mounting before its own control does.
+			return [sidebarToggle, ...(paneToggleMissing ? [] : [paneToggle]), ...OTHER_LABELS.map((l) => button(l))];
+		}
 		if (selector === "[data-sidebar-collapsed], [data-rightbar-collapsed]") return [];
 		return [];
 	},
@@ -654,6 +667,35 @@ check("closed again", paneOpen === false);
 frameOpen = true;
 dispatch("pointerdown", { clientX: 300, clientY: 400, pointerId: 1, target: insideControl("button") });
 check("a tap beside an open panel still closes it, even over a control", frameOpen === false);
+
+/** Install the frame watch afresh, the way a new page load does. */
+const bootWatch = () => {
+	const effect = effects.find((e) => e.label.includes("frame watch"));
+	if (effect === undefined) return () => {};
+	return effect.fn();
+};
+
+console.log("the pane's packaged default, when its own control is late:");
+// The panel can mount before the control that collapses it. The plugin used to call the
+// decision made as soon as the panel existed, so a collapse that never happened was
+// recorded as one that had: the boot flag came off and the pane stayed expanded.
+frameOpen = false;
+paneOpen = true;
+paneToggleMissing = true;
+activations = 0;
+const stopWatch = bootWatch();
+check("the panel is left alone rather than half-collapsed", paneOpen === true);
+check("and the boot flag is held, so it is not shown expanded",
+	documentStub.documentElement.hasAttribute("data-dsh-pane-boot") === true);
+check("nothing was clicked while its control is missing", activations === 0);
+stopWatch();
+paneToggleMissing = false;
+// The retry interval is stubbed in this harness, so the next attempt is made by hand --
+// which is what the interval does in the browser, every 250ms for six seconds.
+const stopWatchAgain = bootWatch();
+check("the next attempt collapses it", paneOpen === false && activations === 1);
+check("and then clears the boot flag", documentStub.documentElement.hasAttribute("data-dsh-pane-boot") === false);
+stopWatchAgain();
 
 console.log("unloading:");
 for (const dispose of disposers) if (typeof dispose === "function") dispose();

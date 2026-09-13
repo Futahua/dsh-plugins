@@ -678,13 +678,23 @@ window.__ModuleLoader__.load({
 			const booting = isNarrow();
 			let decided = !booting;
 			let bootTimer;
+			/**
+			 * Collapse the pane's packaged default, once, and only when it really worked.
+			 *
+			 * The collapse is driven through the pane's own control, and that control can
+			 * lag the panel it belongs to. Marking this decided on the panel's existence
+			 * alone — which this did — left the pane EXPANDED for the whole session
+			 * whenever the control was not there yet: measured in a tab showing the app's
+			 * welcome screen, where every left-edge tap then hit "tap beside the open pane"
+			 * and closed the pane instead of opening the sidebar.
+			 */
 			const settlePane = () => {
 				if (decided) return;
 				if (document.querySelector('[data-dsh-browser-pane="expanded"]') === null) return;
+				if (drive(PANE, {}) === false) return;
 				decided = true;
 				window.clearTimeout(bootTimer);
 				document.documentElement.removeAttribute("data-dsh-pane-boot");
-				drive(PANE, {});
 			};
 			if (booting) {
 				document.documentElement.setAttribute("data-dsh-pane-boot", "");

@@ -43,8 +43,9 @@ node .dsh\profiles\web\plugins\dsh-mobile-rail\connect-phone.mjs
 
 That script reports each step rather than assuming any of them: it waits for a
 device, tries the mDNS-advertised endpoint if none appears, re-asserts the DevTools
-forward (which dies with the transport), and confirms Chrome's DevTools answers on
-`127.0.0.1:9444`. `--status` reports without changing anything.
+forward (which dies with the transport), wakes the screen, reports which app is
+actually in front, and confirms Chrome's DevTools answers on `127.0.0.1:9444`.
+`--status` reports without changing anything.
 
 First-time pairing cannot be automated — Android shows a six-digit code that only a
 human can read:
@@ -74,6 +75,12 @@ and asserts geometry:
 ```powershell
 node .dsh\profiles\web\plugins\dsh-mobile-rail\verify-phone.mjs
 ```
+
+Keep the phone free for the two or three minutes it takes, with Chrome in front and the
+screen on: touch events are not delivered to a backgrounded Chrome (trap 7), and the suite
+now proves the input path with a brush before it measures anything. It also needs the app
+to have a session open — the welcome screen has no composer to measure — and tries one
+fresh tab if this one has none, then says so plainly if the session never arrives.
 
 `phone.mjs` is the harness it uses: attach, real taps
 (`Input.dispatchTouchEvent`), screenshots, and `STATE_EXPR`, the one reading of
@@ -136,6 +143,17 @@ source:
    byte-identical screenshots looked like a frozen CDP surface; they were simply
    what the tab displayed. Open a tab of your own (`newTab()`) instead of driving
    whatever the user has open.
+7. **Chrome must be the app in front, or touch goes nowhere.** With another app in
+   front — or the phone locked — a backgrounded Chrome still answers every
+   `Runtime.evaluate` normally, but a real touch dispatched over DevTools produces
+   **no event at all**, not even a `pointerdown` on `window` capture. Measured with
+   the phone in someone's hand: nothing at any y, `Page.captureScreenshot` returning
+   no data, and fifteen suite failures that were all this one fact.
+   `connect-phone.mjs` reports the foreground app (`dumpsys window | mCurrentFocus`)
+   and `verify-phone.mjs` proves the input path with a brush before measuring
+   anything. Page-side signals do **not** catch it: the active tab reported
+   `visibilityState: "visible"`, `hidden: false`, `hasFocus(): false` while the app
+   was in the background.
 
 ## Screenshots
 
