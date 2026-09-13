@@ -74,6 +74,11 @@ the app marks `flex: 0 0 auto`, plus `min-width:0` down the chain), truncating w
 ellipsis rather than pushing the send button off the edge. Measured after: six controls
 on one line, worst overlap 0px, smallest gap 8px, rightmost edge 385px of 409px.
 
+The row is named by `:has()` because its class names are hashed per build and its
+position in the tree is not stable. `:has()` is Chrome 105+ and Safari 15.4+, and on
+anything older the rule is simply dropped: the row wraps onto two lines exactly as it
+does without this plugin, which is the pre-existing behaviour rather than a new failure.
+
 **A band claims empty space only.** The right sidebar's toggle lives in the top-right
 corner and the composer's own buttons line the bottom of both edges, all of them inside
 a band — so a press whose target (or whose target's ancestor) is a control is left to
