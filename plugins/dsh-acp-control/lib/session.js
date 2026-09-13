@@ -91,8 +91,15 @@ export class SessionRecord {
 	cwd;
 	/** @type {string|undefined} */
 	title;
-	/** @type {boolean} */
-	archived = false;
+	/**
+	 * Whether this plugin borrowed a live agent it does not own.
+	 *
+	 * The distinction is not bookkeeping: an adopted session must never be
+	 * disposed by this plugin, and `session/delete` must refuse it, because
+	 * another frontend is still showing it.
+	 * @type {boolean}
+	 */
+	adopted = false;
 	/** @type {string} one of {@link SessionState}. */
 	state = SessionState.idle;
 	/** @type {string} ISO 8601. */
@@ -136,10 +143,18 @@ export class SessionRecord {
 			sessionId: this.sessionId,
 			cwd: this.cwd,
 			title: this.title ?? null,
-			archived: this.archived,
 			state: this.state,
 			createdAt: this.createdAt,
 			updatedAt: this.updatedAt,
+			/**
+			 * `live` says a real agent is behind this session; `owned` says this
+			 * plugin may tear it down. A session can be live and not owned —
+			 * that is what adoption means — and a client that wants to know
+			 * whether it is looking at the human's session needs the first,
+			 * while only this plugin needs the second.
+			 */
+			live: this.backendSession !== undefined,
+			owned: this.backendSession !== undefined && this.adopted === false,
 			...(this.forkedFrom === undefined ? {} : { forkedFrom: this.forkedFrom }),
 			...(this.turnId === undefined ? {} : { turnId: this.turnId }),
 		};
@@ -159,17 +174,22 @@ export class SessionRegistry {
 	#backend;
 	#sink;
 	#unsubscribe;
+	#archivedIds;
+	/** @type {Map<string, {onEvent: (event: object) => void}>} adopted sessions' event routing. */
+	#observers = new Map();
 
 	/**
 	 * @param {object} options - registry options.
 	 * @param {EventLog} options.log - the append-only log.
 	 * @param {object} options.backend - the backend adapter (lib/backends.js).
 	 * @param {(frame: object, record: object) => void} [options.sink] - delivers a live frame to every subscriber.
+	 * @param {() => Promise<Set<string>|undefined>} [options.archivedIds] - reads the *canonical* archived set, or undefined when the composition has none.
 	 */
-	constructor({ log, backend, sink }) {
+	constructor({ log, backend, sink, archivedIds }) {
 		this.#log = log;
 		this.#backend = backend;
 		this.#sink = sink ?? (() => {});
+		this.#archivedIds = archivedIds;
 		// One delivery path, deliberately. Live frames are read off the log
 		// record's `frame`, which is the same object replay reads — so the live
 		// and replay paths cannot drift, because there is only one of them.
@@ -237,10 +257,15 @@ export class SessionRegistry {
 	 * Rebuild the registry from the log.
 	 *
 	 * What survives a restart is exactly what the log recorded: the session,
-	 * its title, its archive flag, and — critically — the log position, so a
-	 * reconnecting client's cursor still means something. What does *not*
-	 * survive is the agent handle, so a recovered session is honestly `closed`
-	 * rather than pretending to be `idle`; `session/resume` reopens it.
+	 * its title, and — critically — the log position, so a reconnecting
+	 * client's cursor still means something. What does *not* survive is the
+	 * agent handle, so a recovered session is honestly `closed` rather than
+	 * pretending to be `idle`; `session/resume` reopens it — or, when the agent
+	 * turns out to be live, adopts it instead.
+	 *
+	 * Archive is deliberately **not** recovered here: it is not this plugin's
+	 * fact to remember. `session/list` asks the canonical workspace registry
+	 * instead (see the `archivedIds` provider).
 	 *
 	 * @returns {{recovered: number, lastEventId: number, dropped: number}} summary for the boot log.
 	 */
@@ -265,12 +290,6 @@ export class SessionRegistry {
 				case EventType.title: {
 					const session = this.#sessions.get(record.sessionId);
 					if (session !== undefined) session.title = record.data?.title;
-					break;
-				}
-				case EventType.archived:
-				case EventType.unarchived: {
-					const session = this.#sessions.get(record.sessionId);
-					if (session !== undefined) session.archived = record.type === EventType.archived;
 					break;
 				}
 				case EventType.forked: {
@@ -340,33 +359,14 @@ export class SessionRegistry {
 					eventId: this.#log.lastEventId,
 					actor,
 				});
-				// Logged *and* framed. The log entry is the audit trail — it is
-				// the only report a refused notification can have, since a
+				// Logged *and* framed, through the same helper an out-of-band
+				// refusal uses. The log entry is the audit trail — it is the
+				// only report a refused notification can have, since a
 				// notification has no response channel. The frame additionally
 				// lets an opted-in client observe the refusal in-band; the
 				// plane filters `_dsh/*` away from everyone else, so a standard
 				// client is never sent a method it did not ask to hear about.
-				this.#log.append({
-					sessionId: session.sessionId,
-					actor,
-					type: EventType.refused,
-					data: {
-						command,
-						state: session.state,
-						reason: error.data.reason,
-						allowedIn: error.data.allowedIn,
-					},
-					frame: (eventId) =>
-						notificationFrame(REFUSED, {
-							sessionId: session.sessionId,
-							command,
-							state: session.state,
-							reason: error.data.reason,
-							allowedIn: error.data.allowedIn,
-							actor,
-							eventId,
-						}),
-				});
+				this.refuse(session, command, actor, { ...error.data, state: session.state });
 				throw error;
 			}
 
@@ -459,6 +459,125 @@ export class SessionRegistry {
 	}
 
 	/**
+	 * Adopt a session that already exists, without taking ownership of it.
+	 *
+	 * This is what makes the plugin a control plane rather than a second
+	 * harness: the agent was created by another frontend — the web GUI, most
+	 * likely — and this registry gains a *view* of it. The agent handle stays
+	 * with whoever created it, and this plugin never disposes it.
+	 *
+	 * Idempotent, because a GUI session can be discovered by more than one
+	 * route (an `agent/created` announcement, a `session/resume` naming it, a
+	 * `session/list` sweep) and adopting it twice must not produce two records
+	 * or two sets of listeners.
+	 *
+	 * @param {object} input - the session to adopt.
+	 * @param {string} input.sessionId - the DSH session id.
+	 * @param {string} [input.cwd] - its workspace, when the caller knows it.
+	 * @param {string} [input.title] - its title, when the caller knows it.
+	 * @param {string} [input.state] - the state to start from, derived from the live agent's status.
+	 * @param {string} [input.actor] - who caused the adoption.
+	 * @returns {Promise<SessionRecord|undefined>} the record, or undefined when nothing is live to adopt.
+	 */
+	async attach({ sessionId, cwd, title, state, actor = "system:acp-control" }) {
+		const existing = this.#sessions.get(sessionId);
+		if (existing?.backendSession !== undefined) return existing;
+
+		const record = existing ?? new SessionRecord({ sessionId, cwd: cwd ?? "/", title });
+		// `observe` is bound through the map rather than closed over here, so a
+		// re-attach after a detach cannot leave a listener pointing at a stale
+		// record.
+		this.#observers.set(sessionId, { onEvent: (event) => this.observe(sessionId, event) });
+
+		const backendSession = await this.#backend.adopt?.({
+			sessionId,
+			cwd: record.cwd,
+			onEvent: (event) => this.#observers.get(sessionId)?.onEvent(event),
+		});
+		if (backendSession === undefined) {
+			this.#observers.delete(sessionId);
+			return undefined;
+		}
+
+		record.adopted = true;
+		record.backendSession = backendSession;
+		if (existing === undefined) {
+			this.#sessions.set(sessionId, record);
+			this.commit(record, {
+				actor,
+				type: EventType.attached,
+				data: { cwd: record.cwd, state: state ?? SessionState.idle, owner: "external" },
+			});
+		}
+		// The live agent's own status is the truth about whether a turn is
+		// running, so the state machine starts from it rather than from an
+		// assumption. This is what lets an ACP client see a turn the human
+		// started before the client ever connected.
+		this.setState(record, state ?? SessionState.idle, "attached", actor);
+		return record;
+	}
+
+	/**
+	 * React to one event from an adopted session's live agent.
+	 *
+	 * Two jobs, and the second is the one that makes attachment visible from
+	 * both ends:
+	 *
+	 *  1. **Track the turn** the way the state machine models it, so a turn the
+	 *     *human* started shows up as `generating` and a client's
+	 *     `_dsh/session/state` agrees with what the GUI is doing.
+	 *  2. **Forward the conversation** as `session/update`, so an attached ACP
+	 *     client watches the human's session stream past it — and, because the
+	 *     GUI is subscribed to the same session, so does the GUI when the ACP
+	 *     client prompts.
+	 *
+	 * Updates are attributed to the agent, not to the ACP client, because that
+	 * is what produced them.
+	 *
+	 * @param {string} sessionId - the session the event belongs to.
+	 * @param {object} event - a committed DSH session event.
+	 */
+	observe(sessionId, event) {
+		const session = this.#sessions.get(sessionId);
+		if (session === undefined) return;
+		const actor = `agent:${sessionId}`;
+		if (event?.type === "turn/start") {
+			if (session.state === SessionState.idle) {
+				this.setState(session, SessionState.generating, "observed_turn_start", actor);
+			}
+			return;
+		}
+		if (event?.type === "turn/end") {
+			if (session.state === SessionState.generating || session.state === SessionState.awaitingPermission) {
+				this.setState(session, SessionState.idle, "observed_turn_end", actor);
+			}
+			return;
+		}
+		for (const update of this.#backend.translate?.(event) ?? []) {
+			this.emitUpdate(session, update, actor);
+		}
+	}
+
+	/** Stop observing and release an adopted session's borrowed handle. */
+	async detach(sessionId, actor = "system:acp-control") {
+		const session = this.#sessions.get(sessionId);
+		this.#observers.delete(sessionId);
+		if (session === undefined) return;
+		const backendSession = session.backendSession;
+		session.backendSession = undefined;
+		session.adopted = false;
+		// A borrowed session's dispose only removes this plugin's listeners; the
+		// agent itself stays with its owner.
+		if (backendSession?.adopted === true) await backendSession.dispose?.();
+		if (session.state !== SessionState.closed) this.setState(session, SessionState.closed, "owner_gone", actor);
+	}
+
+	/** The canonical archived set, or undefined when this composition has none. */
+	async archivedIds() {
+		return await this.#archivedIds?.();
+	}
+
+	/**
 	 * Serialize an operation on a session's queue **without** a state check.
 	 *
 	 * This is how a long-running command's *settlement* re-enters the queue:
@@ -505,6 +624,45 @@ export class SessionRegistry {
 				{ type: "durability_failed", logPath: this.#log.path, reason: error instanceof Error ? error.message : String(error) },
 			);
 		}
+	}
+
+	/**
+	 * Record a refusal that was decided **outside** {@link admit}.
+	 *
+	 * A command can be refused before admission — `session/delete` refuses a
+	 * live session, because another frontend is still showing it — and such a
+	 * refusal must be exactly as audible as one the transition table produced.
+	 * Otherwise the loudest-looking refusal in the system would be the one
+	 * nothing recorded.
+	 *
+	 * @param {SessionRecord} session - the session that refused.
+	 * @param {string} command - the command name.
+	 * @param {string} actor - who asked.
+	 * @param {object} error - the refusal's `data`.
+	 * @returns {object} the stored record.
+	 */
+	refuse(session, command, actor, error) {
+		return this.#log.append({
+			sessionId: session.sessionId,
+			actor,
+			type: EventType.refused,
+			data: {
+				command,
+				state: error?.state ?? session.state,
+				reason: error?.reason,
+				allowedIn: error?.allowedIn ?? [],
+			},
+			frame: (eventId) =>
+				notificationFrame(REFUSED, {
+					sessionId: session.sessionId,
+					command,
+					state: error?.state ?? session.state,
+					reason: error?.reason,
+					allowedIn: error?.allowedIn ?? [],
+					actor,
+					eventId,
+				}),
+		});
 	}
 
 	/**

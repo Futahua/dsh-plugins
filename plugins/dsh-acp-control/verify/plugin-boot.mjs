@@ -112,30 +112,33 @@ async function main() {
 		return { status: res.status };
 	};
 
-	const request = async (method, params) => {
-		const id = nextId.value++;
-		const promise = new Promise((resolve, reject) => {
-			const timer = setTimeout(() => {
-				pending.delete(id);
-				reject(new Error(`timeout waiting for ${method}`));
-			}, 180000);
-			pending.set(id, {
-				resolve: (value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
+		const request = async (method, params) => {
+			const id = nextId.value++;
+			const promise = new Promise((resolve, reject) => {
+				// Generous, because `session/list` reads the host's *entire*
+				// session store through `sessionQuery.listSessions()` plus a
+				// title snapshot per session — the same call the first-party
+				// server makes. On a home with tens of megabytes of transcripts
+				// that is seconds to minutes, and a tighter timeout here would
+				// report the host's size as this plugin's failure.
+				const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}`)), 420_000);
+				pending.set(id, {
+					resolve: (value) => {
+						clearTimeout(timer);
+						resolve(value);
+					},
+				});
 			});
-		});
-		await post({ jsonrpc: "2.0", id, method, params });
-		const frame = await promise;
-		if (frame.error !== undefined) {
-			const error = new Error(frame.error.message);
-			error.code = frame.error.code;
-			error.data = frame.error.data;
-			throw error;
-		}
-		return frame.result;
-	};
+			await post({ jsonrpc: "2.0", id, method, params });
+			const frame = await promise;
+			if (frame.error !== undefined) {
+				const error = new Error(frame.error.message);
+				error.code = frame.error.code;
+				error.data = frame.error.data;
+				throw error;
+			}
+			return frame.result;
+		};
 
 	/** Print a call and its outcome, so the transcript is readable. */
 	const call = async (method, params, { quiet = false } = {}) => {
@@ -194,6 +197,11 @@ async function main() {
 				continue;
 			}
 			if (frame.method === "session/update") {
+				// Scoped to the session this check is driving. The log lives in
+				// the shared `$DSH_HOME`, so a replay from `after: -1` carries
+				// other runs' sessions too, and an unscoped collector reports
+				// their text as if this session had produced it.
+				if (sessionId !== undefined && frame.params?.sessionId !== sessionId) continue;
 				updates.push(frame.params.update);
 				if (frame.params.update.sessionUpdate !== "agent_message_chunk") {
 					console.log(`  ← session/update ${frame.params.update.sessionUpdate}`);

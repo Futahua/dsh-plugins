@@ -1,0 +1,12 @@
+{
+  "name": "dsh-acp-control-codriver",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Verification fixture: a frontend that owns a session the way the DSH web GUI does, so attachment can be tested against a real second owner",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "license": "MIT"
+}

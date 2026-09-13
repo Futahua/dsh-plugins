@@ -424,6 +424,12 @@ export class ControlPlane {
 	async #list(_connection, params, includeArchived = true) {
 		const cwdFilter = typeof params?.cwd === "string" ? params.cwd : undefined;
 		const backendSessions = await this.#registry.backend.list();
+		// The *canonical* archived set, read fresh. Not a local flag: DSH owns
+		// this fact, and keeping a copy of it here was two sources of truth for
+		// one thing.
+		const archivedIds = (await this.#registry.archivedIds()) ?? new Set();
+		const liveIds = new Set((await this.#registry.backend.live?.())?.map((entry) => entry.sessionId) ?? []);
+
 		const byId = new Map();
 		for (const summary of backendSessions) {
 			byId.set(summary.sessionId, {
@@ -431,9 +437,13 @@ export class ControlPlane {
 				cwd: summary.cwd ?? "/",
 				title: summary.title ?? null,
 				updatedAt: summary.updatedAt ?? null,
+				// A persisted session with no live agent is `closed` because it
+				// *is* closed, which is a fact about the session rather than a
+				// verdict on this plugin's ability to touch it. Whether it can
+				// be adopted is a separate field.
 				state: SessionState.closed,
-				archived: false,
-				backendOnly: true,
+				live: false,
+				attached: false,
 			});
 		}
 		for (const session of this.#registry.all()) {
@@ -445,11 +455,28 @@ export class ControlPlane {
 				title: session.title ?? existing?.title ?? null,
 				updatedAt: session.updatedAt,
 				state: session.state,
-				archived: session.archived,
-				backendOnly: false,
+				live: session.backendSession !== undefined,
+				attached: true,
+				owned: session.adopted === false,
 			});
 		}
+		for (const entry of await this.#registry.backend.live?.() ?? []) {
+			const existing = byId.get(entry.sessionId);
+			byId.set(entry.sessionId, {
+				...(existing ?? { cwd: entry.cwd ?? "/", title: null, updatedAt: null }),
+				sessionId: entry.sessionId,
+				state: existing?.state ?? (entry.status === "running" ? SessionState.generating : SessionState.idle),
+				live: true,
+				attached: existing?.attached ?? false,
+				// Adoptable, not a dead row: a live session this control plane
+				// has not attached to yet can be attached by naming it in
+				// `session/resume`.
+				adoptable: existing?.attached !== true,
+			});
+		}
+
 		const sessions = [...byId.values()]
+			.map((session) => ({ ...session, archived: archivedIds.has(session.sessionId) }))
 			.filter((session) => (cwdFilter === undefined ? true : session.cwd === cwdFilter))
 			.filter((session) => (includeArchived ? true : session.archived !== true))
 			.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
@@ -461,12 +488,71 @@ export class ControlPlane {
 		if (typeof sessionId !== "string" || sessionId.length === 0) {
 			throw invalidParams("session/resume requires a sessionId", { field: "sessionId" });
 		}
+
+		// Already ours: the ordinary reopen path.
+		const known = this.#registry.get(sessionId);
+		if (known !== undefined) {
+			// A session that is already live here is *already attached*, so
+			// resuming it is a no-op that succeeds rather than a refusal. This
+			// matters because adoption is automatic: the plugin attaches a live
+			// session the moment it appears, so a client that then says "attach
+			// me to this session id" is asking for something already true.
+			// Refusing with "already open here" would be technically accurate
+			// and completely misleading.
+			if (known.backendSession !== undefined) {
+				this.#logger(`session ${sessionId} is already attached; resume is a no-op for ${connection.actor}`);
+				return { sessionId, attached: true, alreadyAttached: true, state: known.state };
+			}
+			await this.#registry.admit(known, Command.resume, connection.actor, async (record) => {
+				await this.#registry.reopen(record, connection.actor);
+			});
+			this.#logger(`session ${sessionId} resumed by ${connection.actor}`);
+			return { sessionId, attached: false };
+		}
+
+		// Unknown here. If a real agent already exists, this is attachment —
+		// the operation the whole plugin exists for — and it must come *before*
+		// any resume, because resuming a session another frontend is driving
+		// would create a second owner of one conversation.
+		const live = await this.#registry.backend.live?.();
+		const liveEntry = live?.find((entry) => entry.sessionId === sessionId);
+		const attached = await this.#registry.attach({
+			sessionId,
+			cwd: params?.cwd ?? liveEntry?.cwd,
+			state: liveEntry?.status === "running" ? SessionState.generating : SessionState.idle,
+			actor: connection.actor,
+		});
+		if (attached !== undefined) {
+			this.#logger(`session ${sessionId} attached by ${connection.actor} (a live agent already existed)`);
+			return { sessionId, attached: true, state: attached.state };
+		}
+
+		// Nothing is live. Whether resuming a persisted session is safe depends
+		// entirely on whether this process can *see* live agents: if it can, a
+		// missing one is evidence that nothing holds the session; if it cannot,
+		// saying "nobody has it" would be a guess, and guessing wrong here
+		// produces two owners of one conversation.
+		if (this.#registry.backend.observesLiveAgents !== true) {
+			throw new RpcError(
+				ErrorCode.refused,
+				`session ${sessionId} is not attached here and this server cannot see live agents`,
+				{
+					type: "cannot_attach",
+					command: "resume",
+					sessionId,
+					reason:
+						"this control plane has no view of live agents in the process that owns the session, so it cannot tell whether resuming it would create a second owner of a conversation someone else is already driving",
+					hint:
+						"run the plugin inside the DSH profile that holds the session (its Cordis plugin, index.js), where attachment is possible; a standalone server deliberately refuses instead of racing",
+				},
+			);
+		}
+
 		const session = this.#registry.require(sessionId);
 		await this.#registry.admit(session, Command.resume, connection.actor, async (record) => {
 			await this.#registry.reopen(record, connection.actor);
 		});
-		this.#logger(`session ${sessionId} resumed by ${connection.actor}`);
-		return { sessionId };
+		return { sessionId, attached: false };
 	}
 
 	async #sessionClose(connection, params) {
@@ -480,15 +566,50 @@ export class ControlPlane {
 		return {};
 	}
 
+	/**
+	 * Delete a session's record from this control plane.
+	 *
+	 * **This is plugin-local, and it is not a host operation.** DSH has no
+	 * "delete a session" method — `WorkspaceDeleteRequest` deletes a
+	 * *workspace*, and the only `_deleteSession` is private inside
+	 * `dsh-session-query-sqlite` — so this removes *this plugin's* record and
+	 * nothing else. The wording matters: calling it parity with the GUI would
+	 * be a lie.
+	 *
+	 * Which is why it **refuses a live session**. If an agent is behind the
+	 * session, another frontend is showing it right now; reporting a successful
+	 * delete while the human still has the conversation open on screen is
+	 * exactly the "accepted and discarded" shape this project exists to
+	 * eliminate. The refusal names the way out — close it first.
+	 */
 	async #sessionDelete(connection, params) {
 		const session = this.#requireSessionParam(params);
+		if (session.backendSession !== undefined) {
+			const refusal = new RpcError(ErrorCode.refused, `session ${session.sessionId} is live and cannot be deleted from here`, {
+				type: "refused",
+				command: "delete",
+				sessionId: session.sessionId,
+				state: session.state,
+				allowedIn: [],
+				reason:
+					session.adopted === true
+						? "another frontend created this agent and is still showing the session; deleting the record here would leave the GUI displaying a conversation this control plane claims no longer exists"
+						: "this control plane still holds a live agent for the session",
+				hint: "close the session first, which releases the agent without touching the host's own session store",
+			});
+			// Recorded through the same path a table refusal uses, so a refusal
+			// decided outside `admit` is exactly as audible as one decided by
+			// it — otherwise the loudest refusal in the system would be the one
+			// nothing logged.
+			this.#registry.refuse(session, "delete", connection.actor, refusal.data);
+			throw refusal;
+		}
 		await this.#registry.admit(session, Command.delete, connection.actor, async (record) => {
-			await this.#disposeBackend(record, connection.actor);
-			this.#registry.commit(record, { actor: connection.actor, type: EventType.deleted, data: {} });
+			this.#registry.commit(record, { actor: connection.actor, type: EventType.deleted, data: { scope: "acp-control-only" } });
 			this.#registry.forget(record.sessionId);
 		});
-		this.#logger(`session ${session.sessionId} deleted by ${connection.actor}`);
-		return {};
+		this.#logger(`session ${session.sessionId} deleted from this control plane by ${connection.actor} (host state untouched)`);
+		return { sessionId: session.sessionId, scope: "acp-control-only" };
 	}
 
 	async #sessionPrompt(connection, params, signal) {
@@ -749,22 +870,49 @@ export class ControlPlane {
 			// and asserts this ordering.
 			await this.#registry.durable("the rename");
 			record.title = trimmed;
-			return { sessionId: record.sessionId, title: trimmed, eventId: event.eventId, previous: previous ?? null };
+			// Mirror the rename into the host when it has a canonical surface,
+			// so the GUI's session list shows what an ACP client just set. A
+			// missing service is reported on the result rather than failing the
+			// command: this plugin's own record *is* the authority for the
+			// title a client sees over ACP, and the host copy is a courtesy.
+			const mirrored = await this.#mirrorRename(record.sessionId, trimmed);
+			return {
+				sessionId: record.sessionId,
+				title: trimmed,
+				eventId: event.eventId,
+				previous: previous ?? null,
+				...(mirrored === undefined ? {} : { host: mirrored }),
+			};
 		});
 	}
 
 	async #archive(connection, params, archived) {
 		const session = this.#requireSessionParam(params);
 		const command = archived ? Command.archive : Command.unarchive;
+		const canonical = this.#registry.backend.canonical?.[archived ? "archive" : "unarchive"];
+		if (canonical === undefined) {
+			throw methodNotFound(archived ? "_dsh/session/archive" : "_dsh/session/unarchive", {
+				reason: "this backend has no canonical archive to delegate to",
+			});
+		}
 		return this.#registry.admit(session, command, connection.actor, async (record) => {
-			const previous = record.archived;
-			// Commit, then mutate — same reason as rename.
+			// Delegated, never mirrored. DSH keeps archive as a workspace-scoped
+			// set of session ids behind `workspaceRegistry`; this plugin used to
+			// keep its own `archived` flag beside it, which is two sources of
+			// truth for one fact. The canonical call is the only write, and the
+			// event below is a *record of the delegation*, not a second copy.
+			const outcome = await canonical(record.sessionId);
+			if (outcome?.unavailable !== undefined) {
+				throw new RpcError(
+					ErrorCode.methodNotFound,
+					`${archived ? "archive" : "unarchive"} is unavailable here: ${outcome.unavailable}`,
+					{ type: "unavailable", command: archived ? "archive" : "unarchive", sessionId: record.sessionId, reason: outcome.unavailable },
+				);
+			}
 			const event = this.#registry.commit(record, {
 				actor: connection.actor,
 				type: archived ? EventType.archived : EventType.unarchived,
-				data: { archived, previous },
-				// No stable ACP update says "archived" — there is no such concept
-				// in the protocol — so this one rides the extension namespace.
+				data: { archived, delegatedTo: "workspaceController.archiveSession", archivedSessionIds: outcome?.archivedSessionIds },
 				frame: (eventId) =>
 					notificationFrame(SESSION_CHANGED, {
 						sessionId: record.sessionId,
@@ -774,8 +922,6 @@ export class ControlPlane {
 						eventId,
 					}),
 			});
-			await this.#registry.durable("the archive flag");
-			record.archived = archived;
 			return { sessionId: record.sessionId, archived, eventId: event.eventId };
 		});
 	}
@@ -876,6 +1022,26 @@ export class ControlPlane {
 			throw invalidParams("a sessionId is required", { field: "sessionId" });
 		}
 		return this.#registry.require(sessionId);
+	}
+
+	/**
+	 * Push a rename into the host's canonical session service, when it exists.
+	 *
+	 * Returns a small status so the caller can say whether the GUI will see the
+	 * new title; never throws, because a host that cannot mirror a title must
+	 * not make an otherwise-correct ACP rename fail.
+	 */
+	async #mirrorRename(sessionId, title) {
+		const canonical = this.#registry.backend.canonical?.rename;
+		if (canonical === undefined) return { mirrored: false, reason: "this backend has no host to rename through" };
+		try {
+			const outcome = await canonical(sessionId, title);
+			if (outcome?.unavailable !== undefined) return { mirrored: false, reason: outcome.unavailable };
+			return { mirrored: true };
+		} catch (error) {
+			this.#logger(`host rename mirror failed for ${sessionId}: ${describe(error)}`);
+			return { mirrored: false, reason: describe(error) };
+		}
 	}
 
 	async #disposeBackend(record, actor) {

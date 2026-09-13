@@ -385,8 +385,12 @@ async function main() {
 		await delay(40);
 		const plainSession = await plain.request("session/new", { cwd: dataDir, mcpServers: [] });
 		const plainSessionId = plainSession.result?.sessionId;
-		// Provoke a real refusal, so the plugin emits `_dsh/session/refused`.
-		const refused = await plain.request("session/resume", { sessionId: plainSessionId });
+		// Provoke a real refusal. `session/delete` on a *live* session is the
+		// stable one to use: deleting something another frontend is still
+		// showing is refused by policy, and `session/resume` can no longer serve
+		// as the probe because resuming an attached session is now an
+		// idempotent success rather than a refusal.
+		const refused = await plain.request("session/delete", { sessionId: plainSessionId });
 		check(
 			"the standard client receives the refusal as a normal JSON-RPC error",
 			refused.error?.data?.type === "refused",
@@ -402,7 +406,7 @@ async function main() {
 		check(
 			"an OPTED-IN client does receive the same refusal in-band",
 			client.allFrames.some(
-				(entry) => entry.frame?.method === "_dsh/session/refused" && entry.frame.params?.command === "resume",
+				(entry) => entry.frame?.method === "_dsh/session/refused" && entry.frame.params?.command === "delete",
 			),
 			`opted-in client saw: ${client.allFrames
 				.filter((entry) => entry.frame?.method !== undefined)
@@ -435,16 +439,19 @@ async function main() {
 		// An explicit `?after=` must win over a stale `Last-Event-ID`, because a
 		// browser's EventSource supplies the header automatically on every
 		// reconnect and a client that wants to override it has no other way.
+		//
+		// Probed in the direction that cannot be confused with "there was
+		// nothing to replay": the query asks for everything while the header
+		// asks to skip everything, so an empty result means the header won.
 		const precedence = new HttpAcpClient(base, "verify-secret-token");
 		precedence.connectionId = client.connectionId;
-		const headNow = control.log.lastEventId;
-		await precedence.openStream({ after: headNow - 1, lastId: 1 });
+		await precedence.openStream({ after: 0, lastId: 999_999 });
 		await delay(60);
 		const precedenceIds = precedence.allFrames.filter((entry) => entry.id !== undefined).map((entry) => entry.id);
 		check(
 			"?after= wins over a stale Last-Event-ID header",
-			precedenceIds.length > 0 && precedenceIds.every((id) => id > headNow - 1),
-			`head ${headNow}, got [${precedenceIds.join(", ")}]`,
+			precedenceIds.length > 0 && precedenceIds.every((id) => id > 0),
+			`got [${precedenceIds.slice(0, 6).join(", ")}]`,
 		);
 		await precedence.dropStream();
 
@@ -490,6 +497,9 @@ async function main() {
 			control.log.lastEventId === headAfterTurn,
 			`${headAfterTurn} -> ${control.log.lastEventId}`,
 		);
+		// Deleting refuses a live session, so the ACP view is closed first —
+		// which releases the agent without touching the host's session store.
+		await idem.request("session/close", { sessionId: idemSessionId });
 		await idem.request("session/delete", { sessionId: idemSessionId });
 		await idem.dropStream();
 
@@ -515,8 +525,14 @@ async function main() {
 		// `Acp-Connection-Id` survives a stream swap.
 		await client.openStream({ after: -1 });
 		await delay(30);
+		await client.request("session/close", { sessionId });
 		const deleted = await client.request("session/delete", { sessionId });
 		check("session/delete settles over HTTP after a stream re-attach", deleted.result !== undefined);
+		check(
+			"and it reports that only this control plane's record went away",
+			deleted.result?.scope === "acp-control-only",
+			JSON.stringify(deleted.result),
+		);
 		const afterDelete = await client.request("session/list", {});
 		check(
 			"the deleted session is gone from session/list",

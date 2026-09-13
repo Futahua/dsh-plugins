@@ -49,10 +49,15 @@ export const StopReason = Object.freeze({
 /**
  * @typedef {object} Backend
  * @property {string} name - the adapter's name, reported in `initialize.agentInfo` and in the boot log.
+ * @property {boolean} [observesLiveAgents] - whether a missing agent is *evidence* that nothing holds a session, or merely an absence of information. A backend without this cannot be trusted to decide that resuming a persisted session is safe.
+ * @property {(event: object) => object[]} [translate] - DSH session event → ACP updates, for adopted sessions whose events the registry forwards.
  * @property {(input: {sessionId: string, cwd: string}) => Promise<BackendSession>} create
  * @property {(input: {sessionId: string, cwd: string}) => Promise<BackendSession>} resume
- * @property {() => Promise<Array<{sessionId: string, cwd: string, title?: string, updatedAt?: string}>>} list
+ * @property {(input: {sessionId: string, cwd?: string, onEvent: (event: object) => void}) => Promise<BackendSession|undefined>} [adopt] - borrow an agent that already exists. Returns undefined when nothing is live; the returned session **must not dispose the agent**.
+ * @property {() => Promise<Array<{sessionId: string, status?: string, cwd?: string}>>} [live] - the agents this backend can currently see.
+ * @property {() => Promise<Array<{sessionId: string, status?: string, cwd?: string, title?: string, updatedAt?: string}>>} list - sessions this backend knows about, live or persisted.
  * @property {(sessionId: string) => Promise<void>} remove
+ * @property {object} [canonical] - the host's canonical mutation services, so this plugin never keeps a second copy of a fact the host already owns.
  */
 
 /**
@@ -138,6 +143,8 @@ function sleep(ms, signal) {
  */
 export function createScriptedBackend({ chunkDelayMs = 12 } = {}) {
 	const sessions = new Map();
+	/** The fixture's canonical archived set — the host's fact, not the registry's. */
+	const archived = new Set();
 
 	/**
 	 * Build one scripted session.
@@ -268,6 +275,56 @@ export function createScriptedBackend({ chunkDelayMs = 12 } = {}) {
 
 	return {
 		name: "scripted",
+		/**
+		 * A fixture cannot see live agents, so a missing one tells it nothing.
+		 * That is the difference between "nothing holds this session" and "I
+		 * have no way to know", and a control plane must not treat the second
+		 * as the first — see `session/resume`'s refusal in lib/server.js.
+		 */
+		observesLiveAgents: false,
+		/** Nothing to borrow: this adapter never has a live agent behind a session. */
+		async adopt() {
+			return undefined;
+		},
+		/** Nor anything to list as live. */
+		async live() {
+			return [];
+		},
+		/**
+		 * A fixture workspace registry.
+		 *
+		 * Archive works and unarchive does not — which is not an arbitrary
+		 * fixture choice but a faithful copy of DSH, where
+		 * `workspaceRegistry.archiveSession` only ever *adds* to the archived
+		 * set and no unarchive exists. Giving the fixture the same one-way
+		 * shape means the delegation plumbing and the refusal for the missing
+		 * direction are both exercised by the portable checks, rather than only
+		 * by the profile check.
+		 */
+		canonical: {
+			async rename() {
+				return { unavailable: "the scripted backend has no host to rename through" };
+			},
+			async archive(sessionId) {
+				archived.add(sessionId);
+				return { ok: true, archivedSessionIds: [...archived] };
+			},
+			async unarchive() {
+				return {
+					unavailable:
+						"the scripted fixture mirrors DSH here: archiveSession only adds to the archived set, and no unarchive exists",
+				};
+			},
+			async archivedIds() {
+				return new Set(archived);
+			},
+			async setMode() {
+				return { unavailable: "the scripted backend has no plan mode" };
+			},
+			async fork() {
+				return { unavailable: "the scripted backend has no session controller" };
+			},
+		},
 		async create(input) {
 			return makeSession(input);
 		},

@@ -45,7 +45,12 @@ export async function createControlPlane({
 		log,
 		backend,
 		sink: (frame, record) => plane?.broadcast(frame, record),
+		// Archive is read from the host, never remembered here.
+		archivedIds: () => backend.canonical?.archivedIds?.(),
 	});
+	// A backend that owns a pure translator hands it to the registry, which
+	// uses it to project an adopted session's events for ACP clients.
+	backend.translate = backend.translate ?? ((event) => []);
 	plane = new ControlPlane({ registry, logger, agentName, version });
 	const recovery = registry.recover();
 

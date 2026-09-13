@@ -39,6 +39,14 @@ import { ErrorCode, RpcError } from "./jsonrpc.js";
 export const EventType = {
 	/** A session was created. Rebuilds the session at boot. */
 	created: "session.created",
+	/**
+	 * A live session owned by another frontend was adopted.
+	 *
+	 * Recorded because attachment is a change in this control plane's view of the
+	 * world: a client replaying from a cursor should see that the session became
+	 * visible here, and when.
+	 */
+	attached: "session.attached",
 	/** A session changed state. */
 	state: "session.state",
 	/** A user prompt was admitted. */
@@ -47,9 +55,6 @@ export const EventType = {
 	update: "session.update",
 	/** The title changed. Rebuilds the title at boot. */
 	title: "session.title",
-	/** The archived flag changed. Rebuilds the flag at boot. */
-	archived: "session.archived",
-	unarchived: "session.unarchived",
 	/** A session was forked from another. */
 	forked: "session.forked",
 	/** A permission request was made or answered. */

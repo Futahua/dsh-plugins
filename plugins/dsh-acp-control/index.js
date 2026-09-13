@@ -113,6 +113,15 @@ class AcpControl extends Service {
 		provider: z.string().default(""),
 		/** Model for sessions this plugin creates; empty uses the profile default. */
 		model: z.string().default(""),
+		/**
+		 * Adopt agents that already exist — the web GUI's own sessions — so they
+		 * can be driven over ACP.
+		 *
+		 * On by default, because it is the point of the plugin. Turning it off
+		 * leaves a server that can only ever see sessions it created itself,
+		 * which is exactly the limitation slice 2 removed.
+		 */
+		adoptLiveSessions: z.boolean().default(true),
 	});
 
 	constructor(ctx, config) {
@@ -184,6 +193,50 @@ class AcpControl extends Service {
 			version: VERSION,
 			maxLogBytes: config.maxLogBytes,
 		});
+
+		// ── co-presence ──────────────────────────────────────────────────────
+		// Adopt every live agent this process learns about, so a session the
+		// human opens in the web GUI becomes a real, stateful session here
+		// rather than a `backendOnly` row that cannot be driven. Adoption is
+		// what makes this a control plane instead of a second harness: the
+		// agent stays owned by whoever created it, and this plugin gains a view
+		// of it and never disposes it.
+		//
+		// `agent/created` fires for the GUI's own `agents.create`/`resume`, so
+		// the session is adopted from the moment it exists — before any ACP
+		// client asks for it — which is what lets an attached client see a turn
+		// the human started before the client connected.
+		if (config.adoptLiveSessions) {
+			const adopt = (agent) => {
+				const sessionId = String(agent?.id ?? "");
+				if (sessionId === "") return;
+				void this.#control.registry
+					.attach({
+						sessionId,
+						cwd: agent.session?.header?.cwd,
+						state: agent.status === "running" ? "generating" : "idle",
+						actor: "system:acp-control",
+					})
+					.then(() => {
+						this.#logger(`adopted live session ${sessionId} (status ${agent.status}); ownership stays with its creator`);
+					})
+					.catch((error) => {
+						this.#logger(`could not adopt ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+					});
+			};
+			ctx.on("agent/created", ({ agent }) => adopt(agent));
+			ctx.on("agent/disposed", ({ agent }) => {
+				const sessionId = String(agent?.id ?? "");
+				if (sessionId === "") return;
+				void this.#control.registry
+					.detach(sessionId)
+					.then(() => this.#logger(`session ${sessionId} was disposed by its owner; detached`))
+					.catch(() => {});
+			});
+			// Anything already live when this plugin mounts — a profile that
+			// mounted us late, or a reload — is adopted in the same way.
+			for (const agent of ctx.get("agents")?.list?.() ?? []) adopt(agent);
+		}
 
 		const wantsHttp = config.transport === "auto" || config.transport === "http" || config.transport === "both";
 		const wantsStdio = config.transport === "stdio" || config.transport === "both";

@@ -185,22 +185,44 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 			"idle: rename is announced on the STABLE wire (session_info_update)",
 			updates.some((update) => update.sessionUpdate === "session_info_update" && update.title === "idle rename"),
 		);
-		assertCommitted("idle: _dsh/session/archive succeeds", await command(ctx, "_dsh/session/archive", { sessionId }));
-		assertCommitted("idle: _dsh/session/unarchive succeeds", await command(ctx, "_dsh/session/unarchive", { sessionId }));
+		// Archive is delegated to the host, so it is exercised on a session of
+		// its own: the fixture mirrors DSH's *one-way* archive, so a session
+		// that gets archived cannot be un-archived and would otherwise change
+		// the meaning of every later check.
+		const archival = await ctx.request("session/new", { cwd, mcpServers: [] });
+		const archivalId = archival.sessionId;
+		assertCommitted("idle: _dsh/session/archive succeeds", await command(ctx, "_dsh/session/archive", { sessionId: archivalId }));
+		const unarchive = await command(ctx, "_dsh/session/unarchive", { sessionId: archivalId });
+		check(
+			"unarchive is refused as unavailable rather than faked locally",
+			unarchive.ok === false && unarchive.data?.type === "unavailable",
+			JSON.stringify(unarchive.data),
+		);
 		check(
 			"archive hides the session from session/list, _dsh/session/list brings it back",
 			await (async () => {
-				await ctx.request("_dsh/session/archive", { sessionId });
 				const stable = await ctx.request("session/list", {});
 				const extended = await ctx.request("_dsh/session/list", {});
-				await ctx.request("_dsh/session/unarchive", { sessionId });
 				return (
-					stable.sessions.some((entry) => entry.sessionId === sessionId) === false &&
-					extended.sessions.some((entry) => entry.sessionId === sessionId) === true
+					stable.sessions.some((entry) => entry.sessionId === archivalId) === false &&
+					extended.sessions.some((entry) => entry.sessionId === archivalId) === true &&
+					extended.sessions.find((entry) => entry.sessionId === archivalId)?.archived === true
 				);
 			})(),
 		);
-		assertRefused("idle: session/resume is refused (already open)", await command(ctx, "session/resume", { sessionId }), "idle");
+		// Cleanup must close first: a live session refuses deletion (see below).
+		await ctx.request("session/close", { sessionId: archivalId });
+		await ctx.request("session/delete", { sessionId: archivalId });
+		// Resuming a session that is already live is a no-op that *succeeds*.
+		// Adoption is automatic, so "attach me to this session id" normally asks
+		// for something already true, and refusing it with "already open here"
+		// would be accurate and useless.
+		const alreadyAttached = await command(ctx, "session/resume", { sessionId });
+		check(
+			"idle: resuming an attached session succeeds idempotently",
+			alreadyAttached.ok === true && alreadyAttached.result?.alreadyAttached === true,
+			JSON.stringify(alreadyAttached.result ?? alreadyAttached.data),
+		);
 		// `session/cancel` is a *notification*, so there is no response channel
 		// to refuse down. Two things must therefore be true, and both are
 		// asserted: the refusal is recorded in the log (the only report a
@@ -312,7 +334,17 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 		);
 		assertCommitted("closed: _dsh/session/rename is still accepted", await command(ctx, "_dsh/session/rename", { sessionId, title: "renamed while closed" }));
 		assertCommitted("closed: session/resume reopens it", await command(ctx, "session/resume", { sessionId }));
-		assertRefused("idle: a second session/resume is refused", await command(ctx, "session/resume", { sessionId }), "idle");
+		// Resuming a session that is already live is a no-op that succeeds.
+		// Adoption is automatic for live sessions, so "attach me to this id" is
+		// usually asking for something already true, and refusing it with
+		// "already open here" would be accurate and useless.
+		const again = await command(ctx, "session/resume", { sessionId });
+		check(
+			"resuming an already-attached session succeeds idempotently",
+			again.ok === true && again.result?.alreadyAttached === true,
+			JSON.stringify(again.result ?? again.data),
+		);
+		check("and it did not disturb the session", (await ctx.request("_dsh/session/state", { sessionId })).state === "idle");
 
 		console.log("\n--- list ------------------------------------------------------");
 		const listed = await command(ctx, "session/list", {});
@@ -334,10 +366,10 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 		check("replay ids are strictly increasing (no duplicates)", ids.every((id, index) => index === 0 || id > ids[index - 1]));
 		check("replay reaches the log head", replay.lastEventId === total, `${replay.lastEventId} vs ${total}`);
 		check("replay reports a retained floor", replay.firstRetainedEventId === 1, `got ${replay.firstRetainedEventId}`);
-		const again = await ctx.request("_dsh/events/replay", { sessionId, after: cursor });
+		const replayAgain = await ctx.request("_dsh/events/replay", { sessionId, after: cursor });
 		check(
 			"replay is idempotent: the same cursor yields the same events",
-			JSON.stringify(again.events.map((e) => e.eventId)) === JSON.stringify(ids),
+			JSON.stringify(replayAgain.events.map((e) => e.eventId)) === JSON.stringify(ids),
 		);
 		const everything = await ctx.request("_dsh/events/replay", { sessionId, after: -1 });
 		check(
@@ -436,13 +468,48 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 		);
 		check("and the replay that comes back is empty rather than wrong", ahead.events.length === 0);
 
-		console.log("\n--- delete ----------------------------------------------------");
-		assertCommitted("session/delete succeeds from idle", await command(ctx, "session/delete", { sessionId }));
+		console.log("\n--- delete is plugin-local, and refuses a live session ----");
+		// Deleting is only this control plane's business. DSH has no host
+		// "delete a session" method, so reporting success while another frontend
+		// still shows the conversation would be the accepted-and-discarded shape
+		// this project exists to remove.
+		const liveDelete = await command(ctx, "session/delete", { sessionId });
+		check(
+			"deleting a live session is refused, naming why",
+			liveDelete.ok === false && liveDelete.data?.type === "refused" && typeof liveDelete.data?.reason === "string",
+			JSON.stringify(liveDelete.data),
+		);
+		assertCommitted("session/close releases the agent", await command(ctx, "session/close", { sessionId }));
+		const closedDelete = await command(ctx, "session/delete", { sessionId });
+		assertCommitted("once closed, delete succeeds and says its scope", closedDelete);
+		check(
+			"the delete result states that only this control plane's record went away",
+			closedDelete.result?.scope === "acp-control-only",
+			JSON.stringify(closedDelete.result),
+		);
 		const gone = await command(ctx, "_dsh/session/state", { sessionId });
 		check(
 			"deleted: the session is gone, and asking for it says not_found rather than nothing",
 			gone.ok === false && gone.data?.type === "not_found",
 			JSON.stringify(gone.data),
+		);
+
+		console.log("\n--- a server that cannot see live agents must refuse ----------");
+		// The scripted backend has no view of live agents, so a missing one is
+		// an absence of information rather than evidence. Resuming an unknown
+		// session here would be guessing, and guessing wrong produces two
+		// owners of one conversation — so it refuses in its own words instead of
+		// racing the host's "session is already active".
+		const unknown = await command(ctx, "session/resume", { sessionId: "session-held-by-someone-else" });
+		check(
+			"resuming an unknown session is refused with cannot_attach, not attempted",
+			unknown.ok === false && unknown.data?.type === "cannot_attach",
+			JSON.stringify(unknown.data),
+		);
+		check(
+			"and the refusal explains that the limitation is the missing live-agent view",
+			typeof unknown.data?.reason === "string" && unknown.data.reason.includes("second owner"),
+			unknown.data?.reason,
 		);
 	});
 
