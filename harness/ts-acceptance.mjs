@@ -6,6 +6,7 @@
 import { createHash, createHmac } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { rawRequest } from './probe/raw-http.mjs'
 
 // Read the signing secret from the local credential store — never a hardcoded
 // copy. This value signs the browser-session cookie, so a literal in a script is
@@ -38,7 +39,17 @@ async function req(path, { cookie, method = 'GET', body } = {}) {
   if (cookie) headers.Cookie = cookie
   if (body) headers['content-type'] = 'application/json'
   const r = await fetch(`${BASE}${path}`, { method, headers, body, redirect: 'manual' })
-  return { status: r.status, loc: r.headers.get('location'), text: (await r.text()).trim().slice(0, 44).replace(/\s+/g, ' ') }
+  // setCookie matters now: signing in is a one-hop minted response, not a
+  // redirect, so the cookie arriving on the SAME response is the thing to
+  // assert. Without it this file silently kept testing the old protocol and
+  // contradicted pane-acceptance.mjs, which had been updated.
+  const setCookie = (r.headers.getSetCookie?.() ?? []).find((c) => c.startsWith('dsh-auth-')) ?? null
+  return {
+    status: r.status,
+    loc: r.headers.get('location'),
+    setCookie,
+    text: (await r.text()).trim().slice(0, 44).replace(/\s+/g, ' '),
+  }
 }
 
 let failures = 0
@@ -63,10 +74,21 @@ for (const p of ['/assets/index.js', '/plugins/x/client.js']) {
 
 console.log('')
 console.log('Documents (auto sign-in, by design):')
+// These use RAW SOCKETS, not fetch. A browser navigation cannot be simulated
+// with fetch(): `Sec-*` are forbidden headers so the browser-side ones cannot be
+// set, and undici supplies its own Fetch Metadata (`Dest: empty`, `Mode: cors`)
+// which the bridge correctly reads as "a fetch, not a navigation" and refuses to
+// mint for. Getting this wrong made a correct bridge look broken.
 for (const [label, cookie] of [['no cookie', undefined], ['bogus cookie', BOGUS], ['valid cookie', cookieFor(TS)]]) {
-  const r = await req('/', { cookie })
-  const ok = label === 'valid cookie' ? r.status === 200 : (r.status === 303 && r.loc === '/')
-  check(`GET /  ${label}`, ok, `HTTP ${r.status} location=${r.loc ?? 'none'}`)
+  const r = await rawRequest({
+    host: TS,
+    path: '/',
+    navigation: true,
+    headers: cookie ? { Cookie: cookie } : {},
+  })
+  const minted = r.setCookie.some((c) => c.startsWith('dsh-auth-'))
+  const ok = label === 'valid cookie' ? r.status === 200 : (r.status === 200 && minted)
+  check(`GET /  ${label}`, ok, `HTTP ${r.status} minted=${minted}`)
 }
 
 console.log('')

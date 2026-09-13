@@ -13,10 +13,36 @@
 
 const GUI = process.env.DSH_BASE ?? 'http://127.0.0.1:3080'
 const TEMP = process.env.TEMP ?? 'D:/Programs/evTEMP'
-const PROBE = 'file:///D:/Letters/MatTroiSeConMoc/.dsh/probe/input-test.html'
+// Resolved beside this script, like the lease: input-test.html ships in the same
+// directory, so this works both installed (.dsh/probe/) and committed (harness/).
+const PROBE = pathToFileURL(join(import.meta.dirname, 'input-test.html')).href
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+// Resolved relative to THIS file, trying both layouts, so the script works both
+// installed (.dsh/probe/ next to .dsh/) and committed (harness/ beside
+// harness/). A single relative path breaks silently on copy — which is how the
+// published pane-input-proof.mjs came to import a file that did not exist.
+const here = import.meta.dirname
+let leasePath = null
+for (const candidate of [join(here, 'pane-lease.mjs'), join(here, '..', 'pane-lease.mjs')]) {
+  try { readFileSync(candidate); leasePath = candidate; break } catch { /* try next */ }
+}
+if (!leasePath) throw new Error(`pane-lease.mjs not found near ${here}`)
+const { openLease, assertDrivable } = await import(pathToFileURL(leasePath).href)
+
+// A refusal from the guard below throws at top level. Node's default handling
+// exits on the spot, which races the SSE socket teardown and trips a libuv
+// assertion on Windows — the run then reports exit code 0xC0000409 and looks
+// like a crash instead of a clean refusal. Catch it, say why, and let the event
+// loop drain so the exit code stays honest.
+process.on('uncaughtException', (error) => {
+  console.error(`\n  REFUSED\n  ${error.message}\n`)
+  process.exitCode = 1
+})
+const OWNER = process.env.PANE_OWNER ?? `pane-input-tests:${process.pid}`
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const results = []
@@ -32,26 +58,56 @@ async function check(name, fn) {
   }
 }
 
-function browserPort() {
+/** Every candidate debug port, newest profile first. */
+function browserPorts() {
   const dirs = readdirSync(TEMP)
     .filter((n) => n.startsWith('puppeteer_dev_chrome_profile-'))
     .map((n) => join(TEMP, n))
     .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)
+  const ports = []
   for (const dir of dirs) {
     try {
       const [port] = readFileSync(join(dir, 'DevToolsActivePort'), 'utf8').split('\n')
-      if (/^\d+$/u.test(port.trim())) return Number(port.trim())
+      const n = Number(port.trim())
+      if (/^\d+$/u.test(port.trim()) && !ports.includes(n)) ports.push(n)
     } catch { /* stale profile */ }
   }
-  throw new Error('no live browser port found')
+  return ports
 }
 
-async function attach() {
-  const port = browserPort()
-  const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()
-  const page = list.find((t) => t.type === 'page')
-  if (!page) throw new Error('no page target')
-  const ws = new WebSocket(page.webSocketDebuggerUrl)
+function browserPort() {
+  const [first] = browserPorts()
+  if (first === undefined) throw new Error('no live browser port found')
+  return first
+}
+
+async function attach(urlSubstring) {
+  // Find the tab that actually holds the page under test.
+  //
+  // Two traps, both hit while building this. The plugin drives its ACTIVE tab,
+  // which is not necessarily "the first page target"; and several puppeteer
+  // profiles exist on disk from earlier launches, so trusting the newest profile
+  // folder can point at a port belonging to a different, already-superseded
+  // browser that simply has no such tab. Scan every reachable profile port and
+  // take the one that really has the page.
+  const deadline = Date.now() + 20_000
+  let found = null
+  while (Date.now() < deadline && found === null) {
+    for (const port of browserPorts()) {
+      try {
+        const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()
+        const pages = list.filter((t) => t.type === 'page')
+        const hit = urlSubstring ? pages.find((t) => t.url.includes(urlSubstring)) : pages[0]
+        if (hit) { found = { port, page: hit }; break }
+      } catch { /* port not this browser */ }
+    }
+    if (found === null) await sleep(400)
+  }
+  if (found === null) {
+    const tried = browserPorts().join(', ')
+    throw new Error(`no page target matching "${urlSubstring}" on any browser port (tried ${tried || 'none'})`)
+  }
+  const ws = new WebSocket(found.page.webSocketDebuggerUrl)
   let id = 0
   const pending = new Map()
   ws.addEventListener('message', (e) => {
@@ -79,7 +135,16 @@ async function attach() {
   }
 }
 
+// Every route that DRIVES the shared page goes through one of these two
+// helpers, and both refuse unless this run still holds the lease. That is the
+// point: ownership is enforced by the wrapper, not by the caller remembering to
+// ask. The previously published version drove drag, wheel and keyboard with no
+// lease at all — voluntary compliance is not fail-closed.
+let currentLease = null
+const assertHeld = () => { if (currentLease) currentLease.assertHeld() }
+
 async function post(event) {
+  assertHeld()
   const res = await fetch(`${GUI}/browser-pane/input`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -90,6 +155,7 @@ async function post(event) {
 }
 
 async function goto(url) {
+  assertHeld()
   await fetch(`${GUI}/browser-pane/goto`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -108,10 +174,20 @@ const stream = await fetch(`${GUI}/browser-pane/stream`, {
 })
 stream.body?.cancel?.().catch(() => {})
 if (!stream.ok) throw new Error(`stream refused: HTTP ${stream.status}`)
-console.log(`  stream attached (HTTP ${stream.status})\n`)
+console.log(`  stream attached (HTTP ${stream.status})`)
 
-const client = await attach()
+// Refuse before anything else if the pane is attached to a real browser: this
+// script's goto/navigate calls act on that browser's ACTIVE TAB.
+await assertDrivable()
+
+// Own the page for the whole run, before anything drives it. If another run
+// holds it, this throws here and no input is sent — fail-closed.
+currentLease = openLease({ owner: OWNER, ttlMs: 300_000 })
+console.log(`  lease held by ${OWNER}\n`)
+
+// Navigate FIRST (under the lease), then attach to the tab holding the probe.
 await goto(PROBE)
+const client = await attach('input-test')
 await client.evaluate('window.__resetInput()')
 
 // --- Slice 9a: drag ----------------------------------------------------------
@@ -201,6 +277,7 @@ await check('keyboard: modifiers and special keys are delivered, not just text',
 })
 
 client.close()
+currentLease?.close()
 controller.abort()
 
 const failed = results.filter((r) => !r.ok)

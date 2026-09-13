@@ -8,14 +8,43 @@
 // accepts, and re-signs the browser's tailnet-scoped dsh session cookie for the
 // loopback authority using DSH's persistent browser-session secret.
 //
-// SECURITY: the bridge is not an authentication bypass. It admits a request
-// only when the browser presents a session cookie that is itself valid (signed
-// by DSH's secret, unexpired, bound to this exact authority). Otherwise it
-// returns the same minimal 401 DSH emits, and it never mints a session for an
-// unauthenticated caller. The re-signed upstream cookie keeps the presented
-// cookie's own issuedAt/expiresAt, so the bridge cannot extend a session.
+// SECURITY MODEL — read this before changing the admission rules.
 //
-// Binds 127.0.0.1 only: reachable exclusively through Tailscale Serve.
+// The bridge admits a request in one of two ways:
+//
+//   1. The browser presents a session cookie that is itself valid (signed by
+//      DSH's secret, unexpired, bound to a served authority). The bridge
+//      re-signs it for the loopback authority, keeping the presented
+//      issuedAt/expiresAt, so re-signing cannot extend a session.
+//   2. OR the request is a top-level document navigation, in which case the
+//      bridge MINTS a session and serves the GUI in one hop.
+//
+// An earlier version of this comment claimed the bridge "is not an
+// authentication bypass" and "never mints a session for an unauthenticated
+// caller". Case 2 makes both of those false. The honest description is:
+//
+//   Tailscale network authorization IS the credential for DSH, and the bridge
+//   converts that authorization into a DSH session.
+//
+// Three consequences worth keeping in view:
+//
+//   - Every tailnet identity that can reach the Serve endpoint has full GUI
+//     access. If the ACL there is effectively allow-all, then "member of my
+//     tailnet" means "authorized DSH operator" — which should be an intentional
+//     decision, not a side effect of joining.
+//   - The nominal 30-day DSH session lifetime carries no authentication
+//     significance: when it lapses, the next qualifying navigation mints
+//     another.
+//   - The tailnet ACL is therefore the only access control here that means
+//     anything.
+//
+// Because case 2 hands a session to a caller who presented nothing, the
+// definition of "top-level document navigation" is load-bearing. It is enforced
+// from fetch metadata rather than from path shape — see isDocumentRequest.
+//
+// Binds 127.0.0.1 only, and rejects any Host it does not serve: binding to
+// loopback is not the same as "reachable only through Tailscale Serve", since
+// local processes and a local browser can reach it too.
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
@@ -223,16 +252,55 @@ function writeUnauthorized(res, method) {
   res.end(method === 'HEAD' ? undefined : 'dsh web authentication required; open the GUI URL to sign in.\n')
 }
 
-/** Presentation authority: the name the browser used when it is one we serve. */
+/** Authorities this bridge serves from loopback: its own listener. */
+const LOOPBACK_AUTHORITIES = new Set([
+  `127.0.0.1:${LISTEN_PORT}`,
+  `localhost:${LISTEN_PORT}`,
+  `[::1]:${LISTEN_PORT}`
+])
+
+/**
+ * Whether we serve this Host at all.
+ *
+ * Binding to loopback is NOT the same as "only reachable through Tailscale
+ * Serve": local processes and a local browser can reach the port too, which is
+ * exactly the situation Host allowlisting exists for. An unknown Host must die
+ * BEFORE any session is minted or proxied — not be quietly mapped onto a
+ * served authority, which is what the previous `authorityFor` fallback did.
+ */
+function isKnownAuthority(host) {
+  if (host === undefined || host === '') return false
+  return PUBLIC_AUTHORITIES.includes(host) || LOOPBACK_AUTHORITIES.has(host)
+}
+
+/** Presentation authority: the name the browser used. Callers must have
+ *  already established the Host is one we serve (see isKnownAuthority). */
 function authorityFor(host) {
   return PUBLIC_AUTHORITIES.includes(host ?? '') ? host : PUBLIC_AUTHORITIES[0]
 }
 
 /**
- * Whether this is a top-level document navigation, which is safe to answer with
- * a login redirect. API and static-asset requests must never be redirected: a
- * fetch or image following a 303 to "/" would receive HTML under a resource
- * content type, and redirecting /api would loop.
+ * Whether this is a TOP-LEVEL DOCUMENT NAVIGATION — which is the only thing
+ * allowed to be handed a freshly minted session.
+ *
+ * The previous version decided this from method and path shape alone, which
+ * never actually tested "navigation": any extensionless GET — an `<img src>`, an
+ * `<iframe>`, a speculative or resource request — was classified as a login
+ * navigation. That is worse than mislabelling, because the bridge mints the
+ * session and proxies THAT SAME REQUEST upstream authenticated, so a caller
+ * never has to accept or retain the Set-Cookie to get an authenticated fetch.
+ * That is a CSRF-shaped primitive reachable from any content running in a
+ * browser that can resolve the private hostname.
+ *
+ * Browsers send Fetch Metadata on every request, and it answers precisely the
+ * question being asked, so it is authoritative when present:
+ *
+ *   Sec-Fetch-Dest: document   — the destination is a document, not an image,
+ *                                iframe, script or empty (fetch/XHR)
+ *   Sec-Fetch-Mode: navigate   — it is a navigation, not a cors/no-cors fetch
+ *
+ * When a client sends no Fetch Metadata at all, only the bare GUI entry points
+ * qualify. An arbitrary extensionless path does not: that was the hole.
  */
 function isDocumentRequest(req, url) {
   if (req.method !== 'GET' && req.method !== 'HEAD') return false
@@ -241,11 +309,31 @@ function isDocumentRequest(req, url) {
   if (url.pathname.startsWith('/plugins/')) return false
   if (url.pathname.startsWith('/assets/')) return false
   if (/\.(?:js|mjs|css|map|json|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|wasm)$/iu.test(url.pathname)) return false
-  return true
+
+  const dest = req.headers['sec-fetch-dest']
+  const mode = req.headers['sec-fetch-mode']
+  if (dest !== undefined || mode !== undefined) {
+    // Present: trust it, and require both halves to say "navigation".
+    return dest === 'document' && (mode === undefined || mode === 'navigate')
+  }
+
+  // Absent: fall back to the exact entry points only, never a wildcard path.
+  return url.pathname === '/' || url.pathname === '/index.html'
 }
 
 const server = createServer((req, res) => {
   const url = new URL(req.url ?? '/', 'http://bridge.invalid')
+
+  // Host allowlist, enforced BEFORE anything is minted or proxied. Without this
+  // an arbitrary Host header reaching the loopback listener — a local process, a
+  // DNS-rebinding style request from a browser — was silently mapped onto a
+  // served authority and admitted. Fail closed, and say which host was refused.
+  if (!isKnownAuthority(req.headers.host)) {
+    log('rejected unknown Host', req.headers.host ?? '<absent>')
+    res.writeHead(403, { 'content-type': 'text/plain' })
+    res.end('host not served by this bridge\n')
+    return
+  }
 
   // Health probe: reports whether the DSH upstream answers at all. Loopback
   // callers only, and it reveals nothing beyond liveness.

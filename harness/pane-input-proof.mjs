@@ -23,7 +23,31 @@ const BASE = process.argv[2] ?? process.env.DSH_BASE ?? 'http://127.0.0.1:3080'
 // page, `withLease` refuses and the clicks below never happen — that is the
 // fail-closed property, and it is the whole point: an automated run must not
 // fight a human who is using the pane.
-import { withLease } from '../pane-lease.mjs'
+//
+// Resolved relative to THIS file, trying both layouts, because a single
+// relative path silently breaks the moment the script is copied between the
+// installed tree (.dsh/probe/ next to .dsh/) and the committed one (harness/
+// beside harness/). That is exactly how the previously published version came
+// to import a file that did not exist.
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+const here = import.meta.dirname
+let leasePath = null
+for (const candidate of [join(here, 'pane-lease.mjs'), join(here, '..', 'pane-lease.mjs')]) {
+  try { readFileSync(candidate); leasePath = candidate; break } catch { /* try next */ }
+}
+if (!leasePath) throw new Error(`pane-lease.mjs not found near ${here}`)
+const { withLease, assertDrivable } = await import(pathToFileURL(leasePath).href)
+
+// A refusal from the guard throws at top level; Node's default handling exits
+// immediately and races the SSE socket teardown, tripping a libuv assertion on
+// Windows so a clean refusal reports as a crash. Report it and drain instead.
+process.on('uncaughtException', (error) => {
+  console.error(`\n  REFUSED\n  ${error.message}\n`)
+  process.exitCode = 1
+})
 
 const OWNER = process.env.PANE_OWNER ?? `pane-input-proof:${process.pid}`
 
@@ -46,6 +70,10 @@ async function postInput(event) {
 }
 
 async function main() {
+  // Never drive a browser this tooling does not own: goto/input act on whatever
+  // tab is active, which in connect mode is the human's real browser.
+  await assertDrivable()
+
   // --- 1. Subscribe, and watch the state/frame events -------------------------
   const controller = new AbortController()
   const stream = await fetch(`${BASE}/browser-pane/stream`, {
