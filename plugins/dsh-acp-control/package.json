@@ -1,0 +1,25 @@
+{
+  "name": "dsh-acp-control",
+  "version": "1.0.0",
+  "private": true,
+  "description": "An ACP control plane for DSH sessions: explicit session state with structured refusals, an append-only event log with replay from a cursor, and loopback HTTP+SSE with Goose-style token auth",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./lib/*": "./lib/*"
+  },
+  "bin": {
+    "dsh-acp-control": "./lib/standalone.js"
+  },
+  "scripts": {
+    "check": "node verify/core-checks.mjs && node verify/http-client.mjs",
+    "check:stdio": "node verify/stdio-client.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

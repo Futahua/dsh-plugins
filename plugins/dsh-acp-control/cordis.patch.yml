@@ -1,0 +1,62 @@
+# The dsh-acp-control bundle patch.
+#
+# WHY THIS PLUGIN AND NOT THE ONE ALREADY INSTALLED
+#
+# `@deepseek-ai/dsh-acp` is the first-party ACP server and it is mounted by the
+# `acp` profile. It is stdio-only, it says so, and its README lists "no
+# transcript replay" as a deliberate limit — `session/resume` restores a log
+# "without replaying old updates". `dushaobindoudou/dsh-acp` adds HTTP+SSE but
+# its stream only buffers frames before the first attach, so a client that
+# reconnects has lost everything emitted in the gap and is never told.
+#
+# Neither can be fixed by configuration, and ACP will not fix it either: the
+# Streamable HTTP & WebSocket Transport RFD is Active, targets v1, and defers
+# resumability to v2 while explicitly not replaying in-flight messages. So the
+# replay cursor, the explicit session state machine, and actor identity are
+# implemented here. See DESIGN.md.
+#
+# WHERE THIS MOUNTS
+#
+# After `@deepseek-ai/dsh-base`, because the backend creates its agents through
+# `ctx.agents` (provided by `dsh-agent-loop`) and calls
+# `installModelSelection` from `@deepseek-ai/dsh-agent`. A row placed before
+# those bundles would find no `agents` service and fail its `inject`.
+#
+# `transport: auto` serves **loopback HTTP only**. It deliberately does not
+# fall back to stdio when stdout is not a terminal: `dsh web` runs with stdout
+# redirected to a log file, and a stdio transport that mistook that for an
+# editor's pipe would write JSON-RPC frames into the log. A stdio server has to
+# be asked for, in a profile booted for it.
+#
+# Remove this row to disable the plugin entirely; nothing else depends on it.
+
+- insert:
+    - id: acp-control
+      name: dsh-acp-control
+      config:
+        enabled: true
+        # auto = loopback HTTP+SSE. Use `both` only in a profile whose stdout is
+        # an editor's pipe.
+        transport: auto
+        # Loopback by default. Binding anything else is an explicit decision,
+        # because this endpoint can drive agents.
+        host: 127.0.0.1
+        port: 7810
+        # Empty generates a 32-byte secret at boot and logs it to stderr.
+        # HTTP clients send it as X-Secret-Key; browser EventSource and
+        # WebSocket clients must use ?token=, because neither can set headers.
+        token: ""
+        # Browser origins allowed by CORS. Empty means no CORS headers at all,
+        # which is the safe default: a page on another origin gets nothing.
+        allowedOrigins: []
+        # Empty uses $DSH_HOME/acp-control/events.jsonl.
+        dataDir: ""
+        # At the cap the plugin emits one log.exhausted event and then REFUSES
+        # further mutations with that reason. It never drops events to stay
+        # under the cap, because a silent gap is the failure this design exists
+        # to prevent.
+        maxLogBytes: 67108864
+        # Empty uses the profile's own default route for agents this server
+        # creates.
+        provider: ""
+        model: ""

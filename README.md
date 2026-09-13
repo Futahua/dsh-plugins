@@ -1,6 +1,6 @@
 # DSH plugins
 
-Three plugins for the [DeepSeek Harness](https://github.com/deepseek-ai) Web GUI,
+Four plugins for the [DeepSeek Harness](https://github.com/deepseek-ai) Web GUI,
 developed and verified against a live installation.
 
 | Plugin | What it does |
@@ -8,6 +8,7 @@ developed and verified against a live installation.
 | [`dsh-opencode-go-usage`](plugins/dsh-opencode-go-usage/) | Shows OpenCode Go subscription usage: a progress ring in the composer, and a nested-window panel on click |
 | [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
 | [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a touch device its screen back: both the sidebar rail and the browser-agent pane become invisible edge bands (highlight, flash, real panel sliding in, standing down while you type), and on iPadOS/iOS the shell is pinned above the on-screen keyboard |
+| [`dsh-acp-control`](plugins/dsh-acp-control/) | An Agent Client Protocol control plane over stdio and loopback HTTP+SSE: an explicit session state machine that refuses loudly instead of silently doing nothing, and an append-only event log so a reconnecting client misses nothing and duplicates nothing |
 
 The operational scripts — bringing the harness up at boot, restarting it to load
 a plugin's host half, opening an authenticated GUI, and the Tailscale auth bridge
@@ -112,6 +113,20 @@ node plugins\dsh-mobile-rail\verify-phone.mjs
 
 # both plugins are actually served by a running instance
 node plugins\dsh-mobile-rail\check-live.mjs
+
+# ACP control plane: protocol, state machine and replay over the real stdio
+# transport, driven by the official ACP client (needs nothing but Node)
+node plugins\dsh-acp-control\verify\core-checks.mjs
+
+# the same over a real child process's pipes
+node plugins\dsh-acp-control\verify\stdio-client.mjs
+
+# loopback HTTP+SSE: token auth, the RFD's POST contract, reconnect-with-replay
+node plugins\dsh-acp-control\verify\http-client.mjs
+
+# mounted in a live DSH profile, with the real backend and a real agent turn
+# (needs an `acpctl` profile; setup steps are in the plugin's README)
+node plugins\dsh-acp-control\verify\plugin-boot.mjs
 ```
 
 `check-live.mjs` and the other live scripts need a running GUI; point them with
@@ -227,6 +242,23 @@ Findings that cost real debugging time, recorded so they need not be rediscovere
   contribution mechanism is the slot registry; the popover's children are a
   hardcoded array. The nearest supported seat is `conversation.input.right`,
   which is where the ring lives.
+
+- **Two ACP servers for DSH already exist, and neither replays.** The
+  first-party `@deepseek-ai/dsh-acp` is stdio-only and documents "no transcript
+  replay"; `dushaobindoudou/dsh-acp` adds HTTP+SSE but buffers frames only
+  before the first attach, so a disconnect loses everything emitted in the gap.
+  ACP will not close that either — the remote-transport RFD is still Active and
+  explicitly does not replay in-flight messages, deferring resumability to v2.
+  See [`dsh-acp-control/DESIGN.md`](plugins/dsh-acp-control/DESIGN.md).
+
+- **This DSH build has no `assistant/chunk` session event.** Its vocabulary is
+  the committed `assistant/message`, plus `tool/call`, `tool/result`,
+  `turn/*`, `step/*`, generated into
+  `@deepseek-ai/dsh-session/lib/types/known-event-types.js`. An adapter written
+  against raw deltas completes a turn with `stopReason: end_turn` and delivers
+  *nothing*, which is indistinguishable from a model that said nothing — so the
+  event vocabulary is worth checking against the installed package rather than
+  against another plugin's source. The live-profile check is what caught it.
 
 ## Licence
 
