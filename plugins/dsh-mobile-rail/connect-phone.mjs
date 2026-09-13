@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process";
 const ADB = process.env.ADB ?? "D:\\Programs\\AndroidSDK\\platform-tools\\adb.exe";
 const PORT = Number(process.env.DSH_CDP_PORT ?? process.env.CDP_PORT ?? 9444);
 const STATUS_ONLY = process.argv.includes("--status");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Run adb, returning stdout whether it succeeded or not. */
 function adb(...args) {
@@ -50,10 +51,15 @@ let serial = attachedSerial();
 if (serial === null && !STATUS_ONLY) {
 	// ADB reconnects to a paired device over mDNS on its own, but not instantly: give it
 	// a few seconds before treating the phone as absent.
+	//
+	// Polling `adb devices` rather than `adb wait-for-device`: the latter never exits
+	// while nothing is connected, so bounding it means killing the process — and
+	// `execFileSync` *throws* when it kills a child on timeout, which crashed this
+	// script the first time the phone happened to be asleep.
 	process.stdout.write("no device yet; waiting for mDNS auto-connect ");
-	for (let i = 0; i < 10 && serial === null; i++) {
+	for (let i = 0; i < 20 && serial === null; i++) {
 		process.stdout.write(".");
-		execFileSync(ADB, ["wait-for-device"], { stdio: "ignore", timeout: 1000, killSignal: "SIGKILL" });
+		await sleep(500);
 		serial = attachedSerial();
 	}
 	console.log("");

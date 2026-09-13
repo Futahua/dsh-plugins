@@ -348,6 +348,46 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * Selector for anything the user can actually press.
+		 *
+		 * A band exists to claim *empty* edge space. When a real control sits in that
+		 * space the control wins — and two do: the right sidebar's toggle lives in the
+		 * top-right corner, and the composer's own buttons sit at the bottom of the same
+		 * edges. Deferring to the app costs one `closest` call at press time and needs no
+		 * list of labels to keep up to date, which is what makes it survive a rename.
+		 */
+		const INTERACTIVE = [
+			"button",
+			"a[href]",
+			"input",
+			"select",
+			"textarea",
+			"summary",
+			"label",
+			'[role="button"]',
+			'[role="link"]',
+			'[role="tab"]',
+			'[role="menuitem"]',
+			'[contenteditable="true"]',
+		].join(",");
+
+		/**
+		 * Is this gesture landing on something the app owns?
+		 *
+		 * Read from the event's own target, which the browser has already hit-tested: the
+		 * glow elements are `pointer-events:none`, so they can never be it.
+		 *
+		 * @param event the gesture.
+		 * @returns whether a control is under it.
+		 */
+		function onControl(event) {
+			const target = event.target;
+			if (target === null || target === undefined) return false;
+			if (typeof target.closest !== "function") return false;
+			return target.closest(INTERACTIVE) !== null;
+		}
+
+		/**
 		 * Should this band respond at all?
 		 *
 		 * Only while its own panel is closed, and never under the keyboard.
@@ -491,7 +531,9 @@ window.__ModuleLoader__.load({
 				if (keyboardCovering()) return;
 				const el = frame();
 
-				// 1. Something is open and this tap is beside it: close it, at once.
+				// 1. Something is open and this tap is beside it: close it, at once. A
+				// control under the tap does not change this — that tap is aimed at the
+				// panel, which floats over whatever sits beneath it.
 				for (const edge of EDGES) {
 					const boundary = openBoundary(edge, el);
 					if (boundary === null || !isOutside(edge, event.clientX, boundary)) continue;
@@ -500,22 +542,29 @@ window.__ModuleLoader__.load({
 					return;
 				}
 
-				// 2. Everything is closed: a press inside a band is a press on a button.
-				for (const edge of EDGES) {
-					if (!bandHit(edge, event.clientX) || !bandLive(edge)) continue;
-					active.set(event.pointerId, {
-						x0: event.clientX,
-						y0: event.clientY,
-						x: event.clientX,
-						y: event.clientY,
-						armed: true,
-					});
-					syncHeld();
-					// Own the press, but do NOT preventDefault: the browser still needs to be
-					// free to decide that this is a scroll, which is what cancels a press that
-					// started on a band and then travelled.
-					event.stopPropagation();
-					return;
+				// 2. Everything is closed: a press inside a band is a press on a button —
+				// unless a real control is under it. The right sidebar's toggle sits in the
+				// top-right corner and the composer's buttons line the bottom of both edges,
+				// and those belong to the app. Such a press is tracked like any other, so it
+				// can still light a band by wandering into one, but starting on a control can
+				// never open a panel.
+				if (!onControl(event)) {
+					for (const edge of EDGES) {
+						if (!bandHit(edge, event.clientX) || !bandLive(edge)) continue;
+						active.set(event.pointerId, {
+							x0: event.clientX,
+							y0: event.clientY,
+							x: event.clientX,
+							y: event.clientY,
+							armed: true,
+						});
+						syncHeld();
+						// Own the press, but do NOT preventDefault: the browser still needs to be
+						// free to decide that this is a scroll, which is what cancels a press that
+						// started on a band and then travelled.
+						event.stopPropagation();
+						return;
+					}
 				}
 
 				// 3. Anywhere else: still tracked, so a finger that wanders into a band
@@ -836,6 +885,40 @@ window.__ModuleLoader__.load({
 			// While the packaged default is being settled (see installFrameWatch) the pane
 			// is hidden, so a phone never flashes a full-screen panel on load.
 			'html[data-dsh-pane-boot] [data-dsh-browser-pane="expanded"]{display:none!important}',
+			// --- the composer's controls, on one row ------------------------------------
+			// Measured at 419px: the controls row is 377px wide and its two groups are
+			// 124 + 281 = 405px plus the gap, so it WRAPS -- the commands/attach/access
+			// group on one line, the model chip and send button on the next.
+			//
+			// The commands button goes first: it duplicates what typing "/" already does,
+			// and it is the widest thing in the left group. That leaves
+			// 84 + 281 = 365px, which fits the 377px row with room to spare.
+			`[data-slot="conversation.composer"] button[aria-label="Commands"]{display:none!important}`,
+			// The row itself, addressed by what it CONTAINS -- a row holding the commands
+			// button two levels down -- rather than by the hashed class name the build
+			// generates or by a position in the tree.
+			`[data-slot="conversation.composer.bar"] div:has(> div > button[aria-label="Commands"]){`,
+			"flex-wrap:nowrap!important;gap:8px!important}",
+			// Nowrap alone would push the send button off the edge the moment the model name
+			// is longer than usual, so one of the two groups has to give — and measured, the
+			// wrong one did: the LEFT group is `flex: 0 1 auto` and shrank from 84px to
+			// 72.7px, so its fixed-size icons spilled out and the access-mode button ended
+			// 3px inside the usage ring — while the right group is `flex: 0 0 auto` and
+			// could not shrink at all.
+			//
+			// So: pin the icons, and let the chip absorb the difference. `min-width:0` is
+			// what lets each link in the chip's chain shrink below its content; without it
+			// the chip keeps its full 163px and nothing moves.
+			`[data-slot="conversation.composer.bar"] div:has(> div > button[aria-label="Commands"]) > *:first-child{flex-shrink:0}`,
+			`[data-slot="conversation.composer.bar"] div:has(> div > button[aria-label="Commands"]) > *:last-child{flex-shrink:1;min-width:0}`,
+			// `!important` is deliberate and load-bearing here: the app marks the trailing
+			// group's children `flex-shrink: 0`, so measured, the group shrank to 269px while
+			// its children kept their sizes and the 12px deficit was paid out of the gap
+			// between the chip and the context ring, which closed to 0. Letting the chip's
+			// container shrink is what actually makes the chip truncate.
+			`[data-slot="conversation.input.model"] > div{flex-shrink:1!important;min-width:0!important;overflow:hidden}`,
+			`[data-slot="conversation.input.model"] button{min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis}`,
+			`[data-slot="conversation.input.model"] button > *{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}`,
 			"}",
 			// --- the keyboard, on the platforms that do not make room for it ------------
 			// Deliberately NOT inside the media query above: this is the iPad's problem,
@@ -885,7 +968,7 @@ window.__ModuleLoader__.load({
 		 * swap; a version on the window makes "is the new bundle running?" a measurement
 		 * instead of an assumption.
 		 */
-		const VERSION = 11;
+		const VERSION = 17;
 
 		const inject = [];
 
@@ -904,6 +987,25 @@ window.__ModuleLoader__.load({
 					get keyboardPinned() {
 						return document.documentElement.hasAttribute(KEYBOARD_FLAG);
 					},
+					/**
+					 * Why the bands are standing down, if they are.
+					 *
+					 * A band that ignores a tap has several possible reasons and no visible
+					 * symptom; read this rather than guessing which one it is.
+					 */
+					get gates() {
+						return {
+							typing: isTyping(),
+							keyboardUp: keyboardUp(),
+							covering: keyboardCovering(),
+							baseline: viewportBaseline,
+							innerHeight: window.innerHeight,
+							visualHeight: window.visualViewport ? Math.round(window.visualViewport.height) : null,
+							narrow: isNarrow(),
+							sidebarCollapsed: SIDEBAR.closed(frame()),
+							paneCollapsed: PANE.closed(frame()),
+						};
+					},
 				};
 			}
 			ctx.effect(() => installFrameWatch(), "dsh-mobile-rail: frame watch");
@@ -919,3 +1021,8 @@ window.__ModuleLoader__.load({
 		return module.exports;
 	},
 });
+
+
+
+
+

@@ -220,7 +220,7 @@ exported.apply({ effect: (fn, label) => effects.push({ fn, label }) });
 check("registers all three effects", effects.length === 3, String(effects.length));
 check("labels every effect", effects.every((e) => typeof e.label === "string"));
 check("publishes a build marker with both edges",
-	globalThis.window.__dshMobileRail?.version === 11 &&
+	globalThis.window.__dshMobileRail?.version === 17 &&
 		JSON.stringify(globalThis.window.__dshMobileRail?.edges) === '["left","right"]',
 	JSON.stringify({ version: globalThis.window.__dshMobileRail?.version, edges: globalThis.window.__dshMobileRail?.edges }));
 
@@ -238,6 +238,47 @@ check("avoids display:none for the sidebar (it collapsed the centre)", !css.incl
 check("blanks the squeezed centre column", css.includes(":not([data-sidebar-collapsed]) > :nth-child(2) > *"));
 check("the blanking rule paints no colour of its own (the app's background shows)",
 	css.includes("> :nth-child(2) > *{visibility:hidden!important}"), "rule text carries no background");
+
+console.log("the composer's controls on a phone:");
+// Measured on the phone before this was written: the row carried a "+" that opens a
+// Commands menu, and the model chip could not shrink, so a long name pushed the row
+// past the composer's own edge.
+check("hides the Commands (+) button", css.includes('button[aria-label="Commands"]{display:none!important}'));
+check("forces the control row onto one line",
+	css.includes('[data-slot="conversation.composer.bar"] div:has(> div > button[aria-label="Commands"]){flex-wrap:nowrap!important'),
+	"`:has()` is what names the row without a hashed class");
+check("lets the model chip shrink instead of overflowing",
+	css.includes('[data-slot="conversation.input.model"] > div{flex-shrink:1!important;min-width:0!important;overflow:hidden}'),
+	"the row is justify-content:space-between, so min-width alone did nothing");
+check("and truncates a long model name rather than pushing the row",
+	css.includes('[data-slot="conversation.input.model"] button{min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis}'));
+check("all of it only under the mobile breakpoint", (() => {
+	// Brace-depth walk rather than "the next `}`": the first closing brace after the
+	// media query opens belongs to the first nested rule, not to the block.
+	const rule = css.indexOf('button[aria-label="Commands"]{display:none');
+	if (rule === -1) return false;
+	let depth = 0;
+	let media = -1;
+	for (let i = 0; i < rule; i++) {
+		if (css[i] === "{") depth++;
+		else if (css[i] === "}") depth--;
+		else if (depth === 0 && css.startsWith("@media (max-width: 768px)", i)) media = depth;
+	}
+	return media === 0 && depth === 1;
+})(), "inside the same media block as the rest of the phone rules");
+
+console.log("the gates, as a reading rather than a guess:");
+// Every way a band can refuse a tap is invisible from the outside; this exposes them
+// together, which is what made the last device failure diagnosable at all.
+const gates = globalThis.window.__dshMobileRail?.gates;
+check("exposes a gates getter", gates !== undefined && gates !== null);
+check("reports the typing predicate", gates?.typing === false, "nothing focused in this stub");
+check("reports the keyboard predicate", typeof gates?.keyboardUp === "boolean");
+check("reports the combined verdict", gates?.covering === false);
+check("reports the remembered baseline", typeof gates?.baseline === "number");
+check("reports both viewport heights", typeof gates?.innerHeight === "number" && typeof gates?.visualHeight === "number");
+check("reports the width gate", gates?.narrow === true);
+check("reports both panels' state", gates?.sidebarCollapsed === true && gates?.paneCollapsed === true);
 
 console.log("the browser pane's phone-killers, neutralised:");
 check("body can no longer reserve the pane's width", css.includes("body{margin-right:0!important}"));
@@ -571,6 +612,49 @@ check("and a focused checkbox does not pin it either", root.hasAttribute("data-d
 documentStub.activeElement = null;
 viewport.height = 1024;
 
+console.log("a real control in the band wins:");
+/**
+ * A target that is, or sits inside, a control.
+ *
+ * The top-right icon is a `<button>` wrapping an `<svg>`/`<path>`, so the event target
+ * is the inner element and only `closest` finds the control — exactly the case that
+ * must not be stolen by a band.
+ */
+const insideControl = (selector) => ({
+	tagName: "path",
+	closest: (s) => (s.includes(selector) ? { tagName: "BUTTON" } : null),
+});
+frameOpen = false;
+paneOpen = false;
+activations = 0;
+const iconTap = dispatch("pointerdown", { clientX: RIGHT, clientY: 12, pointerId: 1, target: insideControl("button") });
+check("the tap is left to the app, not swallowed",
+	iconTap.propagationStopped === false && iconTap.defaultPrevented === false);
+check("the right band does not highlight over the icon", heldOn(PANE) === false);
+release(RIGHT, 12);
+check("and tapping the top-right icon does not open the pane", paneOpen === false && activations === 0);
+
+activations = 0;
+dispatch("pointerdown", { clientX: 10, clientY: 700, pointerId: 1, target: insideControl('[role="button"]') });
+release(10, 700);
+check("a control at the bottom of the left band is left alone too",
+	frameOpen === false && activations === 0 && heldOn(EDGE) === false);
+
+// Empty edge space still belongs to the band.
+activations = 0;
+dispatch("pointerdown", { clientX: RIGHT, clientY: 12, pointerId: 1, target: { tagName: "DIV", closest: () => null } });
+check("empty edge space still highlights", heldOn(PANE) === true);
+release(RIGHT, 12);
+check("and still opens the pane", paneOpen === true && activations === 1);
+press(5, 400);
+check("closed again", paneOpen === false);
+
+// Dismissing an open panel by tapping beside it is a different path and deliberately
+// unchanged: that tap is aimed at the panel, not at a band, so it still closes.
+frameOpen = true;
+dispatch("pointerdown", { clientX: 300, clientY: 400, pointerId: 1, target: insideControl("button") });
+check("a tap beside an open panel still closes it, even over a control", frameOpen === false);
+
 console.log("unloading:");
 for (const dispose of disposers) if (typeof dispose === "function") dispose();
 check("leaves no glow behind on unload", body.filter((el) => el.className === "dsh-mobile-glow").length === 0);
@@ -582,4 +666,5 @@ await sleep(50);
 console.log("");
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
 process.exitCode = failures === 0 ? 0 : 1;
+
 

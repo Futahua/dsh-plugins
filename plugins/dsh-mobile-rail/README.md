@@ -58,9 +58,32 @@ Both edges get the same treatment, and both are driven entirely from this plugin
 | 8 | Right-edge tap opens the pane, sliding in from the right | capture `pointerdown`, `clientX >= innerWidth - 24` |
 | 9 | Tap beside the open pane closes it | `clientX <` the panel's left edge |
 | 10 | Settle the pane's packaged expanded default once, without a flash | `html[data-dsh-pane-boot]` + the pane's own toggle |
-| 11 | Stand down entirely while a text field has focus | `document.activeElement` is an editable field |
+| 11 | Stand down entirely under the keyboard | a text field is focused *and* the viewport is keyboard-sized |
 | 12 | Pin the shell above the on-screen keyboard | `html[data-dsh-keyboard] #root` + `--dsh-keyboard-height` |
 | 13 | Follow Safari's own panning | `--dsh-keyboard-top` from `visualViewport.offsetTop` |
+| 14 | A real control in a band wins over the band | `closest("button, a[href], input, [role=button], …")` at press time |
+| 15 | Put every composer control on one row | `[data-slot="conversation.composer.bar"] div:has(> div > button[aria-label="Commands"])` |
+
+**The composer's controls, on one row.** Measured at 419px before this was written: the
+commands (`+`) button, the attachment button, the access-mode chip, the usage ring, the
+model chip and the send button came to more than the 377px row and wrapped onto two
+lines. The `+` duplicates what typing `/` already does and is the widest thing in the
+left group, so it is hidden; the rest are held on one line with `flex-wrap:nowrap`, and
+the model chip is the one thing allowed to shrink (`flex-shrink:1!important` on the group
+the app marks `flex: 0 0 auto`, plus `min-width:0` down the chain), truncating with an
+ellipsis rather than pushing the send button off the edge. Measured after: six controls
+on one line, worst overlap 0px, smallest gap 8px, rightmost edge 385px of 409px.
+
+**A band claims empty space only.** The right sidebar's toggle lives in the top-right
+corner and the composer's own buttons line the bottom of both edges, all of them inside
+a band — so a press whose target (or whose target's ancestor) is a control is left to
+the app. It is still tracked, so a finger wandering from there into a band lights the
+band up, but a press that *starts* on a control can never open a panel. Deferring to the
+app costs one `closest` call and needs no list of labels to keep up to date, which is
+what makes it survive a rename.
+
+Dismissing an open panel by tapping beside it is deliberately unchanged: that tap is
+aimed at the panel, which floats over whatever sits beneath it.
 
 Both bands behave like buttons: the band **highlights** while a finger is on it (even
 a thumb brushing past), the **click flashes** it, and only a **tap** opens anything —
@@ -248,13 +271,34 @@ keyboard — the rail hidden at 419px wide, the drawer and the pane caught mid-s
 the pane never wider than the screen and never reserving space, everything restored
 when a tap lands beside it, a focused composer with no keyboard leaving the bands
 working, a focused composer *under* a keyboard standing them down (and the tap
-dismissing the field rather than being swallowed), the 1280px layout untouched, and
-the corner-tap regression below.
+dismissing the field rather than being swallowed), the composer's controls held on one
+row with nothing overlapping and nothing past the composer's own edge, the 1280px layout
+untouched, and the corner-tap regression below.
 
 `lib/client.js` hot-reloads in the browser; no server restart. The live bundle
 publishes `window.__dshMobileRail.version`, so "is the new build running?" is a
 measurement rather than an assumption — a screenshot once predated an HMR swap and
 made a working fix look broken.
+
+`window.__dshMobileRail.gates` answers the other half of that question: **why** a band
+ignored a tap. A band stands down for several unrelated reasons and every one of them
+looks identical from the outside, so this reads them together:
+
+```js
+window.__dshMobileRail.gates
+// {typing:true, keyboardUp:false, covering:false, baseline:747, innerHeight:747,
+//  visualHeight:747, narrow:true, sidebarCollapsed:true, paneCollapsed:true}
+```
+
+`covering` is the one that decides a band's fate (`typing && keyboardUp`). Run that on
+the phone before believing any theory about a tap that did nothing.
+
+`verify-phone.mjs` also records a gesture timeline in the page while it runs
+(`window.__trace`: every `pointerdown`/`pointerup`/`click` with a timestamp, plus the
+drawer's state polled every 50ms) and prints it when anything fails. A CDP tap settles
+before the app re-renders, so reading state straight afterwards races it; the trace is
+what tells a state change nobody asked for from one the tap caused. A frame the app
+replaced shows up in it as `REPLACED`.
 
 ## Tuning
 

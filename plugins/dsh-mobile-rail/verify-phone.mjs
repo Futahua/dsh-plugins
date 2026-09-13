@@ -66,6 +66,38 @@ try {
 		{ label: "the sidebar toggle to exist" },
 	);
 
+	// A tap's own timeline, recorded in the page from the moment the run starts.
+	//
+	// Reading state after a CDP tap races the app's re-render, and a MutationObserver is
+	// bound to one element -- which is exactly the thing in question. So the drawer is
+	// *polled* every 50ms and every pointer/click is logged with a timestamp: a state
+	// change nobody asked for can then be told from one this plugin made, and a replaced
+	// frame shows up as `REPLACED` rather than as silence.
+	await page.ev(`(function(){
+    window.__trace = [];
+    var t = function(){ return Math.round(performance.now()); };
+    var first = document.querySelector('.dsh-mobile-rail-frame');
+    first.__probe = 'first';
+    var last = null;
+    setInterval(function(){
+      var f = document.querySelector('.dsh-mobile-rail-frame');
+      var v = f
+        ? (f.hasAttribute('data-sidebar-collapsed') ? 'closed' : 'OPEN') + ' w' +
+          Math.round(f.children[0].getBoundingClientRect().width) + ' ' + (f.__probe || 'REPLACED')
+        : 'no frame';
+      if (v !== last) { window.__trace.push({t: t(), k: 'state', v: v}); last = v; }
+    }, 50);
+    var rec = function(e){
+      var el=e.target;
+      window.__trace.push({t:t(), k:e.type, x:Math.round(e.clientX||0), y:Math.round(e.clientY||0),
+        tag:el?el.tagName:'?', cls:el?String(el.className).slice(0,24):''});
+    };
+    window.addEventListener('pointerdown', rec, true);
+    window.addEventListener('pointerup', rec, true);
+    window.addEventListener('click', rec, true);
+    return true;
+  })()`);
+
 	/**
 	 * Does the app have a conversation on screen?
 	 *
@@ -81,6 +113,19 @@ try {
 	};
 
 	const state = async () => await page.json(STATE_EXPR);
+	/**
+	 * Make sure the bands are live before tapping one.
+	 *
+	 * The phone is in someone's hand, and the app focuses the composer as soon as a
+	 * session loads — so a run can catch the keyboard up, in which case the bands
+	 * *deliberately* stand down and a tap test would measure that instead of the band.
+	 * Measured happening: section 4b failed twice with nothing wrong, because the
+	 * keyboard was up at the time. Blur whatever holds focus first.
+	 */
+	const clearFocus = async () => {
+		await page.ev(`(function(){ var a=document.activeElement; if(a && a.blur) a.blur(); return a?a.tagName:null; })()`);
+		await sleep(300);
+	};
 	/** Are the centre column's own children painted? */
 	const centrePainted = async () =>
 		await page.ev(`(function(){
@@ -101,6 +146,7 @@ try {
 	check("centre content is painted", (await centrePainted()) === "visible");
 
 	console.log("\n2. real touch tap on the left edge (10,400):");
+	await clearFocus();
 	await page.tap(10, 400);
 	s = await state();
 	check("sidebar opened", s.collapsed === false, JSON.stringify(s));
@@ -261,6 +307,14 @@ try {
 	await page.tap(350, 400);
 
 	console.log("\n3. real touch tap on the blank strip (350,400):");
+	await clearFocus();
+	// Start from a drawer that is definitely open. This section used to end the previous
+	// one with a tap at the same spot and then tap again, so a run that arrived here
+	// already closed blamed this tap for a state it never changed -- observed once, with
+	// every event of the tap accounted for and nothing moved. Opening it here first makes
+	// the check say what it means: the drawer was open, this tap shut it.
+	if ((await state()).collapsed === true) await page.tap(10, 400);
+	check("starting from an open drawer", (await state()).collapsed === false);
 	await page.tap(350, 400);
 	s = await state();
 	check("sidebar collapsed again", s.collapsed === true, JSON.stringify(s));
@@ -269,6 +323,7 @@ try {
 	await skippable("centre content painted again", (await centrePainted()) === "visible");
 
 	console.log("\n4. the edge tap works repeatedly:");
+	await clearFocus();
 	await page.tap(10, 400);
 	s = await state();
 	check("opened a second time", s.collapsed === false, JSON.stringify(s));
@@ -281,6 +336,7 @@ try {
 	// compatibility click used to swallow the toggle's own activation whenever the
 	// tap was in the top-left corner.
 	console.log("\n4b. the top-left corner still opens it (regression):");
+	await clearFocus();
 	await page.tap(8, 8);
 	s = await state();
 	check("corner tap opened the drawer", s.collapsed === false, JSON.stringify(s));
@@ -400,6 +456,69 @@ try {
 	check("the rail is hidden again, not left as a strip", ps.railDisplay === "none");
 	check("and nothing was left reserved on the body", ps.marginComputed === "0px", `computed ${ps.marginComputed}, inline ${ps.margin}`);
 
+	console.log("\n7c. the top-right corner belongs to the app, not the band:");
+	/**
+	 * The control nearest the right edge in the app's top bar — deliberately not a
+	 * hardcoded coordinate: measured, `(vw-12, 14)` is a control only while the right
+	 * panel has something to show, and a plain div otherwise.
+	 */
+	const cornerProbe = async (register) => await page.json(`(function(){
+    var vw=window.innerWidth;
+    var best=null;
+    var bs=document.querySelectorAll('button[aria-label], a[href], [role="button"][aria-label]');
+    for(var i=0;i<bs.length;i++){
+      var b=bs[i], r=b.getBoundingClientRect();
+      if(r.width===0||r.height===0) continue;
+      // On screen, in the top bar. Without the on-screen test this picked a control at
+      // x=803 on a 418px viewport -- left over from the desktop metrics override -- and
+      // then "tapped" 400px past the right edge.
+      if(r.left<0||r.right>vw||r.top<0||r.bottom>160) continue;
+      var d=Math.round(vw-r.right);
+      if(best===null||d<best.d) best={d:d,label:(b.getAttribute('aria-label')||'').slice(0,34),
+        x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height),el:b};
+    }
+    if(best===null) return {found:false};
+    if(${register ? "true" : "false"}){
+      window.__cornerClicks=0;
+      best.el.addEventListener('click',function(){window.__cornerClicks++;},true);
+    }
+    return {found:true,label:best.label,x:best.x,y:best.y,w:best.w,h:best.h,
+      distanceFromRight:best.d,insideBand:(best.x+best.w)>vw-24};
+  })()`);
+	const corner = await cornerProbe(true);
+	if (corner.found === false) {
+		console.log("  skip  no control in the top bar in this state");
+	} else {
+		console.log(`   nearest top-bar control: "${corner.label}" at (${corner.x},${corner.y}) ` +
+			`${corner.w}x${corner.h}, ${corner.distanceFromRight}px from the edge, inside the band: ${corner.insideBand}`);
+		await clearFocus();
+		await page.tap(Math.round(corner.x + corner.w / 2), Math.round(corner.y + corner.h / 2));
+		check("tapping a top-bar control does not open the pane", (await paneState()).panel === false);
+		const cornerClicks = await page.ev("window.__cornerClicks");
+		check("and the control received the click instead", cornerClicks >= 1, `clicks ${cornerClicks}`);
+
+		// That click did what it says on the tin — it opened the right sidebar — so put
+		// the state back before measuring anything else, and say so, because a later
+		// failure otherwise looks like a band bug rather than a state change.
+		const afterCorner = await cornerProbe(false);
+		if (afterCorner.found === true && afterCorner.label.startsWith("Collapse")) {
+			console.log(`   (the click opened the right sidebar; closing it again)`);
+			await clearFocus();
+			await page.tap(Math.round(afterCorner.x + afterCorner.w / 2), Math.round(afterCorner.y + afterCorner.h / 2));
+			await sleep(500);
+		}
+	}
+
+	// Empty edge space below it must still open the pane.
+	await clearFocus();
+	await page.tap(ps.vw - 12, 400);
+	const openedByBand = await paneState();
+	check("empty edge space still opens the pane", openedByBand.panel === true, JSON.stringify(openedByBand));
+	if (openedByBand.panel === true) {
+		await page.tap(Math.max(6, openedByBand.panelLeft - 60), 400);
+		check("and tapping beside it closes it again", (await paneState()).panel === false);
+	}
+
 	console.log("\n8. typing on a real device");
 	/** What the app thinks is focused, and what the viewport looks like. */
 	const typingState = async () => await page.json(`(function(){
@@ -433,11 +552,25 @@ try {
 	await sleep(400);
 	await focusComposer();
 	const focusedFull = await typingState();
+	// Everything that could decide the tap's fate, read before it lands: a panel left
+	// open by an earlier section makes this tap a *dismiss* rather than an open, which
+	// looks identical to a blocked band in the result.
+	const preTap = await page.json(`(function(){
+    var f=document.querySelector('.dsh-mobile-rail-frame');
+    var el=document.elementFromPoint(10,400);
+    return {
+      collapsed: f.hasAttribute('data-sidebar-collapsed'),
+      pane: !!document.querySelector('[data-dsh-browser-pane="expanded"]'),
+      under: el?el.tagName:'none',
+      control: !!(el&&el.closest&&el.closest('button,a[href],input,select,textarea,summary,label,[role="button"],[role="link"],[role="tab"],[role="menuitem"],[contenteditable="true"]')),
+      gates: window.__dshMobileRail.gates
+    };
+  })()`);
 	await page.tap(10, 400);
 	ts = await typingState();
 	check("a focused composer with no keyboard does NOT block the bands",
 		focusedFull.vvHeight === focusedFull.innerHeight && ts.collapsed === false,
-		`viewport ${focusedFull.innerHeight}/${focusedFull.vvHeight} -> collapsed ${ts.collapsed}`);
+		`viewport ${focusedFull.innerHeight}/${focusedFull.vvHeight} -> collapsed ${ts.collapsed}; before ${JSON.stringify(preTap)}`);
 	await page.tap(350, 400);
 
 	// Case 2: focused AND the keyboard up. A shorter window is a faithful simulation:
@@ -471,7 +604,57 @@ try {
 	await page.call("Emulation.clearDeviceMetricsOverride", {});
 	await sleep(400);
 
+	console.log("\n9. the composer's controls on a phone");
+	/** The composer's controls, where they sit, and whether the commands button is gone. */
+	const composer = async () => await page.json(`(function(){
+    var root=document.querySelector('[data-slot="conversation.composer"]');
+    var cmd=root.querySelector('button[aria-label="Commands"]');
+    var out={commandsDisplay:cmd?getComputedStyle(cmd).display:null, controls:[],
+      containerRight:Math.round(document.querySelector('[data-slot="conversation.composer.bar"] > div').getBoundingClientRect().right)};
+    var bs=root.querySelectorAll('button');
+    for(var i=0;i<bs.length;i++){
+      var b=bs[i], r=b.getBoundingClientRect();
+      if(r.width===0||r.height===0) continue;
+      out.controls.push({label:(b.getAttribute('aria-label')||'').slice(0,26),
+        x:Math.round(r.x), w:Math.round(r.width), y:Math.round(r.y), h:Math.round(r.height)});
+    }
+    return out;
+  })()`);
+	let c = await composer();
+	check("the commands (+) button is hidden on a phone", c.commandsDisplay === "none", String(c.commandsDisplay));
+
+	// Controls on one visual row have different `y` TOPS — they are vertically centred and
+	// have different heights (28, 20, 34) — so a row is a band of centres, not an equal y.
+	const centre = (k) => Math.round((k.y + k.h / 2) / 8) * 8;
+	const modelControl = c.controls.find((k) => k.label.startsWith("Select model")) ?? null;
+	check("the model chip is present", modelControl !== null, JSON.stringify(c.controls.map((k) => k.label)));
+	const inputRow = c.controls.filter((k) => centre(k) === centre(modelControl)).sort((a, b) => a.x - b.x);
+	check("every composer control sits on ONE row", inputRow.length >= 5,
+		`${inputRow.length} controls at centre y=${centre(modelControl)}: ${inputRow.map((k) => k.label || "(usage ring)").join(", ")}`);
+	const otherRows = [...new Set(c.controls.filter((k) => centre(k) !== centre(modelControl)).map(centre))];
+	check("and nothing control-like was left on another control row",
+		otherRows.every((y) => Math.abs(y - centre(modelControl)) > 20), `other rows: ${otherRows.join(", ")}`);
+
+	let worstOverlap = 0;
+	let smallestGap = Infinity;
+	for (let i = 1; i < inputRow.length; i++) {
+		const gap = inputRow[i].x - (inputRow[i - 1].x + inputRow[i - 1].w);
+		if (gap < smallestGap) smallestGap = gap;
+		if (-gap > worstOverlap) worstOverlap = -gap;
+	}
+	check("no control overlaps another", worstOverlap === 0, `worst overlap ${worstOverlap}px`);
+	check("and the gaps between them are even enough to read", smallestGap >= 6, `smallest gap ${smallestGap}px`);
+	const rightmost = Math.max(...inputRow.map((k) => k.x + k.w));
+	check("the row still ends inside the composer", rightmost <= c.containerRight, `edge ${rightmost} vs ${c.containerRight}`);
+	console.log("   shot: " + (await page.shot(`${SHOTS}/composer-row.png`)));
+
 	console.log("");
+	if (failures > 0) {
+		// Only on failure, and only the drawer's own timeline: a bare "the drawer was
+		// open" says nothing about which event opened it.
+		console.log("gesture trace:");
+		console.log("  " + JSON.stringify(await page.json("window.__trace"), null, 0));
+	}
 	console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
 } finally {
 	await closeTab(PORT, created.id);
@@ -479,6 +662,7 @@ try {
 	page?.close();
 }
 process.exitCode = failures === 0 ? 0 : 1;
+
 
 
 
