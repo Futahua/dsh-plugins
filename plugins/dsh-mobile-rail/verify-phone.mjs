@@ -626,27 +626,73 @@ try {
 	// Controls on one visual row have different `y` TOPS — they are vertically centred and
 	// have different heights (28, 20, 34) — so a row is a band of centres, not an equal y.
 	const centre = (k) => Math.round((k.y + k.h / 2) / 8) * 8;
+	/** The control row, and the two ways it can go wrong: overlap, or running off the end. */
+	const rowOf = (reading) => {
+		const model = reading.controls.find((k) => k.label.startsWith("Select model")) ?? null;
+		if (model === null) return null;
+		const at = centre(model);
+		const row = reading.controls.filter((k) => centre(k) === at).sort((a, b) => a.x - b.x);
+		let overlap = 0;
+		let gap = Infinity;
+		for (let i = 1; i < row.length; i++) {
+			const space = row[i].x - (row[i - 1].x + row[i - 1].w);
+			if (space < gap) gap = space;
+			if (-space > overlap) overlap = -space;
+		}
+		return {
+			model,
+			at,
+			row,
+			overlap,
+			gap,
+			rightmost: Math.max(...row.map((k) => k.x + k.w)),
+			others: [...new Set(reading.controls.filter((k) => centre(k) !== at).map(centre))],
+		};
+	};
+
 	const modelControl = c.controls.find((k) => k.label.startsWith("Select model")) ?? null;
 	check("the model chip is present", modelControl !== null, JSON.stringify(c.controls.map((k) => k.label)));
-	const inputRow = c.controls.filter((k) => centre(k) === centre(modelControl)).sort((a, b) => a.x - b.x);
-	check("every composer control sits on ONE row", inputRow.length >= 5,
-		`${inputRow.length} controls at centre y=${centre(modelControl)}: ${inputRow.map((k) => k.label || "(usage ring)").join(", ")}`);
-	const otherRows = [...new Set(c.controls.filter((k) => centre(k) !== centre(modelControl)).map(centre))];
+	const native = rowOf(c);
+	check("every composer control sits on ONE row", native.row.length >= 5,
+		`${native.row.length} controls at centre y=${native.at}: ${native.row.map((k) => k.label || "(usage ring)").join(", ")}`);
 	check("and nothing control-like was left on another control row",
-		otherRows.every((y) => Math.abs(y - centre(modelControl)) > 20), `other rows: ${otherRows.join(", ")}`);
-
-	let worstOverlap = 0;
-	let smallestGap = Infinity;
-	for (let i = 1; i < inputRow.length; i++) {
-		const gap = inputRow[i].x - (inputRow[i - 1].x + inputRow[i - 1].w);
-		if (gap < smallestGap) smallestGap = gap;
-		if (-gap > worstOverlap) worstOverlap = -gap;
-	}
-	check("no control overlaps another", worstOverlap === 0, `worst overlap ${worstOverlap}px`);
-	check("and the gaps between them are even enough to read", smallestGap >= 6, `smallest gap ${smallestGap}px`);
-	const rightmost = Math.max(...inputRow.map((k) => k.x + k.w));
-	check("the row still ends inside the composer", rightmost <= c.containerRight, `edge ${rightmost} vs ${c.containerRight}`);
+		native.others.every((y) => Math.abs(y - native.at) > 20), `other rows: ${native.others.join(", ")}`);
+	check("no control overlaps another", native.overlap === 0, `worst overlap ${native.overlap}px`);
+	check("and the gaps between them are even enough to read", native.gap >= 6, `smallest gap ${native.gap}px`);
+	check("the row still ends inside the composer", native.rightmost <= c.containerRight,
+		`edge ${native.rightmost} vs ${c.containerRight}`);
 	console.log("   shot: " + (await page.shot(`${SHOTS}/composer-row.png`)));
+
+	// The same row on a narrower phone. This is the stress the flex chain exists for: a
+	// 360px screen leaves the row 318px, so something has to give, and the only thing
+	// allowed to is the model chip. Measured at 419px the chip truncates 163px -> 151px;
+	// the failure this guards against is the other group shrinking instead, which spills
+	// the fixed-size icons and overlaps them.
+	//
+	// What is asserted is only what the plugin promises -- nothing overlaps, nothing runs
+	// past the composer, and the chip is the thing that gave. Which controls the app itself
+	// chooses to show at 360px is the app's business, so the count is reported, not
+	// required to match.
+	await page.call("Emulation.setDeviceMetricsOverride", {
+		width: 360, height: 747, deviceScaleFactor: 1.71875, mobile: true,
+	});
+	await sleep(700);
+	const narrowReading = await composer();
+	const narrow = rowOf(narrowReading);
+	check("on a 360px screen the commands button is still hidden", narrowReading.commandsDisplay === "none");
+	check("the model chip is still there to take the squeeze", narrow !== null, "no chip found");
+	if (narrow !== null) {
+		check("nothing overlaps on a 360px screen", narrow.overlap === 0,
+			`worst overlap ${narrow.overlap}px, gap ${narrow.gap}px, ${narrow.row.length} controls: ` +
+				narrow.row.map((k) => `${k.label || "(ring)"} ${k.w}px`).join(", "));
+		check("and nothing runs past the composer", narrow.rightmost <= narrowReading.containerRight,
+			`edge ${narrow.rightmost} vs ${narrowReading.containerRight}`);
+		check("the chip is what gave, not the icons",
+			narrow.model.w <= native.model.w,
+			`chip ${native.model.w}px at 419 -> ${narrow.model.w}px at 360`);
+	}
+	await page.call("Emulation.clearDeviceMetricsOverride", {});
+	await sleep(400);
 
 	console.log("");
 	if (failures > 0) {

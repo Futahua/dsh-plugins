@@ -277,8 +277,9 @@ the pane never wider than the screen and never reserving space, everything resto
 when a tap lands beside it, a focused composer with no keyboard leaving the bands
 working, a focused composer *under* a keyboard standing them down (and the tap
 dismissing the field rather than being swallowed), the composer's controls held on one
-row with nothing overlapping and nothing past the composer's own edge, the 1280px layout
-untouched, and the corner-tap regression below.
+row with nothing overlapping and nothing past the composer's own edge — then the same row
+re-measured on a 360px screen, where the model chip is the only thing allowed to give —
+the 1280px layout untouched, and the corner-tap regression below.
 
 `lib/client.js` hot-reloads in the browser; no server restart. The live bundle
 publishes `window.__dshMobileRail.version`, so "is the new build running?" is a
