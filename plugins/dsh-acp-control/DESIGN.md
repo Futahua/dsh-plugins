@@ -708,11 +708,12 @@ a transcript, and each one found at least one real bug.
 
 | Check | What it drives | Result |
 | --- | --- | --- |
-| `verify/core-checks.mjs` | the scenario below plus the durability/rollback section, over the real `serveStdio` on in-process pipes | **76/76** |
+| `verify/core-checks.mjs` | the scenario below plus the durability/rollback section and the ordering section, over the real `serveStdio` on in-process pipes | **79/79** |
 | `verify/stdio-client.mjs` | the same scenario, over a real child process's OS pipes (the durability section needs the plane object, so it runs only in-process) | **65/65** |
 | `verify/http-client.mjs` | the loopback HTTP+SSE transport from real `fetch` calls on a real socket | **33/33** |
 | `verify/attach-check.mjs` | attachment against a fixture that owns an agent the way the GUI does | **19/19** |
-| `verify/plugin-boot.mjs` | the plugin mounted in a live DSH profile, `dsh` backend, a real agent turn | **12/12**, last measured before this round; not re-run, because the `acpctl` profile would not boot here and the web gate covers the same backend in a stronger composition |
+| `verify/plugin-boot.mjs` | the plugin mounted in a live DSH profile, `dsh` backend, a real agent turn | **12/12**, last measured before this round; see the note below |
+| `verify/web-gate.mjs` | attachment **inside the real web composition**, driven from both ends | **35/36 — see the open defect below** |
 | `verify/web-gate.mjs` | attachment **inside the real web composition**, driven from both ends | **21/22 — see the open defect below** |
 
 **The client is the reference implementation, not this plugin's own code.** The
@@ -801,6 +802,18 @@ through a stand-in.
 | 3 | A permission is raised by a real write outside the session workspace and, during an ACP turn, is routed to the ACP client, whose answer settles the turn. During the **human's** turn the same probe is invisible to ACP: it is not routed, and the host answers its own. |
 | 4 | The human cancels an ACP turn through the real controller, and the ACP request settles as `cancelled` — not `end_turn`. |
 | 5 | ACP attempts to cancel the human's turn and cannot: the turn is still `generating` afterwards, the refusal is **reported** even though `session/cancel` is a notification with no response channel, and a prompt attempted during that turn is refused by name with the state, the allowed set, and a hint. |
+| 6 | **A queued human turn takes over with no idle gap.** An ACP turn runs, the human queues a long turn behind it through `sessionController.prompt(mode: "queue")`, and DSH starts the human's turn the moment ours ends — `while (await this.turn()) {}`. The session must still read `generating`, a second ACP prompt must be **refused** rather than queued behind the human, an ACP cancel must not stop it, and the human's turn must complete. |
+| 7 | **Closing during an ACP-authored turn.** `session/close` is refused, naming the reason and the way out, the session is not closed, and the in-flight request still settles — as `cancelled` — rather than hanging with nothing left to observe its turn end. A close that is not contending still works. |
+
+**How the gate decides a session is at rest matters**, and it is worth stating
+because the first version got it wrong: it waits on `_dsh/session/state`
+directly, not on a scan for an `idle` transition in the stream. DSH ends one
+queued turn and starts the next in the same breath, so a momentary `idle` sits
+in the event stream that no longer describes the session by the time it is read.
+A check that waits for "an `idle` after index N" therefore returns while the
+session is working, and everything after it races. The transition scan is kept
+only where the transition *is* the assertion — that the ACP client was *told* the
+turn ended.
 
 **The honest boundary of that evidence**, stated in the gate's own header and
 worth repeating: the browser's wire protocol (typert remote over the web server)
@@ -836,12 +849,48 @@ composition, after every fixture-based check passed.
 ### What the checks found
 
 Recorded because the point of a check is the bugs it catches, not the green
-ticks. The last three came from this round.
+ticks.
 
+- **Two state machines, and the cruder one won.** `server.js` ran a second,
+  coarser lifecycle beside the registry's turn-aware one: when an ACP prompt
+  returned, its settlement cleared `generating` without checking that the
+  `generating` in front of it was still *its* turn. DSH runs queued turns back
+  to back with no Agent-idle (`while (await this.turn()) {}`), so a human turn
+  queued behind an ACP turn was already running when the settlement landed —
+  and the session was reported idle while it was working, which then let the
+  next ACP prompt past the idle-only admission check and into the queue behind
+  the human's turn. The settlement is now turn-aware: the backend reports which
+  DSH turn it owned, `SessionRegistry#observe` records which turn is running,
+  and the return edge is applied **only** while those are the same turn. When
+  they are not, DSH's own `turn/start` stays the authority — one state machine,
+  rather than two that agree by luck.
+- **Closing during an adopted ACP turn orphaned the request.** `session/close`
+  was admitted from `generating`; it aborted the request and detached the
+  listeners that were the only thing that could ever see that turn's `turn/end`.
+  The quiescence fallback covers a message that was never *claimed*, and this
+  one had been, so nothing was left to settle it: the request waited forever
+  while the view said `closed`. There is no ordering of the teardown that avoids
+  this by itself, so it is fixed twice over — the disposal settles any in-flight
+  request explicitly (`settleOnDispose`), and a close that would contend with an
+  adopted, ACP-authored turn is **refused** with the way out named.
+- **Rename ran the host call before the state check.** `#rename` asked
+  `sessionController.rename` first and entered the state machine second, so a
+  rename arriving in a state that refuses it changed the GUI's title and *then*
+  told the caller it had been refused — refused, but applied, the third outcome
+  this plugin exists to make impossible. The host is now asked *inside* the
+  admitted effect, after the state check; the existing `partially_applied`
+  report still covers the opposite ordering, where the host succeeds and the
+  log write fails. `verify/core-checks.mjs` asserts the order directly, by
+  counting canonical calls during a refused rename: the count must be zero.
+- **A title cache that was never refreshed.** `session/list` preferred this
+  control plane's own copy of a title over the host's, so renaming a session in
+  the GUI left `session/list` showing whatever this plugin last wrote. The
+  host's title now wins on reads, and the cache is updated from every canonical
+  `session/title` event for the window before that read.
 - **A turn aborted by the human was reported to the ACP client as `end_turn`.**
-  The first-party codec maps DSH's `aborted` to `end_turn`, which is right when
-  the only frontend is the caller — an abort there is self-inflicted and already
-  known. Here the abort arrives from the GUI while an ACP client is waiting, and
+  The first-party codec maps DSH's `aborted` there, which is right when the only
+  frontend is the caller — an abort there is self-inflicted and already known.
+  Here the abort arrives from the GUI while an ACP client is waiting, and
   `end_turn` says a turn *finished* when somebody stopped it. `stopReasonForOwned`
   now maps `aborted → cancelled` and `blocked → refusal`, and the gate asserts
   the cancelled case specifically.
@@ -851,16 +900,14 @@ ticks. The last three came from this round.
   from a turn that ran. It now settles as an **error** naming what could not be
   established, because a control plane that cannot prove a turn ran must not
   report that it did.
-- **A gate step disarmed itself with a file write.** The human side reacts only
-  to a *change* in its command file, so two identical `cancel` lines were one
-  cancel: step 4 believed it had cancelled a turn that was never cancelled, and
-  three later checks failed on a session that had simply finished. Commands now
-  carry a sequence number. The lesson generalises — a control channel that
-  deduplicates by value cannot be used to send the same command twice.
-- **Counting state transitions cumulatively is wrong.** "Wait for two `idle`s"
-  is satisfied by the previous two turns, so the next step raced a turn still
-  running. Every wait in the gate is now anchored to an index taken before the
-  turn it waits on.
+- **The gate's own waits were wrong in two ways**, both of which produced
+  failures that looked like product bugs. The human side reacts only to a
+  *change* in its command file, so two identical `cancel` lines were one cancel
+  and a later step believed it had cancelled a turn that had simply finished;
+  commands now carry a sequence number. And "wait for an `idle` after index N"
+  is satisfied by a state the session has already left — DSH passes through
+  `idle` between back-to-back turns — so every wait that means "is at rest" now
+  asks `_dsh/session/state` instead of scanning transitions.
 - **A read outside the workspace raises no approval; a write does.** The
   sandbox knobs are `workspace-write` + `ask`, which confine writes. The
   permission probe was a read and proved nothing while looking like it worked.

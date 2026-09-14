@@ -324,6 +324,14 @@ async function main() {
 		const idleAfter = (from) => until(() => stateChanges.slice(from + 1).some((change) => change.to === "idle"), { timeoutMs: 240_000 });
 		const startAfter = (from) => until(() => stateChanges.slice(from + 1).some((change) => change.to === "generating"), { timeoutMs: 120_000 });
 		const turnsEnded = (reason) => observed(dir).filter((entry) => entry.kind === "human-turn-end" && entry.reason === reason).length;
+		// The *state*, asked for directly, rather than a transition scanned out
+		// of the stream. A transition scan is wrong whenever a state is passed
+		// through: DSH ends one queued turn and starts the next in the same
+		// breath, so a momentary `idle` sits in the stream that no longer
+		// describes the session by the time it is read. Everything below that
+		// has to know whether the session is *actually* at rest asks this.
+		const stateNow = async () => (await request("_dsh/session/state", { sessionId }).catch(() => undefined))?.state;
+		const idleNow = () => until(async () => (await stateNow()) === "idle", { timeoutMs: 240_000, every: 400 });
 
 		console.log("\n--- [1] a human-originated prompt ----------------------------");
 		let at = mark();
@@ -409,7 +417,7 @@ async function main() {
 		const release = async () => {
 			cancelSeq += 1;
 			writeFileSync(join(dir, "command.txt"), `cancel:${cancelSeq}`, "utf8");
-			await idleAfter(at);
+			await idleNow();
 			await delay(400);
 		};
 
@@ -507,7 +515,7 @@ async function main() {
 			cancelled?.value?.stopReason === "cancelled",
 			JSON.stringify(cancelled),
 		);
-		await idleAfter(at);
+		await idleNow();
 		await delay(300);
 
 		console.log("\n--- [5] ACP tries to stop the HUMAN's turn -------------------");
@@ -549,7 +557,7 @@ async function main() {
 			JSON.stringify({ state: refused.data?.state, allowedIn: refused.data?.allowedIn, hint: refused.data?.hint, eventId: refused.data?.eventId }),
 		);
 
-		await idleAfter(at);
+		await idleNow();
 		await delay(500);
 		const completedAfter = turnsEnded("completed");
 		if (completedBefore === 0 && completedAfter === 0) {
@@ -564,6 +572,127 @@ async function main() {
 				`${completedBefore} → ${completedAfter} completed turn(s)`,
 			);
 		}
+
+		console.log("\n--- [6] a queued human turn replaces ours with no idle gap -----");
+		// DSH runs queued turns back to back: `while (await this.turn()) {}`. So
+		// a human turn queued while an ACP turn runs *starts* the moment ours
+		// ends, with no Agent-idle in between. The settlement of our prompt used
+		// to clear `generating` unconditionally on its way out, which cleared
+		// the *human's* turn instead — `_dsh/session/state` then described a
+		// working session as idle, and the next ACP prompt passed the idle-only
+		// admission check and was queued behind the human's turn.
+		check("the session is at rest before this step", (await idleNow()) === true, `state ${await stateNow()}`);
+		const completedBeforeHandoff = turnsEnded("completed");
+		at = mark();
+		const shortTurn = request("session/prompt", { sessionId, prompt: [{ type: "text", text: "Reply with exactly: acp-a" }] }).then(
+			(value) => ({ value }),
+			(error) => ({ error: error.data ?? String(error?.message ?? error) }),
+		);
+		await startAfter(at);
+		// The human queues a long turn behind ours, while ours is still running.
+		const acksBeforeQueue = observed(dir).filter((entry) => entry.kind === "human-prompt-accepted").length;
+		writeFileSync(
+			join(dir, "command.txt"),
+			"prompt:Write a detailed 1200-word essay on the history of the mechanical clock. Do not use any tools.",
+			"utf8",
+		);
+		const queued = await until(
+			() => observed(dir).filter((entry) => entry.kind === "human-prompt-accepted").length > acksBeforeQueue,
+			{ timeoutMs: 60_000 },
+		);
+		check("the human's follow-up was admitted while the ACP turn was still running", queued === true);
+		const firstTurn = await shortTurn;
+		check("the ACP turn it was queued behind completed", typeof firstTurn?.value?.stopReason === "string", JSON.stringify(firstTurn));
+		// The response above is sent only after our settlement block has run, so
+		// the clobber — when it happens — has already happened by now. Polling
+		// rather than sampling once only tolerates the human's turn starting a
+		// moment later; it cannot mask a clobber, because that turn's
+		// `turn/start` has already fired and cannot fire twice.
+		const handedOff = await until(async () => (await stateNow()) === "generating", { timeoutMs: 20_000, every: 300 });
+		check(
+			"the session is still generating, because the turn that is running is the human's",
+			handedOff === true,
+			`state ${await stateNow()}`,
+		);
+		const contending = await request("session/prompt", { sessionId, prompt: [{ type: "text", text: "must not be queued behind the human" }] }).then(
+			() => ({ admitted: true }),
+			(error) => ({ data: error.data, message: String(error?.message ?? error) }),
+		);
+		check(
+			"and a second ACP prompt is refused rather than queued behind the human's turn",
+			contending.admitted !== true && contending.data?.type === "refused" && contending.data?.state === "generating",
+			JSON.stringify(contending),
+		);
+		await post({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
+		await delay(900);
+		check("and an ACP cancel cannot stop the turn it does not own", (await stateNow()) === "generating", `state ${await stateNow()}`);
+		check(
+			"and the human's queued turn then ran to completion",
+			(await until(() => turnsEnded("completed") > completedBeforeHandoff, { timeoutMs: 240_000 })) === true,
+			`${completedBeforeHandoff} → ${turnsEnded("completed")} completed turn(s)`,
+		);
+		check("and the session came back to rest after it", (await idleNow()) === true, `state ${await stateNow()}`);
+
+		console.log("\n--- [7] closing the session during an ACP turn ---------------");
+		// `session/close` used to be admitted from `generating`: it aborted the
+		// request and detached the listeners that were the only thing that could
+		// ever see the turn end. For a session this plugin *adopted*, dispose
+		// correctly leaves the GUI's agent alone — and that is exactly what made
+		// the request unfinishable. It must refuse, or it must settle first.
+		at = mark();
+		const doomed = request("session/prompt", {
+			sessionId,
+			prompt: [{ type: "text", text: "Write a detailed 1200-word essay on the history of papermaking. Do not use any tools." }],
+		}).then(
+			(value) => ({ value }),
+			(error) => ({ error: error.data ?? String(error?.message ?? error) }),
+		);
+		const doomedStarted = await startAfter(at);
+		if (doomedStarted !== true) {
+			cannotProve("closing during an ACP-authored turn is refused", "no ACP-owned turn started, so there was nothing to contend with");
+		} else {
+			await delay(600);
+			check("the ACP turn this step contends with is one this connection owns", (await stateNow()) === "generating", `state ${await stateNow()}`);
+			const closeAttempt = await request("session/close", { sessionId }).then(
+				() => ({ closed: true }),
+				(error) => ({ data: error.data, message: String(error?.message ?? error) }),
+			);
+			check(
+				"closing during an ACP-authored turn is refused, not admitted",
+				closeAttempt.closed !== true && closeAttempt.data?.type === "refused" && closeAttempt.data?.command === "close",
+				JSON.stringify(closeAttempt),
+			);
+			check(
+				"and the refusal says to stop the turn first",
+				typeof closeAttempt.data?.hint === "string" && /cancel/i.test(closeAttempt.data.hint),
+				JSON.stringify(closeAttempt.data?.hint),
+			);
+			check("and the session was not closed", (await stateNow()) === "generating", `state ${await stateNow()}`);
+		}
+		// The request must still be able to finish: that is the whole point.
+		cancelSeq += 1;
+		writeFileSync(join(dir, "command.txt"), `cancel:${cancelSeq}`, "utf8");
+		const doomedOutcome = await Promise.race([doomed, delay(120_000).then(() => "timeout")]);
+		check(
+			"and the in-flight request settled rather than hanging",
+			doomedOutcome !== "timeout",
+			doomedOutcome === "timeout" ? "no settlement after 120s" : JSON.stringify(doomedOutcome),
+		);
+		if (doomedOutcome !== "timeout") {
+			check(
+				"as cancelled, because the human stopped it",
+				doomedOutcome?.value?.stopReason === "cancelled",
+				JSON.stringify(doomedOutcome),
+			);
+		}
+		check("and the session came back to rest", (await idleNow()) === true, `state ${await stateNow()}`);
+		// A close that is *not* contending still works, and the session is then
+		// gone from this control plane's view.
+		const closedNow = await request("session/close", { sessionId }).then(
+			() => ({ closed: true }),
+			(error) => ({ data: error.data, message: String(error?.message ?? error) }),
+		);
+		check("closing an idle session still works", closedNow.closed === true, JSON.stringify(closedNow));
 
 		controller.abort();
 		await pump;

@@ -454,6 +454,27 @@ export async function createDshBackend({ ctx, logger, provider, model }) {
 	}
 
 	/**
+	 * Settle any request still waiting on this session, because the view that
+	 * would have seen its `turn/end` is being torn down.
+	 *
+	 * Closing a session during an ACP-authored turn aborts the request and
+	 * disposes this view. Detaching the listeners first removed the only route
+	 * by which the waiting `session/prompt` could ever learn its turn had
+	 * ended: the quiescence fallback covers a message that was never *claimed*,
+	 * and this one had been. The request then hung forever while the view said
+	 * `closed`. There is no ordering of the teardown that avoids this by
+	 * itself, so the settlement is explicit.
+	 *
+	 * @param {object} sink - the session's sink.
+	 * @param {string} sessionId - the session, for the log line.
+	 */
+	function settleOnDispose(sink, sessionId) {
+		if (sink.owner.settle === undefined) return;
+		logger?.(`settling the in-flight prompt for ${sessionId} because its view is being disposed`);
+		sink.owner.settle({ disposed: true });
+	}
+
+	/**
 	 * Run one ACP prompt as exactly one DSH turn.
 	 *
 	 * @param {object} input - `{agent, sink, content, emit, requestPermission, signal}`.
@@ -517,6 +538,10 @@ export async function createDshBackend({ ctx, logger, provider, model }) {
 
 		try {
 			const outcome = await settled;
+			// Captured before the `finally` clears it: the caller needs to know
+			// *which* turn this request was, so its settlement can avoid
+			// clearing a `generating` that already belongs to the next one.
+			const ownedTurn = sink.owner.turn;
 			if (outcome.neverClaimed === true) {
 				// Reported as a **failure**, not as a clean `end_turn`. This
 				// plugin's whole thesis is that an admitted command is never
@@ -528,10 +553,17 @@ export async function createDshBackend({ ctx, logger, provider, model }) {
 					"the prompt was accepted into the agent's inbox but no turn ever claimed it, so this control plane cannot say the turn ran",
 				);
 			}
+			if (outcome.disposed === true) {
+				// The session was closed while this turn was running and the
+				// listeners that would have seen its `turn/end` are gone. There
+				// is no turn to report on, and saying `end_turn` would be the
+				// same false success in a different costume.
+				throw new Error("the session was closed while this turn was running, so its outcome is unknown");
+			}
 			if (outcome.reason?.kind === "error") {
 				throw new Error(outcome.reason.error?.message ?? "agent turn failed");
 			}
-			return { stopReason: stopReasonForOwned(outcome.reason) };
+			return { stopReason: stopReasonForOwned(outcome.reason), turn: ownedTurn };
 		} finally {
 			signal?.removeEventListener("abort", onAbort);
 			sink.owner.messageId = undefined;
@@ -595,6 +627,13 @@ export async function createDshBackend({ ctx, logger, provider, model }) {
 			},
 			async dispose() {
 				owned.delete(sessionId);
+				// Before anything is torn down. A `session/close` admitted
+				// during this turn aborts the request and disposes this view,
+				// and once these listeners are gone nothing will ever see the
+				// turn's `turn/end` — so a request awaiting it would wait
+				// forever while the session read `closed`. Settling here is the
+				// guarantee that no settlement route can be lost.
+				settleOnDispose(sink, sessionId);
 				await handle.dispose();
 			},
 		};
@@ -617,6 +656,9 @@ export async function createDshBackend({ ctx, logger, provider, model }) {
 			/** Detach, and **never dispose**: the agent belongs to whoever created it. */
 			async dispose() {
 				adopted.delete(sessionId);
+				// See {@link settleOnDispose}: detaching first is what stranded
+				// an in-flight ACP request with no way left to settle it.
+				settleOnDispose(sink, sessionId);
 				detachListeners();
 				logger?.(`detached from session ${sessionId} without disposing the agent (owned elsewhere)`);
 			},

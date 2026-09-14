@@ -457,7 +457,15 @@ export class ControlPlane {
 				...(existing ?? {}),
 				sessionId: session.sessionId,
 				cwd: session.cwd,
-				title: session.title ?? existing?.title ?? null,
+				// **The host's title wins**, and this record's is the fallback.
+				// It used to be the other way round, which made this a stale
+				// second source of truth for one fact: rename the session in the
+				// GUI and `session/list` kept showing the title this control
+				// plane last wrote, with nothing to correct it. `existing.title`
+				// is the *canonical* title, read fresh from the host on this
+				// call; `session.title` is a cache, kept current by
+				// `SessionRegistry#observe` for the window before that read.
+				title: existing?.title ?? session.title ?? null,
 				updatedAt: session.updatedAt,
 				state: session.state,
 				live: session.backendSession !== undefined,
@@ -632,6 +640,31 @@ export class ControlPlane {
 
 	async #sessionClose(connection, params) {
 		const session = this.#requireSessionParam(params);
+		// An **adopted** session is someone else's, and this control plane holds
+		// only a borrowed view of it. Closing that view while a turn this
+		// connection authored is running is a refusal rather than a race: the
+		// view is what observes the turn's `turn/end`, and the prompt waiting on
+		// it would be left with no way to settle while `_dsh/session/state` said
+		// `closed`. The caller can stop its own turn first, which is a thing it
+		// can actually decide.
+		//
+		// A session this plugin *created* is not refused: closing it disposes
+		// the agent, which is the ending the turn was always going to have, and
+		// the backend settles the waiting request as part of that teardown.
+		if (session.adopted === true && session.backendSession?.ownsTurn?.() === true) {
+			const refusal = new RpcError(ErrorCode.refused, `session ${session.sessionId} is running a turn this connection started`, {
+				type: "refused",
+				command: "close",
+				sessionId: session.sessionId,
+				state: session.state,
+				allowedIn: [SessionState.idle, SessionState.closed, SessionState.failed],
+				reason:
+					"closing now would tear down the only view that can observe this turn ending, leaving the prompt that is waiting on it with nothing to settle it",
+				hint: "send session/cancel and wait for the turn to end, then close",
+			});
+			this.#registry.refuse(session, "close", connection.actor, refusal.data);
+			throw refusal;
+		}
 		await this.#registry.admit(session, Command.close, connection.actor, async (record) => {
 			await this.#disposeBackend(record, connection.actor);
 			await this.#registry.setStateDurable(record, SessionState.closed, "closed", connection.actor);
@@ -725,6 +758,7 @@ export class ControlPlane {
 
 		const agentActor = `agent:${session.sessionId}`;
 		let stopReason = "end_turn";
+		let ownedTurn;
 		let failure;
 		try {
 			if (session.backendSession === undefined) {
@@ -740,6 +774,10 @@ export class ControlPlane {
 				requestPermission: (request) => this.#requestPermission(connection, session, request, abort.signal),
 			});
 			stopReason = outcome?.stopReason ?? "end_turn";
+			// Which DSH turn this request actually ran as, when the backend can
+			// say. It is what makes the settlement below turn-aware, and it is
+			// the difference between one state machine and two.
+			ownedTurn = outcome?.turn;
 		} catch (error) {
 			failure = error;
 		} finally {
@@ -763,28 +801,50 @@ export class ControlPlane {
 				this.#registry.commit(session, { actor: agentActor, type: EventType.turnEnd, data: { turnId, stopReason } });
 			}
 			if (session.state === SessionState.generating || session.state === SessionState.awaitingPermission || session.state === SessionState.cancelling) {
-				session.turnId = undefined;
-				session.turnAbort = undefined;
-				// Deliberately the *non*-durable variant, and the one place that
-				// is right. This is a turn return edge, not a command edge: the
-				// work has already happened, and the session must come back to
-				// rest regardless of the disk. Blocking the movement on a write
-				// that may have failed would strand the session in `generating`
-				// — a worse outcome than a state change that outlives a log
-				// entry. The flush below still fails the *prompt response* if
-				// the turn's events did not persist, so the client is not told
-				// the turn succeeded.
-				this.#registry.setState(
-					session,
-					SessionState.idle,
-					abort.signal.aborted ? "turn_cancelled" : failure === undefined ? "turn_complete" : "turn_failed",
-					agentActor,
-				);
-			} else {
-				// Closing or closed: teardown owns the state from here.
-				session.turnId = undefined;
-				session.turnAbort = undefined;
+				// **Turn-aware.** DSH runs queued turns back to back with no
+				// Agent-idle between them (`while (await this.turn()) {}`), so
+				// by the time this request settles, the `generating` in front
+				// of it may already belong to the *next* turn — the human's,
+				// queued while ours ran. Clearing that would do two things at
+				// once: make `_dsh/session/state` describe a working session as
+				// idle, and let the next ACP prompt pass the idle-only
+				// admission check and be *queued behind the human's turn*,
+				// which the policy says must be refused.
+				//
+				// So the return edge is applied only while the running DSH turn
+				// is still the one this request owned. When it is not, DSH's
+				// own `turn/start` stays the authority for `generating` — one
+				// state machine, rather than two that agree by luck.
+				//
+				// Deliberately the *non*-durable variant, and the one place
+				// that is right. This is a turn return edge, not a command edge:
+				// the work has already happened, and the session must come back
+				// to rest regardless of the disk. Blocking the movement on a
+				// write that may have failed would strand the session in
+				// `generating` — a worse outcome than a state change that
+				// outlives a log entry. The flush below still fails the *prompt
+				// response* if the turn's events did not persist, so the client
+				// is not told the turn succeeded.
+				const anotherTurnIsRunning =
+					ownedTurn !== undefined && session.observedTurn !== undefined && session.observedTurn !== ownedTurn;
+				if (anotherTurnIsRunning) {
+					this.#logger(
+						`session ${session.sessionId}: turn ${String(ownedTurn)} settled while DSH turn ${String(session.observedTurn)} is running; the state belongs to that turn, not to this request`,
+					);
+				} else {
+					this.#registry.setState(
+						session,
+						SessionState.idle,
+						abort.signal.aborted ? "turn_cancelled" : failure === undefined ? "turn_complete" : "turn_failed",
+						agentActor,
+					);
+				}
 			}
+			// Released on every path, including "closing or closed", where
+			// teardown owns the state from here: these handles belong to *this*
+			// request, and leaving them set would strand the session.
+			session.turnId = undefined;
+			session.turnAbort = undefined;
 			// The turn's own streamed updates were appended as they happened and
 			// are on the same write chain, so awaiting it here means the client
 			// is not told the turn ended until the turn's events are durable.
@@ -929,30 +989,39 @@ export class ControlPlane {
 		}
 		const trimmed = title.trim();
 
-		// The host is authoritative for a title, and it is asked **first**.
-		// Keeping a private copy here would be a second source of truth for one
-		// fact — the exact problem archive had — and `session/list` prefers the
-		// local title, so a later human rename in the GUI would stay shadowed by
-		// a stale ACP copy. If the host cannot rename, neither can this.
+		// The host is authoritative for a title, and it is asked **first among
+		// the effects** — but it is asked *inside* the admitted effect, after
+		// the state check. Asking before admission meant a rename that arrived
+		// while the session was closing changed the GUI's title and *then* told
+		// the caller it had been refused: the third outcome — refused, but
+		// applied — that this whole plugin exists to make impossible.
+		//
+		// The capability check stays outside, because it mutates nothing: a
+		// backend with no canonical rename can be told so without entering the
+		// state machine at all.
 		const canonical = this.#registry.backend.canonical?.rename;
 		if (canonical === undefined) {
 			throw methodNotFound("_dsh/session/rename", { reason: "this backend has no canonical rename to delegate to" });
 		}
-		const outcome = await canonical(session.sessionId, trimmed);
-		if (outcome?.unavailable !== undefined) {
-			throw new RpcError(ErrorCode.methodNotFound, `rename is unavailable here: ${outcome.unavailable}`, {
-				type: "unavailable",
-				command: "rename",
-				sessionId: session.sessionId,
-				reason: outcome.unavailable,
-			});
-		}
-		// The host's accepted title, not the one that was asked for: a host may
-		// normalise, truncate, or resolve a conflict.
-		const accepted = typeof outcome?.title === "string" && outcome.title.length > 0 ? outcome.title : trimmed;
 
+		// Hoisted out of the effect so the `partially_applied` report below can
+		// name the title the host actually accepted, rather than the one that
+		// was asked for.
+		let accepted = trimmed;
 		try {
 			return await this.#registry.admit(session, Command.rename, connection.actor, async (record) => {
+				const outcome = await canonical(session.sessionId, trimmed);
+				if (outcome?.unavailable !== undefined) {
+					throw new RpcError(ErrorCode.methodNotFound, `rename is unavailable here: ${outcome.unavailable}`, {
+						type: "unavailable",
+						command: "rename",
+						sessionId: session.sessionId,
+						reason: outcome.unavailable,
+					});
+				}
+				// The host's accepted title, not the one that was asked for: a
+				// host may normalise, truncate, or resolve a conflict.
+				accepted = typeof outcome?.title === "string" && outcome.title.length > 0 ? outcome.title : trimmed;
 				const previous = record.title;
 				// Commit, then mutate. Assigning first meant a failed append — a
 				// durability failure, say — left the title changed while the

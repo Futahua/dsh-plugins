@@ -13,11 +13,11 @@ draft ACP RFDs so migration is mechanical when they stabilise.
 
 | Half | State |
 | --- | --- |
-| Protocol core, state machine, event log, replay | **built and verified** (`verify/core-checks.mjs` 76/76) |
+| Protocol core, state machine, event log, replay | **built and verified** (`verify/core-checks.mjs` 79/79) |
 | stdio transport | **built and verified** (`verify/stdio-client.mjs`, 65/65 over a real child process) |
 | Loopback HTTP+SSE with token auth | **built and verified** (`verify/http-client.mjs` 33/33) |
-| `dsh` backend in a real profile | **built and verified** (`verify/plugin-boot.mjs` 12/12 on the run before this round's changes; not re-run this round because the `acpctl` profile would not boot, and the web gate below covers the same backend in a stronger composition) |
-| **Attachment to a session somebody else owns** | **built and verified** — `verify/attach-check.mjs` 19/19 against a fixture that owns an agent the way the GUI does, and `verify/web-gate.mjs` **21/22** inside the **real web composition**, driven from both ends. The one failure is deviation 7 below, found by that check. |
+| `dsh` backend in a real profile | **built and verified** (`verify/plugin-boot.mjs` 12/12 on the run before this round; see the note under *Verifying*) |
+| **Attachment to a session somebody else owns** | **built and verified** — `verify/attach-check.mjs` 19/19 against a fixture that owns an agent the way the GUI does, and `verify/web-gate.mjs` **35/36** inside the **real web composition**, driven from both ends. The one failure is deviation 7 below, found by that check. |
 | Loaded in the running `dsh web` | **not yet** — that is your move, not mine; see *Loading it* |
 
 ## Known deviations
@@ -163,11 +163,32 @@ as a product decision rather than a bug: there is currently **no way for a human
 to grant an attached client authority over their turns**, and no way for a client
 to ask for it. If driving a GUI session from outside turns out to be genuinely
 useful — which is the bet this slice makes — the honest next step is a
-**session lease**: an explicit, revocable, visible grant of turn ownership,
-recorded in the log like every other decision, rather than an implicit one
-inferred from who happened to be attached. Until then, an external client can
-start turns of its own, watch everything, and rename or archive the session; it
-cannot answer for the human or stop them.
+**session lease**.
+
+**A lease belongs at the shared session-controller boundary, not in this
+plugin.** Implemented here it would be authority-by-socket: whichever client
+happened to attach would be granted whatever this plugin decided to grant, with
+the other frontends unable to see or contest it. It has to sit where the
+frontends meet, and it has to be visible to all of them:
+
+- it names the **session**, the **holder** (who, not just which socket), a
+  **lease id**, and the **permissions** it confers — not "control", which is not
+  a thing anyone can reason about;
+- it has a **TTL** and expires without renewal, because the failure mode of an
+  unattended grant is worse than the failure mode of a lapsed one;
+- a **human can revoke it**, from the GUI, at any time and without a round trip
+  through the holder;
+- **acquire, renew, revoke and expire are all logged**, so "who was allowed to
+  do that" is answerable after the fact;
+- the GUI **visibly shows an external holder**, because a person watching their
+  own conversation must be able to see that someone else can act in it;
+- and a lease **never retroactively owns a turn already in progress** — the
+  boundary is the next turn, not the current one. Owning a turn you did not
+  start is exactly the property the fail-closed rule above exists to prevent,
+  and a lease must not be a way to buy it after the fact.
+
+Until then, an external client can start turns of its own, watch everything, and
+rename or archive the session; it cannot answer for the human or stop them.
 
 ## Running it
 
@@ -334,8 +355,9 @@ development, listed at the bottom of this file.
 
 ```powershell
 # protocol, state machine, replay, plus durability and rollback against a log
-# whose directory is deleted out from under a running plane
-node plugins\dsh-acp-control\verify\core-checks.mjs        # 76 checks
+# whose directory is deleted out from under a running plane, plus the order of
+# the host call against the state check
+node plugins\dsh-acp-control\verify\core-checks.mjs        # 79 checks
 
 # the same scenario over a real child process's pipes, driven by the official
 # ACP client (the durability section needs the plane object, so it is in-process only)
@@ -352,18 +374,25 @@ node plugins\dsh-acp-control\verify\attach-check.mjs       # 19 checks
 
 # THE GATE: attachment inside the real web composition, both ends driven for
 # real. Boots its own profile on its own ports; the running GUI is not touched.
-# 21/22 — the one failure is deviation 7 in "Known deviations", and it is why
+# 35/36 — the one failure is deviation 7 in "Known deviations", and it is why
 # the check exists.
-node plugins\dsh-acp-control\verify\web-gate.mjs           # 22 checks
+node plugins\dsh-acp-control\verify\web-gate.mjs           # 36 checks
 ```
 
 `core-checks.mjs` and `http-client.mjs` need nothing but Node. `stdio-client.mjs`
 spawns a child with piped stdio, so it cannot run where that is denied.
-`plugin-boot.mjs` needs the `acpctl` profile running (below).
 `attach-check.mjs` and `web-gate.mjs` build and tear down their own throwaway
 profiles, so they need nothing but a `DSH_HOME` and the network access a real
 model turn needs. **Neither touches the running `dsh web`**: they bind other
 ports, and they remove their profile and their session store entries afterwards.
+
+`plugin-boot.mjs` is the odd one out and it is an **open item**: it needs an
+`acpctl` profile booted by hand, and on the run after this round's changes that
+profile would not come up. Leaving a check that cannot be run is how a suite
+quietly stops being evidence, so the fix is to make it boot its own profile the
+way `web-gate.mjs` does rather than to keep documenting the setup steps. Until
+that is done, treat its `12/12` as the last measured value rather than a current
+one — the same backend is covered, more strongly, by the gate.
 
 The stdio checks drive the server with **`@agentclientprotocol/sdk`** — the
 reference client — deliberately, because this server implements the ACP wire

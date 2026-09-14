@@ -208,6 +208,51 @@ async function runCanonicalChecks({ plane }) {
 			projected.result?.title === "host owns this",
 			JSON.stringify(projected.result?.title),
 		);
+
+		// ── order: the state check comes *before* the host is asked ──────────
+		//
+		// The bug this asserts against: `#rename` asked the canonical host
+		// first and entered the state machine second, so a rename arriving in a
+		// state that refuses it changed the GUI's title and *then* told the
+		// caller it had been refused — refused, but applied, which is the third
+		// outcome this plugin exists to make impossible.
+		//
+		// `closing` is the one state that refuses rename, and it is transient in
+		// real use, so the state is set directly here. What is under test is the
+		// ordering, not how the state was reached.
+		const calls = [];
+		const realRename = canonical.rename;
+		canonical.rename = async (id, title) => {
+			calls.push({ id, title });
+			return await realRename(id, title);
+		};
+		const record = plane.registry.get(sessionId);
+		const stateBefore = record.state;
+		record.state = "closing";
+		const refusedWhileClosing = await connection.handle(plane, {
+			jsonrpc: "2.0",
+			id: 6,
+			method: "_dsh/session/rename",
+			params: { sessionId, title: "must never reach the host" },
+		});
+		record.state = stateBefore;
+		check(
+			"a rename the state refuses is refused",
+			refusedWhileClosing.error?.data?.type === "refused",
+			JSON.stringify(refusedWhileClosing.error?.data ?? refusedWhileClosing.result),
+		);
+		check(
+			"and the host was never asked, so nothing was applied before the refusal",
+			calls.length === 0,
+			`${calls.length} canonical rename call(s): ${JSON.stringify(calls)}`,
+		);
+		const titleAfterRefusal = await connection.handle(plane, { jsonrpc: "2.0", id: 7, method: "_dsh/session/state", params: { sessionId } });
+		check(
+			"and the title is untouched, not changed behind the refusal",
+			titleAfterRefusal.result?.title === "host owns this",
+			JSON.stringify(titleAfterRefusal.result?.title),
+		);
+		canonical.rename = realRename;
 	}
 	plane.detach(connection);
 	return { checks, failures };

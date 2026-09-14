@@ -108,6 +108,19 @@ export class SessionRecord {
 	updatedAt;
 	/** @type {string|undefined} the in-flight turn's id. */
 	turnId;
+	/**
+	 * The DSH turn currently running, as observed from the session's own event
+	 * stream, or `undefined` between turns.
+	 *
+	 * This is the authority on *which* turn a `generating` state belongs to, and
+	 * it exists because DSH runs queued turns back to back with no Agent-idle in
+	 * between (`while (await this.turn()) {}`). Without it, a settlement that
+	 * cleared `generating` on the way out of one turn would clear a *different*
+	 * turn's `generating` — the session would read `idle` while it was working,
+	 * and the next prompt would be admitted into a queue instead of refused.
+	 * @type {number|undefined}
+	 */
+	observedTurn;
 	/** @type {string|undefined} the session this was forked from. */
 	forkedFrom;
 	/** @type {object|undefined} the backend's session object. */
@@ -542,16 +555,38 @@ export class SessionRegistry {
 		if (session === undefined) return;
 		const actor = `agent:${sessionId}`;
 		if (event?.type === "turn/start") {
+			// Recorded on every start, not only the ones that move the state:
+			// the turn that is running is a fact, and the state edge is a
+			// consequence of it.
+			session.observedTurn = event.data?.turn;
 			if (session.state === SessionState.idle) {
 				this.setState(session, SessionState.generating, "observed_turn_start", actor);
 			}
 			return;
 		}
 		if (event?.type === "turn/end") {
-			if (session.state === SessionState.generating || session.state === SessionState.awaitingPermission) {
+			const ended = event.data?.turn;
+			if (session.observedTurn === ended) session.observedTurn = undefined;
+			if (
+				session.state === SessionState.generating ||
+				session.state === SessionState.awaitingPermission ||
+				// `cancelling` too: a cancel that was admitted and then landed is
+				// over when its turn ends, and leaving that to the prompt's own
+				// settlement would strand the state whenever another turn — the
+				// human's, queued behind it — started first.
+				session.state === SessionState.cancelling
+			) {
 				this.setState(session, SessionState.idle, "observed_turn_end", actor);
 			}
 			return;
+		}
+		if (event?.type === "session/title") {
+			// The host renamed the session — from the GUI, most likely. This
+			// record's title is a *cache*, and a cache that is never updated is
+			// a stale second source of truth: reads would keep showing the old
+			// title over the host's new one.
+			const title = event.data?.title ?? event.data?.session?.title;
+			if (typeof title === "string" && title.length > 0) session.title = title;
 		}
 		for (const update of this.#backend.translate?.(event) ?? []) {
 			this.emitUpdate(session, update, actor);
