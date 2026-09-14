@@ -149,6 +149,11 @@ export async function apply(ctx, config) {
 
 	let lastCommand;
 	let rpc = 0;
+	// How often the command file is read. The gate shortens this to race its own
+	// ACP admission deliberately: a human prompt has to be able to land inside
+	// the window between an ACP prompt being admitted and its message reaching
+	// the Agent, and a 200 ms poll cannot hit a window that size.
+	const pollMs = Number.isInteger(config.pollMs) && config.pollMs > 0 ? config.pollMs : 200;
 	const timer = setInterval(() => {
 		const command = readIfPresent(join(DIR, "command.txt"));
 		if (command === undefined || command === lastCommand) return;
@@ -184,6 +189,6 @@ export async function apply(ctx, config) {
 				observe({ kind: "human-cancel-failed", message: String(error?.message ?? error) });
 			}
 		}
-	}, 200);
+	}, pollMs);
 	ctx.effect(() => () => clearInterval(timer));
 }

@@ -172,6 +172,10 @@ function writeProfile(home, dir) {
 			`        sessionId: ${JSON.stringify(fixtureSessionId)}`,
 			`        cwd: ${JSON.stringify(dir.replace(/\\/g, "/"))}`,
 			"        preset: workspace-write",
+			// Step [8] races the human's prompt against this plugin's ACP
+			// admission on purpose, and a 200 ms poll cannot land inside a
+			// window that size.
+			"        pollMs: 5",
 			"",
 		].join("\n"),
 		"utf8",
@@ -686,13 +690,135 @@ async function main() {
 			);
 		}
 		check("and the session came back to rest", (await idleNow()) === true, `state ${await stateNow()}`);
+		// The non-contending close is checked at the very end, after step [8]:
+		// closing here would leave the session `closed`, and every later "wait
+		// for the session to be at rest" would wait forever for a state a closed
+		// session never reaches. That cost a run.
+
+		console.log("\n--- [8] close while an adopted prompt is admitted, not claimed --");
+		// The window this checks is the one `ownsTurn()` cannot see. Admission
+		// does real async durability work before the backend is reached, and the
+		// GUI is not serialized behind it, so a human turn can win the Agent in
+		// that window — leaving this connection's message *queued behind the
+		// human's turn and not yet claimed*. At that moment an ACP prompt is
+		// unambiguously in flight and `ownsTurn()` is false.
+		//
+		// Closing there would abort the request and detach the borrowed view,
+		// and detaching does **not** remove the message from an Agent this plugin
+		// does not own: the caller would be told its prompt was cancelled and
+		// then watch it run anyway, after the human's turn.
+		//
+		// The interleaving is a genuine race, so this attempts it and reports
+		// honestly if it never lands rather than asserting something vacuous.
+		let raced;
+		let lastAttempt;
+		for (let attempt = 1; attempt <= 8 && raced === undefined; attempt += 1) {
+			if ((await idleNow()) !== true) {
+				lastAttempt = { note: "the session never came back to rest before an attempt" };
+				break;
+			}
+			const startsBefore = observed(dir).filter((entry) => entry.kind === "human-turn-start").length;
+			const updatesBefore = updates.length;
+			// The plugin's *own* admission edge: `generating` with
+			// `command: "prompt"`. A human turn starting produces
+			// `observed_turn_start` instead, so counting these is how the check
+			// tells "ACP was admitted and its message is queued" apart from "ACP
+			// was refused because the human got there first" — which look
+			// identical from the request's side for the few milliseconds before
+			// the refusal frame arrives.
+			const admissionsBefore = stateChanges.filter((change) => change.to === "generating" && change.command === "prompt").length;
+			let racerSettled = false;
+			// The human's command goes first, by a few milliseconds, and the
+			// offset is varied across attempts. What has to happen is narrow:
+			// the human's prompt must reach the Agent *before* the ACP message
+			// does, while the ACP admission gate still reads `idle`. The offset
+			// is what moves the attempt across that window.
+			writeFileSync(join(dir, "command.txt"), "prompt:Count slowly from 1 to 80, one number per line.", "utf8");
+			await delay(2 + attempt * 2);
+			const racer = request("session/prompt", { sessionId, prompt: [{ type: "text", text: "Reply with exactly: acp-queued" }] }).then(
+				(value) => {
+					racerSettled = true;
+					return { value };
+				},
+				(error) => {
+					racerSettled = true;
+					return { error: error.data ?? String(error?.message ?? error) };
+				},
+			);
+			const humanWonFirst = await until(
+				() => observed(dir).filter((entry) => entry.kind === "human-turn-start").length > startsBefore,
+				{ timeoutMs: 8_000, every: 25 },
+			);
+			// Four conditions, and all four are needed:
+			//   - the human's turn started (it won the Agent),
+			//   - this plugin admitted the ACP prompt (its own state edge),
+			//   - the ACP request is still outstanding,
+			//   - and the ACP turn has produced nothing, so its message was never
+			//     claimed and cannot have run.
+			// The third alone is not enough: in the step-[6] handoff the human's
+			// turn also starts before the ACP request settles, because the
+			// settlement is queued behind the turn it just ended.
+			const acpAdmitted = stateChanges.filter((change) => change.to === "generating" && change.command === "prompt").length > admissionsBefore;
+			const producedNothing = updates.length === updatesBefore;
+			if (humanWonFirst === true && acpAdmitted === true && racerSettled === false && producedNothing) {
+				raced = { racer, attempt };
+				break;
+			}
+			lastAttempt = await racer;
+			if (racerSettled === false) lastAttempt = { note: "the ACP prompt was still running when the attempt was abandoned" };
+			await idleNow();
+		}
+		if (raced === undefined) {
+			cannotProve(
+				"that an admitted ACP prompt can be pending behind a human turn",
+				`the race did not land in 8 attempts (last: ${JSON.stringify(lastAttempt)})`,
+			);
+		} else {
+			check(
+				`the ACP prompt is in flight but not claimed (attempt ${raced.attempt})`,
+				true,
+				"the human's turn started while the ACP prompt was still outstanding",
+			);
+			const closeInRace = await request("session/close", { sessionId }).then(
+				() => ({ closed: true }),
+				(error) => ({ data: error.data, message: String(error?.message ?? error) }),
+			);
+			check(
+				"closing while it is admitted but unclaimed is REFUSED, not admitted",
+				closeInRace.closed !== true && closeInRace.data?.type === "refused" && closeInRace.data?.command === "close",
+				JSON.stringify(closeInRace),
+			);
+			check(
+				"and the refusal explains that detaching would not remove the queued prompt",
+				typeof closeInRace.data?.reason === "string" && /run anyway|does not own|detach/i.test(closeInRace.data.reason),
+				JSON.stringify(closeInRace.data?.reason),
+			);
+			check("and the session was not closed", (await stateNow()) !== "closed", `state ${await stateNow()}`);
+			// The two things that must now be true: the human's turn finishes,
+			// and the ACP prompt runs rather than being reported stopped.
+			const raceOutcome = await Promise.race([raced.racer, delay(240_000).then(() => "timeout")]);
+			check(
+				"and the ACP prompt settled rather than being stranded",
+				raceOutcome !== "timeout",
+				raceOutcome === "timeout" ? "no settlement after 240s" : JSON.stringify(raceOutcome),
+			);
+			if (raceOutcome !== "timeout") {
+				check(
+					"and it was NOT falsely reported cancelled while still queued",
+					raceOutcome?.value?.stopReason !== "cancelled" && raceOutcome?.error === undefined,
+					JSON.stringify(raceOutcome),
+				);
+			}
+			check("and the session came back to rest", (await idleNow()) === true, `state ${await stateNow()}`);
+		}
+
 		// A close that is *not* contending still works, and the session is then
 		// gone from this control plane's view.
 		const closedNow = await request("session/close", { sessionId }).then(
 			() => ({ closed: true }),
 			(error) => ({ data: error.data, message: String(error?.message ?? error) }),
 		);
-		check("closing an idle session still works", closedNow.closed === true, JSON.stringify(closedNow));
+		check("closing a session with nothing in flight still works", closedNow.closed === true, JSON.stringify(closedNow));
 
 		controller.abort();
 		await pump;

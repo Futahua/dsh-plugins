@@ -708,12 +708,12 @@ a transcript, and each one found at least one real bug.
 
 | Check | What it drives | Result |
 | --- | --- | --- |
-| `verify/core-checks.mjs` | the scenario below plus the durability/rollback section and the ordering section, over the real `serveStdio` on in-process pipes | **79/79** |
+| `verify/core-checks.mjs` | the scenario below plus the durability/rollback section, the ordering section and the close-guard section, over the real `serveStdio` on in-process pipes | **86/86** |
 | `verify/stdio-client.mjs` | the same scenario, over a real child process's OS pipes (the durability section needs the plane object, so it runs only in-process) | **65/65** |
 | `verify/http-client.mjs` | the loopback HTTP+SSE transport from real `fetch` calls on a real socket | **33/33** |
 | `verify/attach-check.mjs` | attachment against a fixture that owns an agent the way the GUI does | **19/19** |
 | `verify/plugin-boot.mjs` | the plugin mounted in a live DSH profile, `dsh` backend, a real agent turn | **12/12**, last measured before this round; see the note below |
-| `verify/web-gate.mjs` | attachment **inside the real web composition**, driven from both ends | **35/36 — see the open defect below** |
+| `verify/web-gate.mjs` | attachment **inside the real web composition**, driven from both ends | **42/43 — see the open defect below** |
 | `verify/web-gate.mjs` | attachment **inside the real web composition**, driven from both ends | **21/22 — see the open defect below** |
 
 **The client is the reference implementation, not this plugin's own code.** The
@@ -803,7 +803,8 @@ through a stand-in.
 | 4 | The human cancels an ACP turn through the real controller, and the ACP request settles as `cancelled` — not `end_turn`. |
 | 5 | ACP attempts to cancel the human's turn and cannot: the turn is still `generating` afterwards, the refusal is **reported** even though `session/cancel` is a notification with no response channel, and a prompt attempted during that turn is refused by name with the state, the allowed set, and a hint. |
 | 6 | **A queued human turn takes over with no idle gap.** An ACP turn runs, the human queues a long turn behind it through `sessionController.prompt(mode: "queue")`, and DSH starts the human's turn the moment ours ends — `while (await this.turn()) {}`. The session must still read `generating`, a second ACP prompt must be **refused** rather than queued behind the human, an ACP cancel must not stop it, and the human's turn must complete. |
-| 7 | **Closing during an ACP-authored turn.** `session/close` is refused, naming the reason and the way out, the session is not closed, and the in-flight request still settles — as `cancelled` — rather than hanging with nothing left to observe its turn end. A close that is not contending still works. |
+| 7 | **Closing during an ACP-authored turn.** `session/close` is refused, naming the reason and the way out, the session is not closed, and the in-flight request still settles — as `cancelled` — rather than hanging with nothing left to observe its turn end. |
+| 8 | **Closing while a prompt is admitted but not yet claimed.** The cross-frontend race: the human's prompt wins the Agent while this plugin's admission is still doing its durability work, leaving the ACP message *queued behind the human's turn and never claimed*. Close must be **refused** there too, the human's turn must finish, and the ACP prompt must run rather than being reported stopped. The interleaving is a genuine race, so the check attempts it with varied offsets and reports `N/A` with the reason if it never lands — it does not assert something it did not establish. |
 
 **How the gate decides a session is at rest matters**, and it is worth stating
 because the first version got it wrong: it waits on `_dsh/session/state`
@@ -851,6 +852,32 @@ composition, after every fixture-based check passed.
 Recorded because the point of a check is the bugs it catches, not the green
 ticks.
 
+- **The close guard asked the wrong question.** It refused only when
+  `ownsTurn()` was true — "is the currently running DSH turn mine?" — which is
+  the right predicate for **destructive Agent cancellation** and the wrong one
+  for **close**. An admitted prompt can be in flight while `ownsTurn()` is
+  false: admission does real async durability work before the backend is
+  reached, and the GUI is not serialized behind it, so a human turn can win the
+  Agent in that window and leave this connection's message queued behind it,
+  unclaimed. Closing there aborts the request and detaches the borrowed view —
+  and detaching does **not** remove the message from an Agent this plugin does
+  not own, so the caller would be told its prompt was stopped and then watch it
+  run anyway, after the human's turn. The guard is now `turnAbort`, which is set
+  at admission and cleared only at settlement: it refuses from the moment a
+  prompt is admitted until it settles, claimed or not. `ownsTurn()` keeps its
+  own job — deciding whether a cancel may touch the Agent — and the distinction
+  between the two predicates is the point.
+- **A prompt held in flight, deterministically.** The gate can only *attempt* the
+  race above, so `verify/core-checks.mjs` holds the same state still instead: it
+  pauses the backend session's own `prompt` on a promise the check controls,
+  which leaves admission, `turnAbort`, and the whole state machine untouched
+  while making the in-flight window arbitrarily wide. It then asserts the
+  refusal, that the session is not closed, that the prompt still settles as
+  `end_turn` rather than as a cancellation, and that close is admitted again
+  once nothing is in flight. Against the old `ownsTurn()` predicate that check
+  fails outright, because the scripted backend has no `ownsTurn()` at all — it
+  cannot say which turn is current, which is exactly the situation the guard has
+  to survive.
 - **Two state machines, and the cruder one won.** `server.js` ran a second,
   coarser lifecycle beside the registry's turn-aware one: when an ACP prompt
   returned, its settlement cleared `generating` without checking that the

@@ -253,6 +253,84 @@ async function runCanonicalChecks({ plane }) {
 			JSON.stringify(titleAfterRefusal.result?.title),
 		);
 		canonical.rename = realRename;
+
+		// ── close refuses while *our* prompt is in flight ────────────────────
+		//
+		// The rule being asserted is about a prompt this connection admitted,
+		// not about which DSH turn is currently running. Those are different
+		// questions, and the scripted backend is the honest way to show it: it
+		// has no `ownsTurn()` at all — it cannot say which turn is current — so
+		// a guard written against *that* predicate lets a close straight through
+		// while a prompt is unmistakably in flight.
+		//
+		// This is the deterministic half of gate case [8]. There, the case is a
+		// genuine race between the human's turn and this plugin's admission, and
+		// a race cannot be asserted into existence. Here the in-flight state is
+		// simply held still and the guard is asked.
+		//
+		// The prompt is held by replacing the backend session's `prompt` with
+		// one that waits on a promise this check controls. Nothing about the
+		// plugin is stubbed: admission still runs for real, `turnAbort` is still
+		// set by it, and the state machine is untouched — only the agent's own
+		// work is paused, which is what makes the window observable instead of
+		// microscopic.
+		//
+		// `adopted` is set directly because the adopted-only rule is what is
+		// under test and this plane has no second frontend — the same technique
+		// as the ordering check above: what is under test is the predicate, not
+		// how the session came to be adopted.
+		const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+		const closeRecord = plane.registry.get(sessionId);
+		const wasAdopted = closeRecord.adopted;
+		closeRecord.adopted = true;
+		const backendSession = closeRecord.backendSession;
+		const realPrompt = backendSession.prompt.bind(backendSession);
+		let releasePrompt;
+		const held = new Promise((resolve) => {
+			releasePrompt = resolve;
+		});
+		backendSession.prompt = async (input) => {
+			await held;
+			return await realPrompt(input);
+		};
+
+		const inFlight = connection.handle(plane, {
+			jsonrpc: "2.0",
+			id: 8,
+			method: "session/prompt",
+			params: { sessionId, prompt: [{ type: "text", text: "hold this in flight while close is attempted" }] },
+		});
+		await sleep(100);
+		check("a prompt is in flight and the backend cannot say whose turn it is", closeRecord.turnAbort !== undefined && closeRecord.backendSession.ownsTurn === undefined);
+		const closeWhileInFlight = await connection.handle(plane, { jsonrpc: "2.0", id: 9, method: "session/close", params: { sessionId } });
+		check(
+			"close is refused while this connection has a prompt in flight",
+			closeWhileInFlight.error?.data?.type === "refused" && closeWhileInFlight.error?.data?.command === "close",
+			JSON.stringify(closeWhileInFlight.error?.data ?? closeWhileInFlight.result),
+		);
+		check(
+			"and it says detaching would not remove the prompt from an agent this plane does not own",
+			typeof closeWhileInFlight.error?.data?.reason === "string" && /does not own|run anyway|detach/i.test(closeWhileInFlight.error.data.reason),
+			JSON.stringify(closeWhileInFlight.error?.data?.reason),
+		);
+		const afterRefusal = await connection.handle(plane, { jsonrpc: "2.0", id: 10, method: "_dsh/session/state", params: { sessionId } });
+		check("and the session is not closed", afterRefusal.result?.state !== "closed", JSON.stringify(afterRefusal.result?.state));
+		closeRecord.adopted = wasAdopted;
+
+		releasePrompt();
+		const promptOutcome = await inFlight;
+		check(
+			"and the prompt still settles on its own terms, not as a cancellation",
+			promptOutcome.result?.stopReason === "end_turn",
+			JSON.stringify(promptOutcome.error ?? promptOutcome.result),
+		);
+		check("and it is no longer in flight once it has settled", closeRecord.turnAbort === undefined);
+		const closeWhenFree = await connection.handle(plane, { jsonrpc: "2.0", id: 11, method: "session/close", params: { sessionId } });
+		check(
+			"close is admitted again once nothing is in flight",
+			closeWhenFree.error === undefined,
+			JSON.stringify(closeWhenFree.error?.data ?? closeWhenFree.result),
+		);
 	}
 	plane.detach(connection);
 	return { checks, failures };

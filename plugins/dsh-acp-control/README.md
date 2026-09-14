@@ -13,11 +13,11 @@ draft ACP RFDs so migration is mechanical when they stabilise.
 
 | Half | State |
 | --- | --- |
-| Protocol core, state machine, event log, replay | **built and verified** (`verify/core-checks.mjs` 79/79) |
+| Protocol core, state machine, event log, replay | **built and verified** (`verify/core-checks.mjs` 86/86) |
 | stdio transport | **built and verified** (`verify/stdio-client.mjs`, 65/65 over a real child process) |
 | Loopback HTTP+SSE with token auth | **built and verified** (`verify/http-client.mjs` 33/33) |
 | `dsh` backend in a real profile | **built and verified** (`verify/plugin-boot.mjs` 12/12 on the run before this round; see the note under *Verifying*) |
-| **Attachment to a session somebody else owns** | **built and verified** — `verify/attach-check.mjs` 19/19 against a fixture that owns an agent the way the GUI does, and `verify/web-gate.mjs` **35/36** inside the **real web composition**, driven from both ends. The one failure is deviation 7 below, found by that check. |
+| **Attachment to a session somebody else owns** | **built and verified** — `verify/attach-check.mjs` 19/19 against a fixture that owns an agent the way the GUI does, and `verify/web-gate.mjs` **42/43** inside the **real web composition**, driven from both ends. The one failure is deviation 7 below, found by that check. |
 | Loaded in the running `dsh web` | **not yet** — that is your move, not mine; see *Loading it* |
 
 ## Known deviations
@@ -356,8 +356,8 @@ development, listed at the bottom of this file.
 ```powershell
 # protocol, state machine, replay, plus durability and rollback against a log
 # whose directory is deleted out from under a running plane, plus the order of
-# the host call against the state check
-node plugins\dsh-acp-control\verify\core-checks.mjs        # 79 checks
+# the host call against the state check and the close guard against an in-flight prompt
+node plugins\dsh-acp-control\verify\core-checks.mjs        # 86 checks
 
 # the same scenario over a real child process's pipes, driven by the official
 # ACP client (the durability section needs the plane object, so it is in-process only)
@@ -374,9 +374,9 @@ node plugins\dsh-acp-control\verify\attach-check.mjs       # 19 checks
 
 # THE GATE: attachment inside the real web composition, both ends driven for
 # real. Boots its own profile on its own ports; the running GUI is not touched.
-# 35/36 — the one failure is deviation 7 in "Known deviations", and it is why
+# 42/43 — the one failure is deviation 7 in "Known deviations", and it is why
 # the check exists.
-node plugins\dsh-acp-control\verify\web-gate.mjs           # 36 checks
+node plugins\dsh-acp-control\verify\web-gate.mjs           # 43 checks
 ```
 
 `core-checks.mjs` and `http-client.mjs` need nothing but Node. `stdio-client.mjs`

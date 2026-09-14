@@ -641,26 +641,43 @@ export class ControlPlane {
 	async #sessionClose(connection, params) {
 		const session = this.#requireSessionParam(params);
 		// An **adopted** session is someone else's, and this control plane holds
-		// only a borrowed view of it. Closing that view while a turn this
-		// connection authored is running is a refusal rather than a race: the
-		// view is what observes the turn's `turn/end`, and the prompt waiting on
-		// it would be left with no way to settle while `_dsh/session/state` said
-		// `closed`. The caller can stop its own turn first, which is a thing it
-		// can actually decide.
+		// only a borrowed view of it. Closing that view while a prompt from this
+		// connection is **in flight at all** is a refusal rather than a race.
+		//
+		// The predicate is `turnAbort`, which is set the moment the prompt is
+		// admitted and cleared only when it settles — *not* `ownsTurn()`, which
+		// asks the narrower question "is the currently running DSH turn mine?".
+		// The two are different questions and the difference is the whole point
+		// here:
+		//
+		//   - `ownsTurn()` is the right predicate for **destructive Agent
+		//     cancellation** — a cancel must only ever stop a turn this
+		//     connection actually started.
+		//   - It is the wrong predicate for **close**, because an admitted
+		//     prompt can be in flight while `ownsTurn()` is false. Admission has
+		//     real async durability work before the backend is reached, and the
+		//     GUI is not serialized behind it: a human turn can win the Agent in
+		//     that window, leaving this connection's message *queued behind it
+		//     and not yet claimed*. Closing then would abort the request and
+		//     detach the borrowed view, but detaching does not remove the
+		//     message from an Agent this plugin does not own — so the caller
+		//     would be told its prompt was cancelled and watch it execute later,
+		//     after the human's turn. That is the false-success family again,
+		//     with the sign flipped.
 		//
 		// A session this plugin *created* is not refused: closing it disposes
-		// the agent, which is the ending the turn was always going to have, and
-		// the backend settles the waiting request as part of that teardown.
-		if (session.adopted === true && session.backendSession?.ownsTurn?.() === true) {
-			const refusal = new RpcError(ErrorCode.refused, `session ${session.sessionId} is running a turn this connection started`, {
+		// the agent, which removes anything queued in it and settles the waiting
+		// request as part of that teardown.
+		if (session.adopted === true && session.turnAbort !== undefined) {
+			const refusal = new RpcError(ErrorCode.refused, `session ${session.sessionId} has a prompt from this connection in flight`, {
 				type: "refused",
 				command: "close",
 				sessionId: session.sessionId,
 				state: session.state,
 				allowedIn: [SessionState.idle, SessionState.closed, SessionState.failed],
 				reason:
-					"closing now would tear down the only view that can observe this turn ending, leaving the prompt that is waiting on it with nothing to settle it",
-				hint: "send session/cancel and wait for the turn to end, then close",
+					"closing now would detach the only view that can observe this prompt settling, and detaching does not remove it from an agent this control plane does not own — it would be reported as stopped and then run anyway",
+				hint: "send session/cancel and wait for the prompt to settle, then close",
 			});
 			this.#registry.refuse(session, "close", connection.actor, refusal.data);
 			throw refusal;
