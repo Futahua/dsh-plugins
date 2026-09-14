@@ -14,64 +14,56 @@ against an alternative, and the alternative is named.
 Four things a reader should know before trusting anything below, because each
 one is a place where this implementation is *not* simply "what the spec says".
 
-### 0. The blocking product gap: this is discovery, not attachment
+### 0. Attachment: how a session that belongs to someone else is driven
 
-**Co-presence does not work yet, and it is slice 2's first job — ahead of the
-stream fix below.**
-
-`backend-dsh.js` discovers the GUI's sessions through
-`sessionQuery.listSessions()`, but `server.js` marks them `backendOnly: true`,
-gives them an artificial `closed` state, and never enters them into
-`SessionRegistry`. Every mutating path starts at `registry.require(sessionId)`,
-so a GUI-originated session cannot be resumed, prompted, renamed, archived,
-forked or state-queried through this server. `SessionRegistry.recover()` only
-rebuilds from *our own* `session.created` records, so a boot does not adopt
-them either.
-
-The topology is therefore **discovery-only**: this server can list the
-sessions a human is working in and cannot touch a single one of them. A more
-conformant controller that still cannot drive the session the human is looking
-at misses the point of the project, which is why attachment outranks the
-transport deviation below.
-
-**The investigation is done, and the answer is that attachment needs no DSH
+**Implemented.** Attaching to a session this plugin did not create needs **no DSH
 core change** — provided the plugin is co-resident in the same process as the
-GUI. What the installed packages actually expose:
+session. That constraint is not incidental, so it is stated first: a session is
+attached by reaching for the *live agent object*, which only exists inside the
+process that owns it. A standalone ACP server can still only discover sessions.
+`lib/backend-dsh.js` refuses to pretend otherwise.
+
+What the seams turned out to be:
 
 | Question | Answer |
 | --- | --- |
-| Does `ctx.agents` expose an already-live agent by session id? | **Yes.** `AgentRegistry.get(id: SessionId): Agent \| undefined`, plus `list()`, `roots()`, `isOwnedBy()`. There is no `attach()` that hands back a `dispose` handle for an agent you did not create — and that is the right shape, because a second controller must not be able to tear down the first one's agent. |
-| What can the live `Agent` do? | `followup(message)`, `steer`, `inject`, `send`, `cancel(cause, options)`, `whenIdle()`, `runMaintenance`, and it carries `id`, `options`, `session`, `status: 'idle'\|'running'`, and **`ctx` — the agent-scoped Context**, which is the same object `setup` receives at create/resume time. So a scoped `agent.ctx.on('session/event', …)` subscription is available on an agent this plugin never created. |
-| Who owns the live handle for a session the user opens? | `ctx.sessionController` (`@deepseek-ai/dsh-api-session-controller`, `super(ctx, "sessionController")`), whose private `ApiSessionAgentController` is the singleton authority: `resolveAgent(sessionId)` "deduplicating concurrent resumes", `ensureSession(...)` "creating or resuming it once". Its public face is `ctx.sessionController.resolveAgent(sessionId)` → `{agent} \| {error}`. |
-| Is there a canonical mutation service? | **Mostly.** `sessionController.rename({sessionId, title})`, `.selectModel(...)`, `.prompt({requestId, mode, content})`, `.fork({sessionId, atSeq?})`, `.cancel(...)`; **access mode** via `ctx.planMode`, presets via `ctx.permissionPresets`; **archive** via `ctx.workspaceController.archiveSession({sessionId})` → `ctx.workspaceRegistry`, where it is a *workspace-scoped `archivedSessionIds` set*, not a session property. |
-| Is there a canonical event stream? | **Two.** `ctx.sessionController.follow({address, maxMessages?, assistantStream?})` yields a `snapshot` frame carrying `{header, cursor, records, hasMore, projections}` followed by durable events and opted-in live assistant frames — the GUI's own transcript stream. Lower down, `ctx.on('session/event', …)` at the plugin fiber sees committed events for **all** sessions, including ones the plugin did not create; the third-party `dushaobindoudou/dsh-acp` relies on exactly that. |
+| How is an already-live agent found? | `ctx.agents.get(id): Agent \| undefined`, plus `list()`, `roots()`, `isOwnedBy()`. There is deliberately **no `attach()` that hands back a dispose handle** for an agent you did not create: a second controller must not be able to tear down the first one's agent. This plugin registers listeners on the agent's own scoped context and never disposes the agent. |
+| What can the live `Agent` do? | `followup(message)`, `steer`, `inject`, `send`, `cancel(cause, options)`, `whenIdle()`, `runMaintenance`, and it carries `id`, `options`, `session`, `status`, and **`ctx` — the agent-scoped Context**. `agent.ctx.on('session/event', …)` is therefore available on an agent this plugin never created, and it is where adoption observes. |
+| Who owns the live handle? | `ctx.sessionController`, whose private `ApiSessionAgentController` is the singleton authority (it deduplicates concurrent resumes). Its public face is what this plugin uses: `resolveAgent(sessionId)`, `inspect`, `create`, `rename`, `prompt`, `cancel`, `fork`, `selectModel`, `follow`, `control`. `ensureSession` is **not** on the mounted service — it lives on the private agent port — so nothing here calls it. |
+| Is there a canonical mutation service? | For everything except delete. `sessionController.rename/.prompt/.cancel/.fork/.selectModel`, `ctx.workspaceController.archiveSession({sessionId})` → a workspace-scoped `archivedSessionIds` set, `ctx.planMode`, `ctx.permissionPresets`. |
+| Is there a canonical event stream? | Two, and this plugin uses the lower one. `sessionController.follow(...)` yields the GUI's own transcript snapshot plus frames; `ctx.on('session/event', …)` on the plugin fiber sees committed events for **all** sessions. Adoption binds the agent-scoped form, because it must see events for exactly one session and must not depend on the GUI's projection. |
 
-Two consequences worth stating plainly, because both contradict something this
-plugin currently implies:
+Two things the investigation changed, and both are now fixed rather than
+recorded as debt:
 
-- **`archive` is modelled wrongly today.** This plugin keeps an `archived` flag
-  on its own session record; DSH keeps a workspace-scoped set of archived
-  session ids. Two sources of truth for one fact is a bug regardless of which
-  one is right, and it is recorded here rather than quietly left.
-- **`delete` has no canonical implementation to delegate to.** There is no host
-  "delete session" method — `WorkspaceDeleteRequest` deletes a *workspace* —
-  and the only `_deleteSession` is private inside `dsh-session-query-sqlite`.
-  So `session/delete` is necessarily plugin-local, and should be described that
-  way rather than as parity with the GUI.
+- **`archive` is no longer modelled twice.** It delegates to
+  `ctx.workspaceController.archiveSession` and reads the workspace registry's own
+  set. DSH has no unarchive in any form, so `_dsh/session/unarchive` is refused
+  as `unavailable` instead of being implemented one-sidedly.
+- **`delete` still has no canonical implementation**, because none exists.
+  `WorkspaceDeleteRequest` deletes a *workspace*, and the only `_deleteSession`
+  is private inside `dsh-session-query-sqlite`. `session/delete` is therefore
+  plugin-local by necessity, says so on the wire (`scope: "acp-control-only"`),
+  and should not be described as parity with the GUI.
 
-**Slice 2 item 1 is therefore: adopt live sessions into the registry, drive
-them through `agent.followup`/`cancel`, observe them through `agent.ctx`, and
-delegate mutations to the canonical services above — never disposing a handle
-this plugin did not create.** A standalone HTTP server has no live agents and
-must *refuse* to `resume()` a session the GUI holds, rather than guess: the
-first-party server already throws `session is already active` in that case, and
-this plugin should pre-check with `agents.get()` and refuse in its own words.
+**The adoption rules**, which are the part with judgement in them:
 
-The one thing genuinely absent is a **policy seam**: nothing in DSH says what
-should happen when two frontends drive one agent, so "who may prompt right now"
-would be decided independently by each side. That is a design decision above
-this plugin, and attachment is worth building without it — but it should be a
-recorded decision rather than an accident.
+| Rule | Reason |
+| --- | --- |
+| Adopt **ordinary sessions only**; a running subagent is never adopted. | A subagent is an implementation detail of a turn its parent owns. Attaching a frontend to one would expose a session that no human opened, whose lifecycle the parent ends without warning. |
+| Adopt on `agent/created`, detach on `agent/disposed`, and sweep `ctx.agents.list()` at boot. | The sweep is what makes adoption survive being loaded into a process that already had sessions. Without it, attachment would only work for sessions created after boot. |
+| Adoption is **structural, not eager**: attaching binds listeners and enters the registry, but issues no command. | Attaching must not be able to change the session. A frontend connecting to watch a session it did not create is a read, and reads here append nothing. |
+| Own a turn by **minted identity**, correlated against `turn/start`/`turn/end`. | See the policy section in the README. "The agent is busy" is the wrong predicate: it refuses safe work and permits unsafe work. |
+| Prompts ACP admits carry `{kind:'plugin', plugin:'dsh-acp-control'}`. | The transcript must stay honest about who spoke, and the GUI's own attribution must keep working. |
+
+**The one thing genuinely absent is a policy seam**: nothing in DSH says what
+should happen when two frontends drive one agent. That is a decision above this
+plugin, and it was made conservatively rather than left as an accident —
+**the README's "Policy: two actors, one session" section is the record**, and it
+names the alternatives that were rejected and the recommendation (a session
+lease) for anyone who wants the permissive behaviour instead.
+
+Slice 2 item 2 is next, and it is the stream model below.
 
 ### 1. Known deviation: the stream model (slice 2, and it is a real non-conformance)
 
@@ -91,9 +83,12 @@ slice 1's checks catches this, because they attach one stream at a time.
 
 Slice 1 shipped this way deliberately — one stream was enough to build and
 demonstrate the replay guarantee, which is the part the RFD does not provide —
-but it is a defect against the transport spec, it is the **first** item of slice
-2, and it is recorded here rather than discovered later. See §7 for the current
-behaviour and what the fix touches.
+but it is a defect against the transport spec and it is recorded here rather
+than discovered later. It is the **remaining** item of slice 2 and the next
+thing to be built; attachment (§0) was ordered ahead of it, because a more
+conformant controller that still cannot drive the session the human is looking
+at misses the point of the project. See §7 for the current behaviour and what
+the fix touches.
 
 ### 2. Which ACP surface is stable, and one trap
 
@@ -713,10 +708,12 @@ a transcript, and each one found at least one real bug.
 
 | Check | What it drives | Result |
 | --- | --- | --- |
-| `verify/core-checks.mjs` | the scenario below plus the durability/rollback section, over the real `serveStdio` on in-process pipes | **65/65** |
-| `verify/stdio-client.mjs` | the same scenario, over a real child process's OS pipes (the durability section needs the plane object, so it runs only in-process) | **58/58** |
-| `verify/http-client.mjs` | the loopback HTTP+SSE transport from real `fetch` calls on a real socket | **32/32** |
-| `verify/plugin-boot.mjs` | the plugin mounted in a live DSH profile, `dsh` backend, a real agent turn | **12/12** |
+| `verify/core-checks.mjs` | the scenario below plus the durability/rollback section, over the real `serveStdio` on in-process pipes | **76/76** |
+| `verify/stdio-client.mjs` | the same scenario, over a real child process's OS pipes (the durability section needs the plane object, so it runs only in-process) | **65/65** |
+| `verify/http-client.mjs` | the loopback HTTP+SSE transport from real `fetch` calls on a real socket | **33/33** |
+| `verify/attach-check.mjs` | attachment against a fixture that owns an agent the way the GUI does | **19/19** |
+| `verify/plugin-boot.mjs` | the plugin mounted in a live DSH profile, `dsh` backend, a real agent turn | **12/12**, last measured before this round; not re-run, because the `acpctl` profile would not boot here and the web gate covers the same backend in a stronger composition |
+| `verify/web-gate.mjs` | attachment **inside the real web composition**, driven from both ends | **21/22 — see the open defect below** |
 
 **The client is the reference implementation, not this plugin's own code.** The
 scenario is driven by `@agentclientprotocol/sdk` — deliberately, because this
@@ -786,10 +783,87 @@ recorded) rather than a fixture; `session/new` composes a real agent through
 output reaching the client. The log survives a restart: the same check's second
 run recovered 18 events from the first and continued from `eventId` 19.
 
+### The gate: attachment inside the real web composition
+
+`verify/web-gate.mjs` is the check that decides whether slice 2 item 1 is done,
+because it is the only one where the session being attached to **belongs to
+somebody else**. It boots a throwaway profile that mounts
+`@deepseek-ai/dsh-web-app` — so `ctx.sessionController`,
+`ctx.workspaceController`, `ctx.permissionPresets` and the host's own approval
+answerer are the real ones — on ports that are not the running GUI's, and it
+runs the human side through those services in a second process rather than
+through a stand-in.
+
+| # | What it establishes |
+| --- | --- |
+| 1 | The human's prompt is admitted by the **real** `sessionController`, its turn ends as `completed` in the host's own log, the attached ACP client is told the turn started and ended, and it receives that turn's streamed output. |
+| 2 | An ACP-originated prompt completes with `end_turn` — settled by the correlation of `turn/end` to the turn this connection authored, not by quiescence — and the human side observes a turn it did not start. |
+| 3 | A permission is raised by a real write outside the session workspace and, during an ACP turn, is routed to the ACP client, whose answer settles the turn. During the **human's** turn the same probe is invisible to ACP: it is not routed, and the host answers its own. |
+| 4 | The human cancels an ACP turn through the real controller, and the ACP request settles as `cancelled` — not `end_turn`. |
+| 5 | ACP attempts to cancel the human's turn and cannot: the turn is still `generating` afterwards, the refusal is **reported** even though `session/cancel` is a notification with no response channel, and a prompt attempted during that turn is refused by name with the state, the allowed set, and a hint. |
+
+**The honest boundary of that evidence**, stated in the gate's own header and
+worth repeating: the browser's wire protocol (typert remote over the web server)
+and the GUI's rendering are **not** exercised. The human side calls the same
+service methods the API layer wraps, in the same composition, but it is not a
+browser. What is exercised is everything the plugin reasons about — who owns a
+turn, who may answer a permission, who may cancel, and what a refusal says.
+
+Two checks remain **unproven rather than asserted** when the composition gives
+them nothing to work with — an approval that the agent never reaches, or a
+turn that ends before a permission could be asked during it. They are printed as
+`N/A` with the reason, because a check that cannot fail is worse than no check.
+
+#### The one check the gate fails, and why that is the point
+
+`an approval during an ACP turn was routed to the ACP client` **fails**. In the
+real composition, a tool that needs approval inside a turn this plugin owns is
+not put to the attached client: the approval is left to the host's answerer, the
+tool is denied, and the turn completes that way. It does not hang, and it does
+not leak — the opposite direction is proven, twice over: an approval raised
+during the *human's* turn never reaches the client, and the host answers it.
+
+So the plugin's fail-closed rule is doing its job, and the *grant* half of the
+permission direction is missing. The listener is registered on both the agent's
+scoped context and the plugin's own fiber context (the first-party server's
+pattern), the ownership predicate is the same one that settles turns correctly,
+and diagnostics now record which of the two decline branches is taken — the
+remaining unknown is narrow and named rather than guessed at. It is recorded as
+an open defect in the README's deviation table, in the same place as the others,
+and it is the reason this check exists: it was **found by the gate**, in the real
+composition, after every fixture-based check passed.
+
 ### What the checks found
 
 Recorded because the point of a check is the bugs it catches, not the green
-ticks:
+ticks. The last three came from this round.
+
+- **A turn aborted by the human was reported to the ACP client as `end_turn`.**
+  The first-party codec maps DSH's `aborted` to `end_turn`, which is right when
+  the only frontend is the caller — an abort there is self-inflicted and already
+  known. Here the abort arrives from the GUI while an ACP client is waiting, and
+  `end_turn` says a turn *finished* when somebody stopped it. `stopReasonForOwned`
+  now maps `aborted → cancelled` and `blocked → refusal`, and the gate asserts
+  the cancelled case specifically.
+- **A turn whose prompt was never claimed settled as success.** The correlation
+  of the plugin's message to the turn DSH claimed it into has a quiescence
+  fallback; when it fires, the request used to settle `end_turn` — indistinguishable
+  from a turn that ran. It now settles as an **error** naming what could not be
+  established, because a control plane that cannot prove a turn ran must not
+  report that it did.
+- **A gate step disarmed itself with a file write.** The human side reacts only
+  to a *change* in its command file, so two identical `cancel` lines were one
+  cancel: step 4 believed it had cancelled a turn that was never cancelled, and
+  three later checks failed on a session that had simply finished. Commands now
+  carry a sequence number. The lesson generalises — a control channel that
+  deduplicates by value cannot be used to send the same command twice.
+- **Counting state transitions cumulatively is wrong.** "Wait for two `idle`s"
+  is satisfied by the previous two turns, so the next step raced a turn still
+  running. Every wait in the gate is now anchored to an index taken before the
+  turn it waits on.
+- **A read outside the workspace raises no approval; a write does.** The
+  sandbox knobs are `workspace-write` + `ask`, which confine writes. The
+  permission probe was a read and proved nothing while looking like it worked.
 
 - **The registry's live-frame sink was never wired.** `SessionRegistry`
   delivers through a sink that has to reach the control plane, constructed
@@ -826,35 +900,94 @@ ticks:
 
 ---
 
-## 10. Slice 1 boundaries
+## 10. Slice boundaries
 
-Implemented: stdio transport; loopback HTTP+SSE with token auth; `initialize`,
-`session/new`, `session/list`, `session/resume`, `session/close`,
-`session/delete`, `session/prompt`, `session/cancel`; streaming
-`session/update`; the state machine and structured refusals; the append-only
-log with monotonic ids and attach-after-N replay; actor identity;
-`_dsh/session/{rename,archive,unarchive,fork,state}` and
-`_dsh/events/replay`.
+### Slice 1 — implemented
 
-Not implemented, and refused by name rather than ignored: WebSocket upgrade
-(the RFD's second profile — HTTP+SSE covers slice 1's clients); `session/load`;
-`session/set_mode`; `session/set_config_option`; client filesystem, terminal,
-and elicitation capabilities; log rotation; and durable fork execution — fork
-creates the child session and records lineage, but copying the parent's turn
-prefix is slice 2.
+stdio transport; loopback HTTP+SSE with token auth; `initialize`, `session/new`,
+`session/list`, `session/resume`, `session/close`, `session/delete`,
+`session/prompt`, `session/cancel`; streaming `session/update`; the state machine
+and structured refusals; the append-only log with monotonic ids and
+attach-after-N replay; actor identity; `_dsh/session/{rename,archive,unarchive,fork,state}`
+and `_dsh/events/replay`.
 
-**Slice 2 opens with the stream-model deviation** described at the top of this
-document and in §7: replacing the single-stream-per-connection model with the
-RFD's connection-scoped plus per-session streams. It is a conformance defect,
-not an enhancement, and it is listed first so it is not mistaken for polish.
+### Slice 2, item 1 — attachment (implemented)
+
+A session this plugin did not create is now **driven**, not merely listed:
+
+- **Adoption.** `index.js` adopts every ordinary live agent — on `agent/created`,
+  on the boot sweep over `ctx.agents.list()`, and on demand from
+  `session/resume`. A subagent is skipped, because it is an implementation
+  detail of a turn its parent owns and no human opened it.
+- **Observation.** Adoption binds the *agent's own* scoped event surface,
+  `agent.ctx.on('session/event', …)`, and forwards translated events as
+  `session/update`. The human's turn therefore streams to the attached ACP
+  client, and an ACP turn streams to the GUI, through one code path (§2's
+  translation), with no second subscription and no polling.
+- **Ownership.** A prompt ACP admits mints a message identity, and the turn that
+  claims it becomes *this connection's* turn. `turn/end` is correlated to that
+  turn, so the request settles on its own turn's end — and `aborted` settles as
+  `cancelled`, not as `end_turn`, because the abort may have come from the human.
+- **Cancellation.** `session/cancel` is refused before admission when the
+  running turn is not ours, and the refusal is *reported* even though a
+  notification has no response channel. A cancel that is admitted passes
+  `keepInbox: true`: stopping a turn must not silently discard the queue behind
+  it.
+- **Permission.** A `session/request_permission` is routed to ACP only while the
+  current turn is ours; otherwise it is left for the host's own answerer. This
+  is the fail-closed rule, and it is the one place where being wrong cannot be
+  undone.
+- **Mutation.** `rename` delegates to `sessionController.rename` first and
+  records second, reporting `partially_applied` if the second half fails;
+  `archive` delegates to `workspaceController.archiveSession` and reads the
+  workspace registry's own set; `session/delete` stays plugin-local and says so,
+  because no host method exists.
+
+The constraint is **co-residence**: attachment reaches for the live agent
+object, so the plugin must be loaded in the process that owns the session. A
+standalone server can still only discover sessions, and refuses to pretend
+otherwise. The policy for what an attached client may do is a decision above
+this plugin; it is recorded in the README, with the alternatives that were
+rejected and the recommendation.
+
+### Not implemented, and refused by name
+
+WebSocket upgrade (the RFD's second profile — HTTP+SSE covers the clients this
+plugin serves); `session/load`; `session/set_mode`; `session/set_config_option`;
+client filesystem, terminal, and elicitation capabilities; log rotation.
+
+Two refusals are **declines rather than gaps**, and both now say `unavailable`
+instead of doing something adjacent:
+
+- **`_dsh/session/unarchive`** — DSH has no unarchive in any form. Implementing
+  it would mean inventing a second source of truth for a fact the workspace
+  registry owns.
+- **`_dsh/session/fork`** — DSH's canonical `fork` copies a *completed-turn
+  prefix* into a new session; this plugin could only create an empty child. A
+  method that returns a session which is not the one the caller asked for is
+  worse than one that says no.
+
+### Slice 2, item 2 — the stream model (next)
+
+**Slice 2 continues with the stream-model deviation** described at the top of
+this document and in §7: replacing the single-stream-per-connection model with
+the RFD's connection-scoped plus per-session streams. It is a conformance
+defect, not an enhancement, and it is named here so it is not mistaken for
+polish. Attachment was ordered ahead of it because a more conformant controller
+that still cannot drive the session the human is looking at misses the point of
+the project.
 
 The session backend is a port (`lib/backends.js`) with two adapters:
 
 - **`dsh`** (default inside a profile, `index.js`): binds each ACP session to a
-  real DSH agent through `ctx.agents`, streams committed `session/event`s into
-  `session/update`, and routes `approval/request` into `awaiting_permission`.
+  real DSH agent — creating one through `ctx.agents.create`, or **adopting the
+  live one** — streams committed `session/event`s into `session/update`, and
+  routes `approval/request` into `awaiting_permission` only when the turn is
+  this connection's.
 - **`scripted`** (`lib/backends.js`, standalone default): a deterministic
   fixture, and **never** the default inside a profile. It exists so the
   protocol, the refusals, and the replay can be exercised over a real socket
   without a model, a key, or a network. Every transcript produced with it says
-  so, and `initialize` reports which backend is live in `_meta`.
+  so, and `initialize` reports which backend is live in `_meta`. It does not
+  implement `adopt`/`live` at all — it reports `observesLiveAgents: false`, so a
+  standalone run cannot imply an attachment it cannot perform.

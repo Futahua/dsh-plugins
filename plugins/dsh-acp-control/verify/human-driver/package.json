@@ -1,0 +1,12 @@
+{
+  "name": "dsh-acp-control-human-driver",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Verification fixture: drives the human side of the gate test through DSH's real sessionController, not through a stand-in",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "license": "MIT"
+}

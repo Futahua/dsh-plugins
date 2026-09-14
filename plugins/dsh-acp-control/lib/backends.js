@@ -145,6 +145,8 @@ export function createScriptedBackend({ chunkDelayMs = 12 } = {}) {
 	const sessions = new Map();
 	/** The fixture's canonical archived set — the host's fact, not the registry's. */
 	const archived = new Set();
+	/** Monotonic sequence for the fixture title store, mirroring `SessionRenameValue.seq`. */
+	let seq = 0;
 
 	/**
 	 * Build one scripted session.
@@ -302,8 +304,21 @@ export function createScriptedBackend({ chunkDelayMs = 12 } = {}) {
 		 * by the profile check.
 		 */
 		canonical: {
-			async rename() {
-				return { unavailable: "the scripted backend has no host to rename through" };
+			/**
+			 * A fixture title store, standing in for `sessionController.rename`.
+			 *
+			 * Present so the *delegation* path is exercised by the portable
+			 * checks: the command reaches a host, takes the host's accepted
+			 * title as its projection, and keeps nothing of its own. A backend
+			 * without this refuses the rename rather than keeping a private
+			 * copy — which `verify/core-checks.mjs` also asserts, by removing
+			 * this method and watching the command refuse.
+			 */
+			async rename(sessionId, title) {
+				const record = sessions.get(sessionId);
+				if (record !== undefined) record.title = title;
+				seq += 1;
+				return { ok: true, title, seq };
 			},
 			async archive(sessionId) {
 				archived.add(sessionId);

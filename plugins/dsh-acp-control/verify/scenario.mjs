@@ -270,7 +270,16 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 			"generating",
 		);
 		assertRefused("generating: session/delete is refused", await command(ctx, "session/delete", { sessionId }), "generating");
-		assertRefused("generating: _dsh/session/fork is refused (no settled turn boundary)", await command(ctx, "_dsh/session/fork", { sessionId }), "generating");
+		// Fork is disabled until it delegates to the host's canonical fork, so it
+// refuses as `unavailable` in every state — the per-state rule no longer
+// decides anything, which is why the assertion is about the method being
+// absent rather than about the state table.
+		const forkMidTurn = await command(ctx, "_dsh/session/fork", { sessionId });
+		check(
+			"generating: fork is unavailable regardless of state, because it is disabled",
+			forkMidTurn.ok === false && forkMidTurn.data?.type === "unavailable",
+			JSON.stringify(forkMidTurn.data),
+		);
 		// The deliberate design choice from DESIGN.md §2: a title is not part of
 		// the turn, so rename is admitted mid-turn — and it must be *audible*,
 		// not silently discarded.
@@ -411,6 +420,16 @@ export async function runScenario({ sdk, stream, cwd, serverStderr }) {
 		check("an unknown method is methodNotFound", bogus.data?.type === "unimplemented" && bogus.data?.method === "totally/made-up");
 		const badParams = await command(ctx, "_dsh/session/rename", { sessionId, title: "  " });
 		check("a blank title is invalidParams, not a silent success", badParams.ok === false && badParams.data?.type === "invalid_params");
+		// Fork must refuse rather than offer a *different* operation under the
+		// same name. DSH's canonical fork copies a completed-turn prefix and
+		// preserves lineage; this plugin can only create an empty child, so the
+		// method is disabled until it delegates.
+		const fork = await command(ctx, "_dsh/session/fork", { sessionId });
+		check(
+			"fork is refused as unavailable rather than doing something else under its name",
+			fork.ok === false && fork.data?.type === "unavailable",
+			JSON.stringify(fork.data ?? fork.result),
+		);
 
 		console.log("\n--- a read must not write -------------------------------------");
 		const beforeRead = await lastEventId(ctx);

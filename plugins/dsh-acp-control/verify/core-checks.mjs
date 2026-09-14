@@ -86,24 +86,27 @@ async function runDurabilityChecks({ sdk, plane, logger }) {
 			params: { sessionId, title: "durable?" },
 		});
 		check(
-			"a rename whose event cannot be written FAILS",
-			rename.error !== undefined && rename.error.data?.type === "durability_failed",
+			"a rename whose log write fails reports the split outcome honestly",
+			rename.error !== undefined && rename.error.data?.type === "partially_applied",
 			JSON.stringify(rename.error?.data ?? rename.result),
 		);
+		// The host is authoritative for a title and is written first, so this
+		// failure is *not* "nothing happened": the title is live in DSH. Saying
+		// otherwise — or pretending to roll the host back — would be the lie.
 		check(
-			"and the failure does NOT claim the effect was applied, because it was not",
-			rename.error?.data?.effectApplied !== true,
+			"and it says the host applied it while this control plane did not record it",
+			rename.error?.data?.hostApplied === true && typeof rename.error?.data?.hostTitle === "string",
 			JSON.stringify(rename.error?.data),
 		);
 		check(
-			"the failure names the durability cause and the log path",
-			typeof rename.error?.data?.reason === "string" && rename.error?.data?.logPath === plane.log.path,
-			JSON.stringify(rename.error?.data),
+			"the failure names the durability cause",
+			typeof rename.error?.data?.reason === "string" && rename.error.data.reason.includes("event log"),
+			rename.error?.data?.reason,
 		);
 
 		const after = await connection.handle(plane, { jsonrpc: "2.0", id: 4, method: "_dsh/session/state", params: { sessionId } });
 		check(
-			"a rename that could not be committed left the title UNCHANGED (commit before mutate)",
+			"this control plane's own projection is unchanged, because its write is what failed",
 			after.result?.title === titleBefore,
 			`${JSON.stringify(titleBefore)} -> ${JSON.stringify(after.result?.title)}`,
 		);
@@ -127,8 +130,90 @@ async function runDurabilityChecks({ sdk, plane, logger }) {
 	return { checks, failures };
 }
 
-async function main() {
-	const { sdk, path: sdkPath } = await loadSdk();
+/**
+ * "Canonical or disabled": a command whose fact belongs to the host must reach
+ * the host, and must refuse when it cannot.
+ *
+ * Asserted by *removing* the canonical method from a running backend, which is
+ * the only way to observe the rule rather than the happy path: a plugin that
+ * quietly kept its own copy would still answer here, and that is exactly the
+ * two-sources-of-truth bug this rule exists to prevent.
+ *
+ * @param {object} options - `{plane, logger}`.
+ * @returns {Promise<{checks: object[], failures: string[]}>} results.
+ */
+async function runCanonicalChecks({ plane }) {
+	const failures = [];
+	const checks = [];
+	function check(name, ok, detail) {
+		checks.push({ name, ok, detail });
+		if (!ok) failures.push(`${name}${detail === undefined ? "" : ` — ${detail}`}`);
+		console.log(`${ok ? "  PASS" : "  FAIL"}  ${name}${ok || detail === undefined ? "" : `  (${detail})`}`);
+	}
+
+	console.log("\n--- canonical or disabled -------------------------------------");
+	const connection = {
+		id: "canonical-probe",
+		actor: "human:canonical-check",
+		transportName: "in-process",
+		extensions: true,
+		closed: false,
+		send() {},
+		notify() {},
+		request: () => Promise.reject(new Error("the probe never asks the client anything")),
+		acceptResponse: () => false,
+		signalFor: () => new AbortController().signal,
+		releaseRequest() {},
+		handle: async (p, frame) => p.dispatch(connection, frame),
+	};
+	plane.attach(connection);
+
+	const created = await connection.handle(plane, { jsonrpc: "2.0", id: 1, method: "session/new", params: { cwd: PLUGIN_DIR, mcpServers: [] } });
+	const sessionId = created.result?.sessionId;
+
+	if (sessionId !== undefined) {
+		const canonical = plane.registry.backend.canonical;
+		const saved = canonical.rename;
+		delete canonical.rename;
+
+		const refused = await connection.handle(plane, {
+			jsonrpc: "2.0",
+			id: 2,
+			method: "_dsh/session/rename",
+			params: { sessionId, title: "no host to hold this" },
+		});
+		check(
+			"rename refuses when the backend has no canonical host to delegate to",
+			refused.error !== undefined && refused.error.data?.type === "unimplemented",
+			JSON.stringify(refused.error?.data ?? refused.result),
+		);
+		const after = await connection.handle(plane, { jsonrpc: "2.0", id: 3, method: "_dsh/session/state", params: { sessionId } });
+		check(
+			"and it kept no private copy of the title it could not delegate",
+			after.result?.title === null || after.result?.title === undefined,
+			JSON.stringify(after.result?.title),
+		);
+
+		canonical.rename = saved;
+		const works = await connection.handle(plane, {
+			jsonrpc: "2.0",
+			id: 4,
+			method: "_dsh/session/rename",
+			params: { sessionId, title: "host owns this" },
+		});
+		check("and it succeeds again once the host is available", works.result?.title === "host owns this", JSON.stringify(works.error ?? works.result));
+		const projected = await connection.handle(plane, { jsonrpc: "2.0", id: 5, method: "_dsh/session/state", params: { sessionId } });
+		check(
+			"the projection is the host's accepted title, not the requested one",
+			projected.result?.title === "host owns this",
+			JSON.stringify(projected.result?.title),
+		);
+	}
+	plane.detach(connection);
+	return { checks, failures };
+}
+
+async function main() {	const { sdk, path: sdkPath } = await loadSdk();
 	const dataDir = await mkdtemp(join(tmpdir(), "dsh-acp-control-core-"));
 	console.log("\n=== dsh-acp-control — stdio transport (in-process pipes) ===");
 	console.log(`client   @agentclientprotocol/sdk  ${sdkPath}`);
@@ -164,8 +249,15 @@ async function main() {
 	let result;
 	try {
 		result = await runScenario({ sdk, stream, cwd: PLUGIN_DIR, serverStderr: () => logs });
+		// Canonical checks run *before* the durability section, which deletes the
+		// log directory on purpose and would otherwise make every later command
+		// fail for an unrelated reason.
+		const canonical = await runCanonicalChecks({ plane: control.plane, logger });
 		const durability = await runDurabilityChecks({ sdk, plane: control.plane, logger });
-		result = { checks: [...result.checks, ...durability.checks], failures: [...result.failures, ...durability.failures] };
+		result = {
+			checks: [...result.checks, ...canonical.checks, ...durability.checks],
+			failures: [...result.failures, ...canonical.failures, ...durability.failures],
+		};
 	} finally {
 		toServer.end();
 		await control.close();

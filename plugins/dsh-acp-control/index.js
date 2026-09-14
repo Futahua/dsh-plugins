@@ -210,6 +210,15 @@ class AcpControl extends Service {
 			const adopt = (agent) => {
 				const sessionId = String(agent?.id ?? "");
 				if (sessionId === "") return;
+				// Subagents are deliberately never adopted. They are visible —
+				// `_dsh/session/list` reports them with `controllable: false` —
+				// but they are not conversations, and an external client driving
+				// one would be operating a delegated worker rather than talking
+				// to the agent a person asked for.
+				if (backend.classify?.(sessionId)?.kind === "subagent") {
+					this.#logger(`not adopting ${sessionId}: it belongs to subagent routing`);
+					return;
+				}
 				void this.#control.registry
 					.attach({
 						sessionId,
@@ -217,7 +226,8 @@ class AcpControl extends Service {
 						state: agent.status === "running" ? "generating" : "idle",
 						actor: "system:acp-control",
 					})
-					.then(() => {
+					.then((record) => {
+						if (record === undefined) return;
 						this.#logger(`adopted live session ${sessionId} (status ${agent.status}); ownership stays with its creator`);
 					})
 					.catch((error) => {

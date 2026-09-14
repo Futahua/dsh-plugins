@@ -127,6 +127,15 @@ node plugins\dsh-acp-control\verify\http-client.mjs
 # mounted in a live DSH profile, with the real backend and a real agent turn
 # (needs an `acpctl` profile; setup steps are in the plugin's README)
 node plugins\dsh-acp-control\verify\plugin-boot.mjs
+
+# attachment: an external ACP client driving a session it did not create,
+# against a fixture that owns an agent the way the GUI does
+node plugins\dsh-acp-control\verify\attach-check.mjs
+
+# THE GATE: attachment inside the real web composition — the human side drives
+# ctx.sessionController for real, both ends are exercised, and the running GUI
+# is not touched (own profile, own ports, removed afterwards)
+node plugins\dsh-acp-control\verify\web-gate.mjs
 ```
 
 `check-live.mjs` and the other live scripts need a running GUI; point them with

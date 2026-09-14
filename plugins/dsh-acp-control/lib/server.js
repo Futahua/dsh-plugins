@@ -329,7 +329,7 @@ export class ControlPlane {
 			case "_dsh/session/state":
 				return this.#state(connection, params);
 			case "_dsh/session/list":
-				return this.#list(connection, params);
+				return this.#listSessions(connection, params);
 			case "_dsh/events/replay":
 				return this.#replay(params);
 			case "_dsh/log/info":
@@ -416,19 +416,22 @@ export class ControlPlane {
 	}
 
 	async #sessionList(connection, params) {
-		// Stable `session/list` omits archived sessions: that is what archive
-		// means. `_dsh/session/list` brings them back on request.
-		return this.#list(connection, params, false);
+		// Stable `session/list` omits archived sessions, and omits subagent
+		// sessions entirely. A standard client has no way to know that an entry
+		// there is a delegated worker rather than a conversation, and would
+		// reasonably read it as something it may prompt. `_dsh/session/list`
+		// shows them, marked, for clients that asked for the extension.
+		return this.#listSessions(connection, params, { includeArchived: false, includeSubagents: false });
 	}
 
-	async #list(_connection, params, includeArchived = true) {
+
+	async #listSessions(_connection, params, { includeArchived = true, includeSubagents = true } = {}) {
 		const cwdFilter = typeof params?.cwd === "string" ? params.cwd : undefined;
 		const backendSessions = await this.#registry.backend.list();
 		// The *canonical* archived set, read fresh. Not a local flag: DSH owns
-		// this fact, and keeping a copy of it here was two sources of truth for
-		// one thing.
+		// this fact, and keeping a copy here was two sources of truth for one
+		// thing.
 		const archivedIds = (await this.#registry.archivedIds()) ?? new Set();
-		const liveIds = new Set((await this.#registry.backend.live?.())?.map((entry) => entry.sessionId) ?? []);
 
 		const byId = new Map();
 		for (const summary of backendSessions) {
@@ -439,11 +442,13 @@ export class ControlPlane {
 				updatedAt: summary.updatedAt ?? null,
 				// A persisted session with no live agent is `closed` because it
 				// *is* closed, which is a fact about the session rather than a
-				// verdict on this plugin's ability to touch it. Whether it can
-				// be adopted is a separate field.
+				// verdict on this plugin's ability to touch it.
 				state: SessionState.closed,
 				live: false,
 				attached: false,
+				kind: summary.kind ?? "ordinary",
+				controllable: summary.controllable !== false,
+				...(summary.controllable === false ? { reason: summary.reason } : {}),
 			});
 		}
 		for (const session of this.#registry.all()) {
@@ -458,9 +463,15 @@ export class ControlPlane {
 				live: session.backendSession !== undefined,
 				attached: true,
 				owned: session.adopted === false,
+				kind: "ordinary",
+				controllable: true,
 			});
 		}
-		for (const entry of await this.#registry.backend.live?.() ?? []) {
+		// A session this control plane has *not* attached to, but knows is live.
+		// Subagents are marked rather than hidden here, because this is the
+		// extension list and hiding them would make the control plane's view of
+		// the process a lie.
+		for (const entry of (await this.#registry.backend.live?.()) ?? []) {
 			const existing = byId.get(entry.sessionId);
 			byId.set(entry.sessionId, {
 				...(existing ?? { cwd: entry.cwd ?? "/", title: null, updatedAt: null }),
@@ -468,15 +479,15 @@ export class ControlPlane {
 				state: existing?.state ?? (entry.status === "running" ? SessionState.generating : SessionState.idle),
 				live: true,
 				attached: existing?.attached ?? false,
-				// Adoptable, not a dead row: a live session this control plane
-				// has not attached to yet can be attached by naming it in
-				// `session/resume`.
-				adoptable: existing?.attached !== true,
+				adoptable: existing?.attached !== true && entry.controllable !== false,
+				kind: entry.kind ?? existing?.kind ?? "ordinary",
+				controllable: entry.controllable !== false,
 			});
 		}
 
 		const sessions = [...byId.values()]
 			.map((session) => ({ ...session, archived: archivedIds.has(session.sessionId) }))
+			.filter((session) => (includeSubagents ? true : (session.kind ?? "ordinary") !== "subagent"))
 			.filter((session) => (cwdFilter === undefined ? true : session.cwd === cwdFilter))
 			.filter((session) => (includeArchived ? true : session.archived !== true))
 			.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
@@ -514,24 +525,35 @@ export class ControlPlane {
 		// the operation the whole plugin exists for — and it must come *before*
 		// any resume, because resuming a session another frontend is driving
 		// would create a second owner of one conversation.
-		const live = await this.#registry.backend.live?.();
-		const liveEntry = live?.find((entry) => entry.sessionId === sessionId);
-		const attached = await this.#registry.attach({
-			sessionId,
-			cwd: params?.cwd ?? liveEntry?.cwd,
-			state: liveEntry?.status === "running" ? SessionState.generating : SessionState.idle,
-			actor: connection.actor,
-		});
+		// A session that is not a person's conversation is refused outright
+		// rather than adopted: an external client driving a subagent would be
+		// operating a delegated worker, not a conversation.
+		const verdict = this.#registry.backend.classify?.(sessionId);
+		if (verdict?.kind === "subagent") {
+			throw new RpcError(ErrorCode.refused, `session ${sessionId} belongs to subagent routing`, {
+				type: "subagent_owned",
+				command: "resume",
+				sessionId,
+				reason: verdict.reason,
+				hint: "subagent sessions appear in _dsh/session/list with controllable:false, and are never driven from here",
+			});
+		}
+
+		// If a real agent already exists this is attachment — the operation the
+		// whole plugin exists for — and it must come *before* any resume,
+		// because resuming a session another frontend is driving would create a
+		// second owner of one conversation.
+		const attached = await this.#attach(sessionId, connection.actor, params?.cwd);
 		if (attached !== undefined) {
 			this.#logger(`session ${sessionId} attached by ${connection.actor} (a live agent already existed)`);
 			return { sessionId, attached: true, state: attached.state };
 		}
 
 		// Nothing is live. Whether resuming a persisted session is safe depends
-		// entirely on whether this process can *see* live agents: if it can, a
-		// missing one is evidence that nothing holds the session; if it cannot,
-		// saying "nobody has it" would be a guess, and guessing wrong here
-		// produces two owners of one conversation.
+		// on whether this process can *see* live agents: if it can, a missing
+		// one is evidence that nothing holds the session; if it cannot, saying
+		// "nobody has it" would be a guess, and guessing wrong produces two
+		// owners of one conversation.
 		if (this.#registry.backend.observesLiveAgents !== true) {
 			throw new RpcError(
 				ErrorCode.refused,
@@ -548,11 +570,64 @@ export class ControlPlane {
 			);
 		}
 
-		const session = this.#registry.require(sessionId);
-		await this.#registry.admit(session, Command.resume, connection.actor, async (record) => {
+		// Cold, and this process can see live agents — so nothing holds it. Ask
+		// the *host's own* controller to resolve it rather than calling
+		// `agents.resume` directly: `sessionController.resolveAgent` is the
+		// deduplicating authority the GUI also goes through, so a GUI resume and
+		// an ACP resume of the same id converge on one agent instead of racing
+		// to create two.
+		const resolved = await this.#registry.backend.canonical?.resolveAgent?.(sessionId);
+		if (resolved?.refused !== undefined) {
+			throw new RpcError(ErrorCode.resourceNotFound, `the host could not open session ${sessionId}`, {
+				type: "not_found",
+				command: "resume",
+				sessionId,
+				reason: String(resolved.refused?.message ?? resolved.refused),
+				hostCode: resolved.refused?.code,
+			});
+		}
+		if (resolved?.ok === true) {
+			const nowLive = await this.#attach(sessionId, connection.actor, params?.cwd);
+			if (nowLive !== undefined) {
+				this.#logger(`session ${sessionId} resolved through the host controller and attached by ${connection.actor}`);
+				return { sessionId, attached: true, resolvedCold: true, state: nowLive.state };
+			}
+		}
+
+		// Otherwise this must be a session this control plane recovered from its
+		// own log: no live agent, and nothing else that could hold it. An id we
+		// have never seen is genuinely unknown, and saying so is the honest
+		// answer — the previous revision called `require()` here, which threw
+		// `not_found` for the very id the branch existed to import.
+		const recovered = this.#registry.get(sessionId);
+		if (recovered === undefined) {
+			throw notFound(`unknown session: ${sessionId}`, { sessionId });
+		}
+		await this.#registry.admit(recovered, Command.resume, connection.actor, async (record) => {
 			await this.#registry.reopen(record, connection.actor);
 		});
+		this.#logger(`session ${sessionId} resumed by ${connection.actor}`);
 		return { sessionId, attached: false };
+	}
+
+	/**
+	 * Adopt a live session into the registry, or report that nothing is live.
+	 *
+	 * One place, so `session/resume` and the automatic adoption in `index.js`
+	 * cannot drift into adopting different things.
+	 *
+	 * @returns {Promise<object|undefined>} the record, or undefined when there is nothing adoptable.
+	 */
+	async #attach(sessionId, actor, cwd) {
+		if (this.#registry.backend.classify?.(sessionId)?.kind === "subagent") return undefined;
+		const live = await this.#registry.backend.live?.();
+		const entry = live?.find((candidate) => candidate.sessionId === sessionId);
+		return await this.#registry.attach({
+			sessionId,
+			cwd: cwd ?? entry?.cwd,
+			state: entry?.status === "running" ? SessionState.generating : SessionState.idle,
+			actor,
+		});
 	}
 
 	async #sessionClose(connection, params) {
@@ -746,12 +821,24 @@ export class ControlPlane {
 			this.#logger(`session/cancel for unknown session ${sessionId} was ignored`);
 			return;
 		}
+		// Ownership is checked *before* admission, because admission applies the
+		// `generating → cancelling` edge. A backend that can say which turn is
+		// running is asked first: cancelling a turn this control plane did not
+		// start would stop the human's work, and moving the session to
+		// `cancelling` on the way to discovering that would leave the state
+		// machine describing a cancellation that never happened.
+		const ownsTurn = session.backendSession?.ownsTurn;
+		if (typeof ownsTurn === "function" && ownsTurn.call(session.backendSession) !== true) {
+			const reason =
+				"the agent is running a turn this control plane did not start, so cancelling here would stop someone else's work";
+			this.#registry.refuse(session, "cancel", connection.actor, { state: session.state, reason, allowedIn: [] });
+			this.#logger(`session/cancel for ${sessionId} refused: ${reason}`);
+			return;
+		}
+
 		await this.#registry.admit(session, Command.cancel, connection.actor, async (record) => {
-			// The cancellation is recorded before it is performed. The previous
-			// version committed nothing here, which is exactly the case the
-			// strengthened admission check now catches: it leaned on the
-			// automatic state edge to look non-silent while its own effect left
-			// no trace of having been asked.
+			// The cancellation is recorded before it is performed, so a cancel
+			// that was asked for is never invisible.
 			this.#registry.commit(record, {
 				actor: connection.actor,
 				type: EventType.cancel,
@@ -841,49 +928,73 @@ export class ControlPlane {
 			throw invalidParams("_dsh/session/rename requires a non-empty title", { field: "title" });
 		}
 		const trimmed = title.trim();
-		return this.#registry.admit(session, Command.rename, connection.actor, async (record) => {
-			const previous = record.title;
-			// Commit, then mutate. Assigning first meant a failed append — a
-			// durability failure, say — left the title changed while the caller
-			// was told the rename failed.
-			//
-			// The effect is published on the *stable* wire: `session_info_update`
-			// is Completed in the ACP schema, so a client that has never heard
-			// of `_dsh/` still sees the rename. The extension exists only
-			// because stable ACP has no client→agent request for setting a
-			// title — the stable surface only lets the agent announce one.
-			const event = this.#registry.commit(record, {
-				actor: connection.actor,
-				type: EventType.title,
-				data: { title: trimmed, previous: previous ?? null },
-				frame: (eventId) =>
-					notificationFrame(CLIENT_METHODS.sessionUpdate, {
-						sessionId: record.sessionId,
-						update: { sessionUpdate: "session_info_update", title: trimmed },
-						_meta: { actor: connection.actor, eventId },
-					}),
+
+		// The host is authoritative for a title, and it is asked **first**.
+		// Keeping a private copy here would be a second source of truth for one
+		// fact — the exact problem archive had — and `session/list` prefers the
+		// local title, so a later human rename in the GUI would stay shadowed by
+		// a stale ACP copy. If the host cannot rename, neither can this.
+		const canonical = this.#registry.backend.canonical?.rename;
+		if (canonical === undefined) {
+			throw methodNotFound("_dsh/session/rename", { reason: "this backend has no canonical rename to delegate to" });
+		}
+		const outcome = await canonical(session.sessionId, trimmed);
+		if (outcome?.unavailable !== undefined) {
+			throw new RpcError(ErrorCode.methodNotFound, `rename is unavailable here: ${outcome.unavailable}`, {
+				type: "unavailable",
+				command: "rename",
+				sessionId: session.sessionId,
+				reason: outcome.unavailable,
 			});
-			// Durability before the mutation. `commit` only queues the write, so
-			// mutating straight after it still exposes the title to a disk that
-			// is gone — the rename would report `durability_failed` and have
-			// applied anyway. verify/core-checks.mjs deletes the log directory
-			// and asserts this ordering.
-			await this.#registry.durable("the rename");
-			record.title = trimmed;
-			// Mirror the rename into the host when it has a canonical surface,
-			// so the GUI's session list shows what an ACP client just set. A
-			// missing service is reported on the result rather than failing the
-			// command: this plugin's own record *is* the authority for the
-			// title a client sees over ACP, and the host copy is a courtesy.
-			const mirrored = await this.#mirrorRename(record.sessionId, trimmed);
-			return {
-				sessionId: record.sessionId,
-				title: trimmed,
-				eventId: event.eventId,
-				previous: previous ?? null,
-				...(mirrored === undefined ? {} : { host: mirrored }),
-			};
-		});
+		}
+		// The host's accepted title, not the one that was asked for: a host may
+		// normalise, truncate, or resolve a conflict.
+		const accepted = typeof outcome?.title === "string" && outcome.title.length > 0 ? outcome.title : trimmed;
+
+		try {
+			return await this.#registry.admit(session, Command.rename, connection.actor, async (record) => {
+				const previous = record.title;
+				// Commit, then mutate. Assigning first meant a failed append — a
+				// durability failure, say — left the title changed while the
+				// caller was told the rename failed.
+				//
+				// The effect is published on the *stable* wire:
+				// `session_info_update` is Completed in the ACP schema, so a
+				// client that has never heard of `_dsh/` still sees the rename.
+				const event = this.#registry.commit(record, {
+					actor: connection.actor,
+					type: EventType.title,
+					data: { title: accepted, previous: previous ?? null, hostSeq: outcome?.seq },
+					frame: (eventId) =>
+						notificationFrame(CLIENT_METHODS.sessionUpdate, {
+							sessionId: record.sessionId,
+							update: { sessionUpdate: "session_info_update", title: accepted },
+							_meta: { actor: connection.actor, eventId },
+						}),
+				});
+				await this.#registry.durable("the rename");
+				record.title = accepted;
+				return { sessionId: record.sessionId, title: accepted, eventId: event.eventId, previous: previous ?? null };
+			});
+		} catch (error) {
+			// The host rename and this log cannot be one transaction, so the
+			// failure is reported as what it is rather than disguised. Rolling
+			// the host back is deliberately not attempted: the host has already
+			// published the new title to every other frontend, and undoing it
+			// would be a second racing write.
+			if (error?.data?.type === "durability_failed" || error?.data?.type === "invariant_violation") {
+				throw new RpcError(ErrorCode.internalError, "the host accepted the new title but this control plane could not record it", {
+					type: "partially_applied",
+					command: "rename",
+					sessionId: session.sessionId,
+					hostApplied: true,
+					hostTitle: accepted,
+					reason: error.message,
+					hint: "the title is live in DSH; this control plane's own log is behind and resyncs from the host on the next session/list",
+				});
+			}
+			throw error;
+		}
 	}
 
 	async #archive(connection, params, archived) {
@@ -926,36 +1037,42 @@ export class ControlPlane {
 		});
 	}
 
+	/**
+	 * Fork through the host, or not at all.
+	 *
+	 * The previous implementation created an empty child carrying a lineage
+	 * marker and called it a fork. DSH's canonical fork is a materially
+	 * different operation — it picks a completed-turn boundary, copies the
+	 * parent's event prefix, preserves lineage, and attaches the child to the
+	 * workspace — so offering the second under the first's name promised one
+	 * thing and did another. A warning would not fix that; the method is
+	 * disabled until it delegates.
+	 */
 	async #fork(connection, params) {
 		const session = this.#requireSessionParam(params);
-		return this.#registry.admit(session, Command.fork, connection.actor, async (record) => {
-			const headEventId = this.#log.lastEventId;
-			const child = await this.#registry.create({
-				cwd: record.cwd,
-				actor: connection.actor,
-				forkedFrom: record.sessionId,
+		const canonical = this.#registry.backend.canonical?.fork;
+		if (canonical === undefined) {
+			throw methodNotFound("_dsh/session/fork", { reason: "this backend has no canonical fork to delegate to" });
+		}
+		const outcome = await canonical(session.sessionId, params?.atEventId);
+		if (outcome?.unavailable !== undefined) {
+			throw new RpcError(ErrorCode.methodNotFound, `fork is unavailable here: ${outcome.unavailable}`, {
+				type: "unavailable",
+				command: "fork",
+				sessionId: session.sessionId,
+				reason: outcome.unavailable,
 			});
-			await this.#registry.admit(child, Command.rename, connection.actor, async (target) => {
-				const title = `${record.title ?? "session"} (fork)`;
-				target.title = title;
-				this.#registry.commit(target, {
-					actor: connection.actor,
-					type: EventType.title,
-					data: { title, previous: null },
-					frame: (eventId) =>
-						notificationFrame(CLIENT_METHODS.sessionUpdate, {
-							sessionId: target.sessionId,
-							update: { sessionUpdate: "session_info_update", title },
-							_meta: { actor: connection.actor, eventId },
-						}),
-				});
-			});
+		}
+		// The host did the forking; this records that it happened, under the
+		// transition table, so the `idle`-only rule still holds for any backend
+		// that can actually fork.
+		return await this.#registry.admit(session, Command.fork, connection.actor, async (record) => {
 			this.#registry.commit(record, {
 				actor: connection.actor,
 				type: EventType.forked,
-				data: { childSessionId: child.sessionId, headEventId },
+				data: { childSessionId: outcome.sessionId },
 			});
-			return { sessionId: child.sessionId, forkedFrom: record.sessionId, headEventId };
+			return { sessionId: outcome.sessionId, forkedFrom: record.sessionId };
 		});
 	}
 
@@ -1022,26 +1139,6 @@ export class ControlPlane {
 			throw invalidParams("a sessionId is required", { field: "sessionId" });
 		}
 		return this.#registry.require(sessionId);
-	}
-
-	/**
-	 * Push a rename into the host's canonical session service, when it exists.
-	 *
-	 * Returns a small status so the caller can say whether the GUI will see the
-	 * new title; never throws, because a host that cannot mirror a title must
-	 * not make an otherwise-correct ACP rename fail.
-	 */
-	async #mirrorRename(sessionId, title) {
-		const canonical = this.#registry.backend.canonical?.rename;
-		if (canonical === undefined) return { mirrored: false, reason: "this backend has no host to rename through" };
-		try {
-			const outcome = await canonical(sessionId, title);
-			if (outcome?.unavailable !== undefined) return { mirrored: false, reason: outcome.unavailable };
-			return { mirrored: true };
-		} catch (error) {
-			this.#logger(`host rename mirror failed for ${sessionId}: ${describe(error)}`);
-			return { mirrored: false, reason: describe(error) };
-		}
 	}
 
 	async #disposeBackend(record, actor) {

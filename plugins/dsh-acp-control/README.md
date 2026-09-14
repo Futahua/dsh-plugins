@@ -13,11 +13,12 @@ draft ACP RFDs so migration is mechanical when they stabilise.
 
 | Half | State |
 | --- | --- |
-| Protocol core, state machine, event log, replay | **built and verified** (`verify/core-checks.mjs` 65/65) |
-| stdio transport | **built and verified** (`verify/stdio-client.mjs`, 58/58 over a real child process) |
-| Loopback HTTP+SSE with token auth | **built and verified** (`verify/http-client.mjs` 32/32) |
-| `dsh` backend in a real profile | **built and verified** (`verify/plugin-boot.mjs` 12/12, real agent turn) |
-| Loaded in the running `dsh web` | **not yet** — see *Loading it* |
+| Protocol core, state machine, event log, replay | **built and verified** (`verify/core-checks.mjs` 76/76) |
+| stdio transport | **built and verified** (`verify/stdio-client.mjs`, 65/65 over a real child process) |
+| Loopback HTTP+SSE with token auth | **built and verified** (`verify/http-client.mjs` 33/33) |
+| `dsh` backend in a real profile | **built and verified** (`verify/plugin-boot.mjs` 12/12 on the run before this round's changes; not re-run this round because the `acpctl` profile would not boot, and the web gate below covers the same backend in a stronger composition) |
+| **Attachment to a session somebody else owns** | **built and verified** — `verify/attach-check.mjs` 19/19 against a fixture that owns an agent the way the GUI does, and `verify/web-gate.mjs` **21/22** inside the **real web composition**, driven from both ends. The one failure is deviation 7 below, found by that check. |
+| Loaded in the running `dsh web` | **not yet** — that is your move, not mine; see *Loading it* |
 
 ## Known deviations
 
@@ -26,12 +27,14 @@ Read these before relying on the plugin. Full reasoning is in
 
 | # | What | Status |
 | --- | --- | --- |
-| 0 | **This is discovery, not attachment.** GUI-originated sessions are listed (`backendOnly`, artificial `closed`) but never entered into the registry, so they cannot be prompted, renamed, archived, forked or state-queried. | **Blocking product gap. Slice 2, item 1.** The investigation is done and recorded in DESIGN.md: attachment needs **no DSH core change** — `ctx.agents.get(sessionId)` returns the live agent, `agent.ctx` is the scoped event surface, and `ctx.sessionController` is the canonical mutation service. It requires co-residence in the GUI's process. |
+| 0 | **Attachment, not discovery.** A session that belongs to someone else — the GUI — is attached by resolving the live agent, binding to its own event surface, and routing every mutation through DSH's canonical session services. It is no longer listed with an artificial `closed` state. It needs **no DSH core change**, but it does require **co-residence**: the plugin must be loaded in the process that owns the session, so a standalone ACP server can still only *discover* sessions, never drive them. | **Implemented** (slice 2, item 1). Verified inside the real web composition by `verify/web-gate.mjs`. |
 | 1 | **The stream model does not conform to the RFD.** It requires one connection-scoped stream *plus* one session-scoped stream per session, concurrently attachable. This serves **one stream per connection** with an optional `?session=` filter, so a client that follows the RFD and opens both gets its connection stream torn down by its session stream and stops receiving responses. | Known defect. Slice 2, item 2. |
 | 2 | `_dsh/session/refused` is an **invention** — ACP is silent on how a refused *notification* is reported, since a notification has no response channel. The log entry is the part that needs no permission; the notification is this plugin's own mechanism. | Deliberate, labelled as ours |
 | 3 | The SSE `id:` field is used as the replay cursor. The RFD does **not** define event ids in v1 — it defers them to v2 as a "last replay ID". Unclaimed today and pointing v2's way, but v2 could assign it a different meaning. | Contained in `lib/cursor.js` |
-| 4 | **`archive` is modelled twice.** This plugin keeps an `archived` flag on its own session record; DSH keeps a workspace-scoped `archivedSessionIds` set behind `ctx.workspaceController.archiveSession`. Two sources of truth for one fact is a bug regardless of which is right. | Known defect |
-| 5 | **`session/delete` is plugin-local.** There is no host "delete a session" method — `WorkspaceDeleteRequest` deletes a *workspace*, and the only `_deleteSession` is private inside `dsh-session-query-sqlite`. | Not parity with the GUI, and should not be described as such |
+| 4 | **`archive` is delegated, and one-way.** The plugin no longer keeps its own archived flag as a second source of truth: it calls `ctx.workspaceController.archiveSession` and *reads* the workspace registry's own set. DSH has no unarchive in any form, so `_dsh/session/unarchive` is refused as `unavailable` rather than implemented one-sidedly. | Implemented (slice 2); the refusal is deliberate |
+| 5 | **`_dsh/session/fork` is refused as `unavailable`.** DSH's canonical `fork` copies a *completed-turn prefix* into a new session; the plugin could only have created an empty child and called it a fork. A method that returns a session which is not the one the caller asked for is worse than one that says no. | Deliberate decline (slice 2) |
+| 6 | **`session/delete` is plugin-local.** There is no host "delete a session" method — `WorkspaceDeleteRequest` deletes a *workspace*, and the only `_deleteSession` is private inside `dsh-session-query-sqlite`. The removal is real but its scope is stated on the wire as `scope: "acp-control-only"`. | Not parity with the GUI, and should not be described as such |
+| 7 | **An approval raised during this plugin's *own* turn is not routed to the ACP client — it is left to the host.** Found by the gate, in the real web composition, and **not fixed**. The fail-closed direction is proven (an approval during the *human's* turn never reaches the client, and the host answers it), but the claim in the policy table above is therefore only half-implemented: with a client attached, a tool that needs approval inside the client's own turn is never put to that client. The turn does not hang — the host's answerer resolves it, and the tool is denied — but the client is not asked. | **Open defect, reproduced by `verify/web-gate.mjs`.** Diagnostics are in `backend-dsh.js` at the point of decision; the listener is registered on both the agent's context and the plugin's own, and the remaining unknown is which predicate declines. Fails closed, so the safe direction is the one that works. |
 
 ### What the replay guarantee does *not* cover
 
@@ -127,7 +130,47 @@ notifies on every move. Two table entries are deliberate decisions:
 - **`fork` is `idle`-only**, because a fork cuts the log at a settled turn
   boundary and `generating` has none.
 
+## Policy: two actors, one session
+
+Once an external client can attach to the session the human is looking at, the
+interesting question is no longer *can* it act, but *may* it. ACP says nothing
+about a second frontend, and neither does DSH, so this is a decision this plugin
+has to make and state rather than discover. **It is not settled policy** — it is
+the most conservative behaviour that is still useful, chosen so that the human
+never loses control of their own session to a program.
+
+**What was chosen.**
+
+| Rule | Why this one |
+| --- | --- |
+| **Fail closed on permissions.** A `session/request_permission` reaches the ACP client **only** while the current turn is the exact turn ACP authored. Anything else — an adopted GUI turn, a turn whose owner is unknown, a race — is left for the host's own answerer. | Answering a permission means authorizing an irreversible side effect on someone else's turn. It is the one action where being wrong cannot be undone, so it is the one action that requires positive proof of ownership rather than the absence of a reason to refuse. **The refusal half is verified; the grant half is not** — see deviation 7: a permission raised inside ACP's own turn is also left to the host, which is too conservative and is an open defect. |
+| **Turn ownership, not "is the agent busy".** Every command is scoped to a turn this connection authored: a minted message identity, correlated against `turn/start` and `turn/end`, and carried on refusals. | "Busy" is the wrong predicate in both directions — it refuses work that is safe (a rename mid-turn) and permits work that is not (answering a question asked by a different actor's turn). |
+| **Cancel only your own turn**, with the inbox kept (`keepInbox: true`). | Cancelling is destructive to the turn and *not* to the queue; dropping the human's queued follow-ups as collateral would be a second, silent failure. |
+| **Write provenance.** A prompt ACP admits carries `{kind: 'plugin', plugin: 'dsh-acp-control'}`. | It is the only way the transcript stays honest about who spoke. It also keeps the GUI's own attribution and the host's `user-rpc` dedup working untouched. |
+| **Never a second source of truth.** Rename and archive call the canonical DSH service first and record second; if the log write then fails the result is reported as `partially_applied`, naming both halves. | The plugin's log is a view of the session, not a rival copy of it. A view that disagrees with the thing it views is how the original bug class starts. |
+
+**Alternatives considered, and why not.**
+
+| Alternative | Why it is worse |
+| --- | --- |
+| *First come, first served*: while attached, ACP answers every permission. | The human watching the GUI would see a tool run they did not approve. Attaching a second client would silently delegate authority over the first client's turns. |
+| *Take over*: an attached client owns the session exclusively until it detaches. | Turns a read-only-ish convenience into a lockout. The human's own GUI would start refusing them in their own session. |
+| *Pure observer*: attach, stream, but allow no mutation. | Safe, and useless — it fails the acceptance test this was built for (an attached client sends a follow-up and the reply lands in the GUI). Observers already have a mechanism: replay. |
+| *Serialize everything behind one lock.* | Correct but destructive: a long ACP turn would block the human's rename, which is precisely the interaction that produced the motivating bug. The point is to make the write *legible*, not to make it wait. |
+
+**Recommendation.** Keep the conservative behaviour, and treat the remaining gap
+as a product decision rather than a bug: there is currently **no way for a human
+to grant an attached client authority over their turns**, and no way for a client
+to ask for it. If driving a GUI session from outside turns out to be genuinely
+useful — which is the bet this slice makes — the honest next step is a
+**session lease**: an explicit, revocable, visible grant of turn ownership,
+recorded in the log like every other decision, rather than an implicit one
+inferred from who happened to be attached. Until then, an external client can
+start turns of its own, watch everything, and rename or archive the session; it
+cannot answer for the human or stop them.
+
 ## Running it
+
 
 ### As a server, without DSH
 
@@ -262,8 +305,9 @@ deliberately **not** `fork`, whose RFD is still Draft.
 | Method | Notes |
 | --- | --- |
 | `_dsh/session/rename` | its *effect* is published on the stable wire as `session_info_update`; the extension exists only because stable ACP has no client→agent request for setting a title |
-| `_dsh/session/archive` / `unarchive` | archive omits the session from `session/list`; `_dsh/session/list` brings it back |
-| `_dsh/session/fork` | creates the child and records lineage; copying the parent's turn prefix is slice 2 |
+| `_dsh/session/archive` | delegates to `ctx.workspaceController.archiveSession`; archive omits the session from `session/list`, `_dsh/session/list` brings it back |
+| `_dsh/session/unarchive` | present, and refused as `unavailable` — DSH has no unarchive, so this plugin will not invent a second source of truth for it |
+| `_dsh/session/fork` | present, and refused as `unavailable`. DSH's canonical fork copies a completed-turn prefix; a child created empty would not be the session the caller asked for |
 | `_dsh/session/state` | the full state record, including which commands are admitted |
 | `_dsh/events/replay` | `{sessionId?, after, limit?}` → events, `lastEventId`, `firstRetainedEventId` |
 | `_dsh/log/info` | log position, size, cap, backend, connection count |
@@ -291,23 +335,35 @@ development, listed at the bottom of this file.
 ```powershell
 # protocol, state machine, replay, plus durability and rollback against a log
 # whose directory is deleted out from under a running plane
-node plugins\dsh-acp-control\verify\core-checks.mjs        # 65 checks
+node plugins\dsh-acp-control\verify\core-checks.mjs        # 76 checks
 
 # the same scenario over a real child process's pipes, driven by the official
 # ACP client (the durability section needs the plane object, so it is in-process only)
-node plugins\dsh-acp-control\verify\stdio-client.mjs       # 58 checks
+node plugins\dsh-acp-control\verify\stdio-client.mjs       # 65 checks
 
 # loopback HTTP+SSE: auth, the RFD's POST contract, the reconnect guarantee,
 # cursor edge cases, and idempotency
-node plugins\dsh-acp-control\verify\http-client.mjs        # 32 checks
+node plugins\dsh-acp-control\verify\http-client.mjs        # 33 checks
 
 # mounted in a live DSH profile, with the dsh backend and a real agent turn
 node plugins\dsh-acp-control\verify\plugin-boot.mjs        # 12 checks
+# attachment, against a fixture that owns an agent the way the GUI does
+node plugins\dsh-acp-control\verify\attach-check.mjs       # 19 checks
+
+# THE GATE: attachment inside the real web composition, both ends driven for
+# real. Boots its own profile on its own ports; the running GUI is not touched.
+# 21/22 — the one failure is deviation 7 in "Known deviations", and it is why
+# the check exists.
+node plugins\dsh-acp-control\verify\web-gate.mjs           # 22 checks
 ```
 
 `core-checks.mjs` and `http-client.mjs` need nothing but Node. `stdio-client.mjs`
 spawns a child with piped stdio, so it cannot run where that is denied.
-`plugin-boot.mjs` needs a profile running (below).
+`plugin-boot.mjs` needs the `acpctl` profile running (below).
+`attach-check.mjs` and `web-gate.mjs` build and tear down their own throwaway
+profiles, so they need nothing but a `DSH_HOME` and the network access a real
+model turn needs. **Neither touches the running `dsh web`**: they bind other
+ports, and they remove their profile and their session store entries afterwards.
 
 The stdio checks drive the server with **`@agentclientprotocol/sdk`** — the
 reference client — deliberately, because this server implements the ACP wire
@@ -357,11 +413,47 @@ reason, which is the point.
 
 ## Loading it into `dsh web`
 
-The plugin is **not** in the running `dsh web` profile. To add it, follow this
-repository's install steps (`README.md`): place the directory, junction it into
-`$DSH_HOME/profiles/web/node_modules/`, and list it in the profile's bundles
-**after** `@deepseek-ai/dsh-base` — the backend needs `ctx.agents`. Then restart
-`dsh web`; host `index.js` edits are not hot-reloaded.
+The plugin is **not** in the running `dsh web` profile, and installing it is your
+move rather than mine — loading it requires restarting `dsh web`, which would end
+whatever sessions are live at the time. Everything up to that line is done and
+verified; this is the only step left, and it is a decision about *when*.
+
+To add it, follow this repository's install steps (`README.md`): place the
+directory, junction it into `$DSH_HOME/profiles/web/node_modules/`, and list it
+in the profile's bundles **after** `@deepseek-ai/dsh-base` — the backend needs
+`ctx.agents`. Then restart `dsh web`; host `index.js` edits are not hot-reloaded.
+
+### What to expect once it is loaded
+
+This is the test the whole slice was built against, and it is worth running
+exactly as written:
+
+1. Open a session in the DSH web GUI and type a prompt there yourself. Watch it
+   answer. (Nothing about this changes — adoption issues no command, so a
+   session you are working in is untouched by the plugin being present.)
+2. From an external ACP client, attach to **that** session by its DSH session id
+   — `session/resume`, or `_dsh/session/state` to inspect it first.
+3. Send a follow-up from the ACP client and watch the reply arrive in the GUI you
+   are already looking at, in the same conversation, without reloading.
+4. Both ends observe the same state transitions: `_dsh/session/state_changed`
+   fires for the human's turns as well as the client's.
+
+Adoption is on by default and can be turned off:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `adoptLiveSessions` | `true` | adopt ordinary live sessions this plugin did not create, so an external client can attach to a session the GUI owns. With it off, the plugin only ever drives sessions it created itself — which is the whole of slice 1's behaviour, and useful if you would rather attach nothing until you have read the policy above. |
+
+A session is adopted when its agent appears, when the plugin boots into a
+process that already has live sessions, and on demand from `session/resume`.
+Subagents are never adopted.
+
+**If it goes wrong, the failure mode to look for** is a session that answers
+`session/resume` with `cannot_attach` — that means the plugin is running
+somewhere that cannot see live agents, i.e. it is not co-resident with the
+session, and it is refusing rather than guessing. The other one is a refusal
+naming a state: `{state, allowedIn, hint}` in `error.data`, which is the plugin
+telling you exactly which state blocked it and how to get out of it.
 
 ## Notes from building this
 
