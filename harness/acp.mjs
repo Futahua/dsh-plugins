@@ -14,6 +14,7 @@
 //   node acp.mjs prompt <id> <text>         drive a session, stream its reply
 //   node acp.mjs watch [id]                 follow events until interrupted
 //   node acp.mjs new <cwd> [text]           create a session, optionally prompt it
+//   node acp.mjs send <id> <file>           prompt with a file's contents, verbatim
 //   node acp.mjs cancel <id>                stop a turn that is running right now
 //   node acp.mjs steer <id> <text>          cancel, then say this instead
 //
@@ -191,6 +192,55 @@ const commands = {
     });
     console.log(said.trim());
     console.log(`\n[${result?.stopReason ?? 'no stopReason'}]`);
+    process.exit(0);
+  },
+
+  /**
+   * Prompt from a FILE rather than from argv.
+   *
+   * A long brief is prose: apostrophes, quotes, backticks, dollar signs, CRLF.
+   * Passing it as "$(cat brief.txt)" puts every one of those through a shell
+   * that is entitled to interpret them, and one unbalanced quote does not
+   * truncate the brief — it kills the whole command, heredoc included, so the
+   * file is never written either. That failed silently enough to look like a
+   * lane that had been briefed and said nothing.
+   *
+   * Read the bytes here. The shell never sees them.
+   */
+  async send([id, file]) {
+    if (!file) { console.log('usage: acp.mjs send <sessionId> <file>'); process.exit(2); }
+    const text = readFileSync(file, 'utf8');
+    if (!text.trim()) { console.log(`REFUSED: ${file} is empty`); process.exit(2); }
+    const c = await connect();
+    let said = '';
+    c.on((m) => { if (m.method === 'session/update') said += textOf(m.params?.update); });
+
+    // A long turn outlives the stream. When the SSE connection drops mid-turn the
+    // prompt promise never settles, node exits 13 on the unsettled top-level await,
+    // and the whole thing reads as a brief that was never delivered — while the lane
+    // is in fact working on it. So race the reply against the state machine: the turn
+    // is the authority on whether it landed, not my connection to it.
+    const settled = await Promise.race([
+      c.call('session/prompt', { sessionId: id, prompt: [{ type: 'text', text }] })
+        .then((r) => ({ kind: 'reply', r })),
+      (async () => {
+        for (;;) {
+          await new Promise((r) => setTimeout(r, 5000));
+          let state;
+          try { state = (await c.call('_dsh/session/state', { sessionId: id }))?.state; }
+          catch { return { kind: 'blind' }; }
+          if (state === 'generating') continue;
+          if (said) continue;      // a reply is arriving; let the promise win
+          return { kind: 'quiet', state };
+        }
+      })(),
+    ]);
+
+    if (said) console.log(said.trim());
+    if (settled.kind === 'reply') console.log(`
+[${settled.r?.stopReason ?? 'no stopReason'}]`);
+    else console.log(`
+[delivered; lost the stream — session is ${settled.state ?? 'unreadable'}]`);
     process.exit(0);
   },
 
