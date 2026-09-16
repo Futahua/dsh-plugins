@@ -1,6 +1,6 @@
 # DSH plugins
 
-Three plugins for the [DeepSeek Harness](https://github.com/deepseek-ai) Web GUI,
+Five plugins for the [DeepSeek Harness](https://github.com/deepseek-ai) Web GUI,
 developed and verified against a live installation.
 
 | Plugin | What it does |
@@ -8,6 +8,8 @@ developed and verified against a live installation.
 | [`dsh-opencode-go-usage`](plugins/dsh-opencode-go-usage/) | Shows OpenCode Go subscription usage: a progress ring in the composer, and a nested-window panel on click |
 | [`dsh-opencode-go-session`](plugins/dsh-opencode-go-session/) | Supplies the per-conversation `x-opencode-session` header OpenCode Go requires, and registers a model its catalog lacks |
 | [`dsh-mobile-rail`](plugins/dsh-mobile-rail/) | Gives a touch device its screen back: both the sidebar rail and the browser-agent pane become invisible edge bands (highlight, flash, real panel sliding in, standing down while you type), and on iPadOS/iOS the shell is pinned above the on-screen keyboard |
+| [`dsh-code-colors`](plugins/dsh-code-colors/) | House style for the GUI: colors carry meaning — yellow=created, pink=changed, blue=read/code, sage=thinking, lavender=closing reply, red=failed; per-file counts, folded turns, icon copy button |
+| [`dsh-chat-backdrop`](plugins/dsh-chat-backdrop/) | An optional photo behind the chat with a side-panel switch, custom uploads, and phone↔desktop sync through a tiny host service |
 
 The operational scripts — bringing the harness up at boot, restarting it to load
 a plugin's host half, opening an authenticated GUI, and the Tailscale auth bridge

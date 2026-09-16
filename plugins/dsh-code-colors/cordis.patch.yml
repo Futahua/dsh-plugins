@@ -1,0 +1,17 @@
+# The dsh-code-colors bundle patch.
+#
+# Loads the client bundle that colours boxed inline code blue, splits the
+# `+N -M` line statistic into a yellow half and a blue half, and writes per-file
+# line counts into the end-of-turn "Files changed" panel.
+#
+# The plugin ships no host-side behaviour, so this row exists mainly so that
+# `dsh-client-modules` can discover the package's `./client` entry.
+#
+# Remove this bundle (or set enabled: false) to restore the shipped colours and
+# the shipped single-text-node statistic. Nothing else changes.
+
+- insert:
+    - id: code-colors
+      name: dsh-code-colors
+      config:
+        enabled: true

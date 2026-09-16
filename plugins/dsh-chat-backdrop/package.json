@@ -1,0 +1,22 @@
+{
+  "name": "dsh-chat-backdrop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Optional chat backdrop image with a sidebar toggle to return to the normal background",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "license": "MIT"
+}

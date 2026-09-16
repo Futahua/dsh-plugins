@@ -1,0 +1,16 @@
+# The dsh-chat-backdrop bundle patch.
+#
+# Loads the client bundle that paints an optional image behind the chat, with a
+# toggle row in the side panel to return to the normal background. The choice
+# persists in the browser, so a reload keeps whatever was picked.
+#
+# The plugin ships no host-side behaviour, so this row exists mainly so that
+# `dsh-client-modules` can discover the package's `./client` entry.
+#
+# Remove this bundle (or set enabled: false) to lose the backdrop and its
+# toggle entirely. Nothing else changes.
+- insert:
+    - id: chat-backdrop
+      name: dsh-chat-backdrop
+      config:
+        enabled: true

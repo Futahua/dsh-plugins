@@ -1,0 +1,22 @@
+{
+  "name": "dsh-code-colors",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Blue boxed inline code, yellow/blue +N -M line statistics, and per-file line counts in the end-of-turn Files changed panel",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "license": "MIT"
+}
