@@ -12,12 +12,16 @@
  *     `~/.dsh/browser-stealth-profile`. `launchStealthBrowser()` in
  *     `@try-works/dsh-browser-agent` lib/index.js spawns Chrome with
  *     `--user-data-dir=<cfg.userDataDir>`, so this config entry is the whole
- *     of half (a); the bundle itself never touches launch behaviour
- *     (it posts no `/browser-pane/mode`).
+ *     of half (a).
  *  3. The bundle hides the "My Chrome" mode button while Headless + Plugin
  *     stay visible and clickable, ignores a same-named button outside the
  *     pane, re-hides a re-rendered toggle (collapse/expand survival), and
  *     restores everything on unload.
+ *  4. The connect guard keeps the pane attached to the shortcut Chrome: it
+ *     POSTs `/browser-pane/mode {mode:"connect"}` on install (before the
+ *     pane's own EventSource can trigger an own-mode launch onto our profile
+ *     dir) and re-posts on any pane state whose mode is not connect — and it
+ *     talks to no other route, so it can neither launch nor drive anything.
  *
  * Run: node plugins\dsh-browser-tweaks\verify-client.mjs
  */
@@ -76,8 +80,15 @@ check("touches no filesystem (so nothing outside this plugin can be patched)",
 	"no fs API in the bundle");
 check("spawns no processes", !clientSource.includes("child_process"));
 check("requires no modules", !clientSource.includes('require("') && !clientSource.includes("require('"));
-check("never posts a mode itself (launch/switch behaviour untouched)",
-	!clientSource.includes("/browser-pane/mode"));
+check("talks to exactly one route, the mode switch",
+	clientSource.includes('"/browser-pane/mode"') && !clientSource.includes("/browser-pane/back") &&
+		!clientSource.includes("/browser-pane/forward") && !clientSource.includes("/browser-pane/reload") &&
+		!clientSource.includes("/browser-pane/goto") && !clientSource.includes("/browser-pane/input"),
+	"mode only, never drive/input routes");
+check("always posts the attach mode, never a launch mode",
+	clientSource.includes('{ mode: CONNECT_MODE }') && !clientSource.includes('"own"') &&
+		!clientSource.includes('"stealth"'),
+	"no own/stealth literal in the bundle");
 check("never defers work to requestAnimationFrame (background tabs skip it)",
 	!/requestAnimationFrame\s*\(/.test(clientSource));
 check("no timers at all (observer-driven)", !clientSource.includes("setInterval") && !clientSource.includes("setTimeout("));
@@ -117,6 +128,25 @@ globalThis.MutationObserver = class {
 	disconnect() { this.disconnected = true; }
 	fire() { this.fn(); }
 };
+// Every connect post the bundle issues, with its exact shape.
+const fetchPosts = [];
+globalThis.fetch = async (url, opts) => {
+	fetchPosts.push({ url, method: opts?.method, body: opts?.body });
+	return { ok: true, json: async () => ({}) };
+};
+// The pane stream as the bundle sees it: state events fired by hand.
+const sseSources = [];
+globalThis.EventSource = class {
+	constructor(url) { this.url = url; this.listeners = {}; this.closed = false; sseSources.push(this); }
+	addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
+	removeEventListener(type, fn) {
+		const list = this.listeners[type] ?? [];
+		const at = list.indexOf(fn);
+		if (at >= 0) list.splice(at, 1);
+	}
+	fire(type, data) { for (const fn of [...(this.listeners[type] ?? [])]) fn({ data: JSON.stringify(data) }); }
+	close() { this.closed = true; }
+};
 globalThis.window = {
 	__ModuleLoader__: { load: (value) => { globalThis.__registration = value; } },
 };
@@ -141,14 +171,17 @@ console.log("exports:");
 check("exports apply", typeof exported.apply === "function");
 check("exports inject", Array.isArray(exported.inject));
 check("exports the matched label", exported.MY_CHROME_LABEL === "My Chrome");
+check("exports the mode route", exported.MODE_PATH === "/browser-pane/mode");
+check("exports the stream path", exported.STREAM_PATH === "/browser-pane/stream");
+check("exports the attach mode", exported.CONNECT_MODE === "connect");
 
 console.log("effect registration:");
 const effects = [];
 exported.apply({ effect: (fn, label) => effects.push({ fn, label }) });
-check("registers exactly one effect", effects.length === 1, String(effects.length));
-check("labels the effect", typeof effects[0]?.label === "string", String(effects[0]?.label));
+check("registers both effects", effects.length === 2, String(effects.length));
+check("labels every effect", effects.every((e) => typeof e.label === "string"));
 check("publishes a build marker",
-	globalThis.window.__dshBrowserTweaks?.version === 1 &&
+	globalThis.window.__dshBrowserTweaks?.version === 2 &&
 		globalThis.window.__dshBrowserTweaks?.label === "My Chrome");
 
 console.log("the toggle, as shipped:");
@@ -175,7 +208,7 @@ headless.click();
 plugin.click();
 check("Headless posts mode own", posts.some((p) => p.mode === "own"), JSON.stringify(posts));
 check("Plugin posts mode stealth", posts.some((p) => p.mode === "stealth"), JSON.stringify(posts));
-check("the bundle itself posted nothing new", posts.length === 2, `${posts.length} post(s)`);
+check("the shipped buttons' clicks still post their own modes", posts.length === 2, `${posts.length} post(s)`);
 
 console.log("collapse/expand survival (React re-renders the toggle):");
 // A re-render replaces the buttons with fresh, visible ones — as the pane does
@@ -195,9 +228,34 @@ check("the re-rendered survivors are visible",
 check("marker counts the hidden button", globalThis.window.__dshBrowserTweaks?.hiddenCount === 1,
 	String(globalThis.window.__dshBrowserTweaks?.hiddenCount));
 
+console.log("the connect guard — only the shortcut Chrome owns the profile:");
+const guardPosts = () => fetchPosts.filter((p) => p.url === "/browser-pane/mode");
+check("posts connect on install, before the pane can launch",
+	guardPosts().length === 1, `${guardPosts().length} post(s)`);
+check("post is an exact mode switch",
+	guardPosts()[0]?.method === "POST" && guardPosts()[0]?.body === '{"mode":"connect"}',
+	JSON.stringify(guardPosts()[0]));
+check("watches the pane stream", sseSources.length === 1 && sseSources[0].url === "/browser-pane/stream",
+	`${sseSources.length} source(s)`);
+check("state resolvers are pure (unit level)",
+	exported.notePaneState({ mode: "own" }) === true &&
+		exported.notePaneState({ mode: "stealth" }) === true &&
+		exported.notePaneState({ mode: "connect" }) === false &&
+		exported.notePaneState({}) === false &&
+		exported.notePaneState(null) === false &&
+		exported.notePaneState("own") === false);
+const postsAfterUnits = guardPosts().length;
+sseSources[0].fire("state", { mode: "own", active: false, url: "" });
+check("a drifted state re-posts connect", guardPosts().length === postsAfterUnits + 1);
+sseSources[0].fire("state", { mode: "connect", active: true, url: "https://example.com" });
+check("an attached state stays quiet", guardPosts().length === postsAfterUnits + 1);
+check("marker counts the posts", globalThis.window.__dshBrowserTweaks?.guard?.posts === guardPosts().length,
+	String(globalThis.window.__dshBrowserTweaks?.guard?.posts));
+
 console.log("unloading:");
 for (const dispose of disposers) if (typeof dispose === "function") dispose();
 check("observer disconnected", observers.every((o) => o.disconnected));
+check("stream source closed", sseSources.every((s) => s.closed));
 check("My Chrome restored", myChrome2.style.display === "" && !myChrome2.hasAttribute(exported.HIDE_ATTRIBUTE),
 	`display=${myChrome2.style.display}`);
 check("survivors untouched by restore",

@@ -1,11 +1,42 @@
 /**
- * Hide the browser pane's "My Chrome" mode button, leaving Headless + Plugin.
+ * Hide the browser pane's "My Chrome" mode button, leaving Headless + Plugin —
+ * and keep the pane attached to the shortcut Chrome instead of squatting its
+ * profile with a Chrome of its own.
  *
- * The shipped pane (`@try-works/dsh-browser-agent` lib/client.js) renders its
- * mode toggle as three unconditional ModeButtons — Headless (`mode: "own"`),
- * Plugin (`mode: "stealth"`), "My Chrome" (`mode: "connect"`). No config key governs that toggle's
- * visibility, so removing one button is DOM work by necessity; the stealth
- * profile directory, by contrast, is a config override in cordis.patch.yml.
+ * PROFILE-LOCK COLLISION (why the second half exists). Every GUI page load
+ * opens the pane's `/browser-pane/stream`, whose `startScreencast()` calls
+ * `sharedPage()` → `ensureBrowser()` — and the shipped runtime boots in own
+ * mode (the constructor only ever picks own or stealth; no config key
+ * selects connect). That launches a headless Chrome with
+ * `--user-data-dir` set to our override, which takes the profile lock, so the
+ * user's shortcut Chrome (`--remote-debugging-port=9222` on the SAME dir) can
+ * never start and the pane stays blank. Restarts do not help: the first page
+ * load re-squats.
+ *
+ * CONNECT GUARD. There is no config route to a connect-default, so this half
+ * is client work: on install it POSTs `/browser-pane/mode {mode:"connect"}`
+ * at once (bundle evaluation runs before the pane's own EventSource connects,
+ * so the launch usually never starts), and it keeps its own EventSource on
+ * the pane stream — every "state" event whose mode is not "connect" triggers
+ * another post. That covers a host restart with the page still open (fresh
+ * runtime, mode back to own) and any other drift. `switchMode` closes an
+ * owned browser and kills a stealth child before attaching, so each post both
+ * stops a squatter and attaches to the shortcut Chrome; when that Chrome is
+ * not running the server broadcasts its own "launch the shortcut" error state
+ * instead of launching anything. No repost loop: after a post the mode IS
+ * "connect" (even on failure), so the guard stays quiet.
+ *
+ * Honest limitation: while the guard runs, clicking Headless/Plugin is pulled
+ * back to connect — an own/stealth launch on this directory always collides
+ * with the shortcut, so there is no working state to preserve there. If the
+ * shortcut was started after the page loaded, reload the page: the stream
+ * reconnect re-attaches to it.
+ *
+ * (My Chrome half: the shipped pane renders its mode toggle as three
+ * unconditional ModeButtons — Headless, Plugin, My Chrome. No config key governs
+ * that toggle's visibility, so removing one button is DOM work by necessity;
+ * the stealth profile directory, by contrast, is a config override in
+ * cordis.patch.yml.)
  *
  * Identification is deliberately narrow: a `<button>` whose whole text is
  * exactly "My Chrome" *and* which sits inside `[data-dsh-browser-pane]`. The
@@ -33,7 +64,7 @@ window.__ModuleLoader__.load({
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
 		/** Bundle version, published on the marker for diagnostics. */
-		const VERSION = 1;
+		const VERSION = 2;
 
 		/** Exact text of the shipped third ModeButton (lib/client.js). */
 		const MY_CHROME_LABEL = "My Chrome";
@@ -122,6 +153,75 @@ window.__ModuleLoader__.load({
 
 		const inject = [];
 
+		// ---- connect guard: only the shortcut Chrome owns the profile --------
+
+		/** Shipped mode-switch route: switchMode closes/kills before attaching. */
+		const MODE_PATH = "/browser-pane/mode";
+
+		/** Shipped SSE stream, broadcasting {mode} on every state event. */
+		const STREAM_PATH = "/browser-pane/stream";
+
+		/** The only mode that never launches a Chrome of its own. */
+		const CONNECT_MODE = "connect";
+
+		/** Connect posts issued (diagnostics; the guard posts at most on drift). */
+		let connectPosts = 0;
+
+		/**
+		 * Ask the pane to attach to the shortcut Chrome.
+		 *
+		 * The server's switchMode stops any owned/stealth browser first, so a
+		 * post both evicts a squatter and attaches; when the shortcut Chrome
+		 * is down the server answers with its "launch the shortcut" error
+		 * state instead of launching. Fire-and-forget: a failed post simply
+		 * leaves the next state event to trigger a retry.
+		 */
+		function postConnect() {
+			if (typeof fetch !== "function") return;
+			connectPosts += 1;
+			fetch(MODE_PATH, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ mode: CONNECT_MODE }),
+			}).catch(() => {});
+		}
+
+		/**
+		 * Handle one pane "state" event: anything but connect means a squatter
+		 * is launching (or launched) — pull it back.
+		 * @returns true when a post was issued.
+		 */
+		function notePaneState(payload) {
+			if (payload === null || payload === undefined || typeof payload.mode !== "string") return false;
+			if (payload.mode === CONNECT_MODE) return false;
+			postConnect();
+			return true;
+		}
+
+		/** Install the immediate post plus the stream watch; returns the disposer. */
+		function installGuard() {
+			postConnect();
+			if (typeof EventSource === "undefined") return () => {};
+			const source = new EventSource(STREAM_PATH);
+			const onState = (event) => {
+				let payload = null;
+				try {
+					payload = JSON.parse(event?.data ?? "null");
+				} catch {
+					return;
+				}
+				notePaneState(payload);
+			};
+			const onError = () => {};
+			source.addEventListener("state", onState);
+			source.addEventListener("error", onError);
+			return () => {
+				source.removeEventListener("state", onState);
+				source.removeEventListener("error", onError);
+				source.close();
+			};
+		}
+
 		function apply(ctx) {
 			if (typeof window !== "undefined") {
 				window.__dshBrowserTweaks = {
@@ -133,9 +233,16 @@ window.__ModuleLoader__.load({
 					},
 					/** Re-run the sweep on demand (diagnostics). */
 					resweep: sweep,
+					/** Connect-guard diagnostics. */
+					get guard() {
+						return { posts: connectPosts };
+					},
+					/** Re-run the connect post on demand (diagnostics). */
+					reconnect: postConnect,
 				};
 			}
 			ctx.effect(() => install(), "dsh-browser-tweaks: hide My Chrome");
+			ctx.effect(() => installGuard(), "dsh-browser-tweaks: keep pane on shortcut Chrome");
 		}
 
 		exports.apply = apply;
@@ -143,6 +250,11 @@ window.__ModuleLoader__.load({
 		exports.MY_CHROME_LABEL = MY_CHROME_LABEL;
 		exports.HIDE_ATTRIBUTE = HIDE_ATTRIBUTE;
 		exports.sweep = sweep;
+		exports.MODE_PATH = MODE_PATH;
+		exports.STREAM_PATH = STREAM_PATH;
+		exports.CONNECT_MODE = CONNECT_MODE;
+		exports.postConnect = postConnect;
+		exports.notePaneState = notePaneState;
 		return module.exports;
 	},
 });
