@@ -1,11 +1,14 @@
 # dsh-session-archive
 
-Sidebar session pane replacement: every session row reveals a one-click
-archive button on hover, beside the `...` menu. One click archives
-immediately with **no confirmation dialog** — the same posture as the
-shipped Archive menu item, which commits without a dialog because archiving
-only hides the row through the registry-global archive set and never touches
-the session log. The row disappears when the archive-set echo lands.
+Sidebar session pane replacement: a faithful port of the shipped pane —
+workspace grouping, session drag-reorder, workspace reorder, workspace
+create/rename/delete dialogs, session rename/fork, and search — plus a
+one-click archive button on row hover, beside the `...` menu. One click
+archives immediately with **no confirmation dialog** — the same posture as
+the shipped Archive menu item, which commits without a dialog because
+archiving only hides the row through the registry-global archive set and
+never touches the session log. The row disappears when the archive-set
+echo lands.
 
 ## What it replaces, and why a whole pane
 
