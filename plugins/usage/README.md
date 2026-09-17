@@ -20,6 +20,7 @@ escalates to amber at 70% and red at 90%. Clicking it opens a small panel:
 
 ```
 OpenCode Go allowance
+opencode-go · 89% left
 Monthly   24% · 29d   [━━━━━━━━│━━━━━━━━━━━━━━━━━━━]
 Weekly    48% · 35h   [━━━━━━━━│━━━━━━━━━━━━━━━━━━━]
 5-hour    11% · 3h    [        ┃██│━━━━━━━━━━━━━━━━]
@@ -30,6 +31,14 @@ Three rows on **one shared quota scale**, where the track in every row is the
 monthly allowance, so a bar's width is its allowance as a fraction of that
 ($30 = 50%, $12 = 20%). The solid part of each bar is allowance consumed and the
 lighter part is what remains.
+
+The line under the title names the **active provider**: `opencode-go · 89% left`
+while a metered model drives the session (remaining 5-hour allowance, live on
+every poll and model switch), or `<provider> · free` for unmetered providers
+(`meta`, `openai-codex`, anything unknown). A pill name served by several
+providers reads plain `free` until the model menu has been opened once —
+opening it, or picking a model, teaches the pill which provider it saw. The
+pill only ever *reads* the shipped model pill; it never writes to it.
 
 Each window is **positioned by its own usage**, not by its allowance:
 
@@ -148,8 +157,9 @@ node .dsh\profiles\web\plugins\usage\verify-client.mjs   # client: bundle envelo
 
 `verify-client.mjs` stubs `window.__ModuleLoader__`, `require`, and a minimal DOM,
 then evaluates `lib/client.js` exactly as the browser would. It catches syntax
-errors, a wrong envelope, missing exports, and a mis-wired slot registration —
-not rendering, which still needs a browser.
+errors, a wrong envelope, missing exports, a mis-wired slot registration, a
+broken `usage` rename, and a wrong provider readout — not rendering, which
+still needs a browser.
 
 ## Loading it
 

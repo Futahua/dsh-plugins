@@ -20,7 +20,7 @@
  * `apiKeyEnv` reference the `opencode-go` provider uses, so the plugin follows
  * wherever the route is already configured and never stores a second copy.
  *
- * @module dsh-opencode-go-usage
+ * @module usage
  */
 
 import { Service } from "@deepseek-ai/cordis";
@@ -109,7 +109,7 @@ async function fetchUsage({ baseUrl, apiKey, timeoutMs }) {
 			authorization: `Bearer ${apiKey}`,
 			accept: "application/json",
 			// Go prefers clients that identify themselves over generic HTTP libraries.
-			"user-agent": "dsh-opencode-go-usage/1.0",
+			"user-agent": "usage/1.0",
 		},
 		signal: AbortSignal.timeout(timeoutMs),
 	});
@@ -158,9 +158,9 @@ function registerStatusRoute(ctx, service) {
 					);
 				},
 			});
-			connectionCtx.logger?.info?.(`opencode-go-usage: serving ${STATUS_PATH}`);
+			connectionCtx.logger?.info?.(`usage: serving ${STATUS_PATH}`);
 		} catch (error) {
-			connectionCtx.logger?.warn?.(`opencode-go-usage: could not register ${STATUS_PATH}: ${error}`);
+			connectionCtx.logger?.warn?.(`usage: could not register ${STATUS_PATH}: ${error}`);
 		}
 	});
 }

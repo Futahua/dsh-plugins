@@ -8,6 +8,11 @@
  *
  *   node plugins/usage/verify-client.mjs
  *
+ * It also locks the `usage` rename (bundle/cell/style/package/patch identity,
+ * with the host route deliberately unchanged) and the provider readout
+ * (`resolveProvider` / `providerLine` / menu-cache learning, including the
+ * guarantee that the shipped model pill seat is only ever read).
+ *
  * The React stub is intentionally tiny: this never renders, it only evaluates
  * the bundle and inspects what it registered. `createElement` returns a plain
  * descriptor and the hooks are inert, which is enough for the module body to run
@@ -179,6 +184,102 @@ check("no window ever escapes the track", (() => {
 	}
 	return true;
 })(), "across five extreme readings");
+
+console.log("usage identity (rename dsh-opencode-go-usage -> usage):");
+const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+check("package renamed to usage", pkg?.name === "usage", String(pkg?.name));
+const patch = readFileSync(new URL("./cordis.patch.yml", import.meta.url), "utf8");
+check("patch row id is usage", /id:\s*usage\s*\n/u.test(patch));
+check("patch row name is usage", /name:\s*usage\s*\n/u.test(patch));
+check("no old bundle name left in the patch", !patch.includes("dsh-opencode-go-usage"));
+check("no old bundle id left in the bundle", !source.includes("dsh-opencode-go-usage"));
+check("style tag uses the usage tag id", styleTags[0]?.dataset?.pluginCss === "usage/usage.css", String(styleTags[0]?.dataset?.pluginCss));
+const host = readFileSync(new URL("./index.js", import.meta.url), "utf8");
+check("host module tag renamed", host.includes("@module usage") && !host.includes("dsh-opencode-go-usage"));
+const routeOf = (text) => /\/api\/[a-z-]+\.status/u.exec(text)?.[0];
+check("host route kept working (not renamed)", routeOf(host) === "/api/opencode-go-usage.status", String(routeOf(host)));
+check("client polls the same route the host serves", routeOf(source) === routeOf(host), `${routeOf(source)} vs ${routeOf(host)}`);
+check("registers nothing into the model seat", !registrations.some((r) => r.phase === "register" && /model/u.test(r.spec?.name ?? "")), "conversation.input.model is read-only");
+check("single slot registration, into the usage seat only", source.split("slots.register").length - 1 === 1);
+
+console.log("provider readout:");
+check(
+	"exports the provider resolvers",
+	["resolveProvider", "clearProviderCache", "learnFromMenu", "learnFromOptionClick", "providerLine", "PILL_SEAT"].every(
+		(key) => exported[key] !== undefined,
+	),
+);
+check(
+	"reads (never owns) the model pill seat",
+	typeof exported.PILL_SEAT === "string" && exported.PILL_SEAT.includes("conversation.input.model"),
+	String(exported.PILL_SEAT),
+);
+const rp = exported.resolveProvider;
+check("provider/model label names the provider", rp("opencode-go/grok-4.6") === "opencode-go");
+check("unique opencode-go model resolves menu-free", rp("grok-4.6") === "opencode-go");
+check("unique display name resolves (case-insensitive)", rp("Grok 4.6") === "opencode-go");
+check("openai-codex model resolves", rp("gpt-5.4") === "openai-codex");
+check("meta model resolves", rp("muse-spark-1.3") === "meta");
+check("ambiguous id falls back to menu (null)", rp("muse-spark-1.3-contributor") === null);
+check("ambiguous display name falls back too", rp("Muse Spark 1.3 Contributor") === null);
+check("unknown model stays unknown", rp("some-future-model-xyz") === undefined);
+
+const pl = exported.providerLine;
+const byKey = (rollingPct) => ({ rolling: { key: "rolling", label: "5-hour", percent: rollingPct } });
+check("metered provider shows live remaining", pl("opencode-go", byKey(32)) === "opencode-go · 68% left", pl("opencode-go", byKey(32)));
+check("metered provider with no reading yet", pl("opencode-go", {}) === "opencode-go");
+check("meta reads free", pl("meta", byKey(32)) === "meta · free");
+check("openai-codex reads free", pl("openai-codex", byKey(32)) === "openai-codex · free");
+check("unknown provider reads free", pl("some-future-provider", byKey(32)) === "some-future-provider · free");
+check("ambiguous fallback reads bare free", pl(null, byKey(32)) === "free");
+check("missing pill reads bare free", pl(undefined, byKey(32)) === "free");
+
+// Menu-cache learning: an ambiguous name resolves only once the open model
+// menu names its provider section — the same pattern the pill uses at runtime
+// (checked menuitemradio's group, minus the trigger's own select id).
+const realDocument = globalThis.document;
+const fakeTrigger = {
+	getAttribute: (name) => (name === "aria-controls" ? "testselect-menu" : name === "title" ? "Muse Spark 1.3 Contributor" : null),
+	textContent: "Muse Spark 1.3 Contributor",
+};
+const fakeSection = (provider) => ({
+	getAttribute: (name) => (name === "aria-labelledby" ? `testselect-${provider}` : null),
+});
+const fakeOption = (provider) => ({
+	getAttribute: (name) => (name === "aria-checked" ? "true" : name === "title" ? "Muse Spark 1.3 Contributor" : null),
+	textContent: "Muse Spark 1.3 Contributor",
+	closest: () => fakeSection(provider),
+});
+globalThis.document = {
+	...realDocument,
+	querySelector: (selector) =>
+		selector === exported.PILL_SEAT ? { querySelector: () => fakeTrigger } : realDocument.querySelector(selector),
+	querySelectorAll: () => [fakeOption("meta")],
+};
+check("open menu teaches the ambiguous provider", exported.learnFromMenu(fakeTrigger) === true);
+check("taught name now resolves to the menu provider", exported.resolveProvider("Muse Spark 1.3 Contributor") === "meta");
+exported.clearProviderCache();
+check("clearing forgets the taught provider", exported.resolveProvider("Muse Spark 1.3 Contributor") === null);
+
+const clickSection = fakeSection("openai-codex");
+const clickOption = {
+	getAttribute: (name) => (name === "title" ? "GPT-5.6 Luna" : null),
+	textContent: "GPT-5.6 Luna",
+	closest: (selector) => (String(selector).includes("menuitemradio") ? clickOption : clickSection),
+};
+globalThis.document = {
+	...realDocument,
+	querySelector: (selector) =>
+		selector === exported.PILL_SEAT ? { querySelector: () => fakeTrigger } : realDocument.querySelector(selector),
+	querySelectorAll: () => [],
+};
+check(
+	"clicking a menu option teaches immediately",
+	exported.learnFromOptionClick({ target: { closest: (selector) => (String(selector).includes("menuitemradio") ? clickOption : null) } }) === true,
+);
+check("clicked name resolves to its section provider", exported.resolveProvider("GPT-5.6 Luna") === "openai-codex");
+exported.clearProviderCache();
+globalThis.document = realDocument;
 
 console.log("");
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
