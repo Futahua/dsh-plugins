@@ -1,0 +1,22 @@
+{
+  "name": "dsh-browser-tweaks",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Point the browser pane's Plugin/stealth mode at the shortcut-created Chrome profile, and hide the My Chrome mode button",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "license": "MIT"
+}

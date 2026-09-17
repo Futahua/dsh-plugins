@@ -1,0 +1,44 @@
+# The dsh-browser-tweaks bundle patch.
+#
+# Two entries, two halves of one job:
+#
+# 1. STEALTH PROFILE. An id-targeted config override pointing the shipped
+#    browser pane's Plugin/stealth mode at the shortcut-created Chrome profile,
+#    so fresh logins land there instead of the default
+#    `~/.dsh/browser-stealth-profile`. `launchStealthBrowser()` in
+#    `@try-works/dsh-browser-agent` lib/index.js reads `cfg.userDataDir`
+#    (`""` = default) and spawns Chrome with `--user-data-dir=<that dir>` —
+#    setting it here is the supported path and needs no DOM patching.
+#
+#    DSH_CHROME_PROFILE_DIR (edit once): the value below is the `--user-data-dir`
+#    the "Chrome (DSH Browser)" desktop shortcut was created with, read from
+#    `C:\Users\Public\Desktop\Chrome (DSH Browser).lnk` (see README). The page
+#    cannot resolve a `.lnk`, so this constant is edited by hand when the
+#    shortcut changes. Single-quoted: backslashes are literal there.
+#
+#    Layer-order warning: this override REPLACES the row's `config` object, and
+#    the profile's own `cordis.patch.yml` layer applies AFTER every bundle
+#    layer and replaces it again. If that file already configures
+#    `dsh-browser-agent` (e.g. `connectUrl`), merge `userDataDir` into it there
+#    too — otherwise the profile layer wins and stealth keeps the default.
+#
+# 2. MODE TOGGLE. Our own row, so `dsh-client-modules` can discover the
+#    package's `./client` entry. That bundle hides the "My Chrome" mode button.
+#    No config key controls the toggle's visibility (the three ModeButtons
+#    render unconditionally in the shipped lib/client.js), so this half is DOM
+#    work by necessity. Remove this row (or set enabled: false) to restore the
+#    button; the stealth profile override above is independent of it.
+
+# Must apply after the `@try-works/dsh-browser-agent` bundle layer inserts the
+# row: list `dsh-browser-tweaks` AFTER `@try-works/dsh-browser-agent` in the
+# profile's `dsh.profile.bundles`, or this override warns "entry not found" and
+# is skipped.
+- id: dsh-browser-agent
+  config:
+    userDataDir: 'D:\Programs\evTEMP\dsh-chrome-profile'
+
+- insert:
+    - id: browser-tweaks
+      name: dsh-browser-tweaks
+      config:
+        enabled: true
