@@ -1,0 +1,20 @@
+# The dsh-session-archive bundle patch.
+#
+# Loads the client bundle that replaces the sidebar session pane
+# (`sidebar.workspaces`, a `single` slot declared by
+# `@deepseek-ai/dsh-client-ui-sidebar`) with a flat session list whose rows
+# reveal a one-click archive button on hover, beside the `...` menu.
+#
+# A `single` slot renders one entry: registering here shadows the shipped
+# `WorkspaceBrowser` (the catalog marks this seat
+# `replaceRisk: "shadows-shipped-ui"`). The shipped entry stays installed but
+# unrendered, so removing this bundle (or set enabled: false) restores the
+# grouped browser with no other change.
+#
+# Remove this bundle (or set enabled: false) to restore the shipped pane.
+
+- insert:
+    - id: session-archive
+      name: dsh-session-archive
+      config:
+        enabled: true
