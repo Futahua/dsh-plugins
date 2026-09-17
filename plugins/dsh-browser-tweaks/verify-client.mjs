@@ -28,11 +28,14 @@ import { readFileSync } from "node:fs";
  *
  *   $sh = New-Object -ComObject WScript.Shell
  *   $sh.CreateShortcut('C:\Users\Public\Desktop\Chrome (DSH Browser).lnk').Arguments
- *   # --remote-debugging-port=9222 --user-data-dir="D:\Programs\evTEMP\dsh-chrome-profile"
+ *   # --remote-debugging-port=9222 --user-data-dir="D:\Letters\MatTroiSeConMoc\.dsh\browser-profile"
+ *
+ * (Re-read 2026-09-17 after the profile moved out of evTEMP; the old
+ * `D:\Programs\evTEMP\dsh-chrome-profile` directory is deleted.)
  *
  * The check below requires cordis.patch.yml to carry exactly this value.
  */
-const EXPECTED_PROFILE_DIR = "D:\\Programs\\evTEMP\\dsh-chrome-profile";
+const EXPECTED_PROFILE_DIR = "D:\\Letters\\MatTroiSeConMoc\\.dsh\\browser-profile";
 
 let failures = 0;
 const check = (label, condition, detail = "") => {

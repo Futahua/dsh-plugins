@@ -33,12 +33,13 @@ Windows `.lnk`, so the shortcut is read once, by hand, and stored as
 ```powershell
 $sh = New-Object -ComObject WScript.Shell
 $sh.CreateShortcut('C:\Users\Public\Desktop\Chrome (DSH Browser).lnk').Arguments
-# --remote-debugging-port=9222 --user-data-dir="D:\Programs\evTEMP\dsh-chrome-profile"
+# --remote-debugging-port=9222 --user-data-dir="D:\Letters\MatTroiSeConMoc\.dsh\browser-profile"
 ```
 
-Current value: `D:\Programs\evTEMP\dsh-chrome-profile`. If the shortcut is
-ever recreated with a different `--user-data-dir`, edit that one line (and
-the matching constant in `verify-client.mjs`).
+Current value: `D:\Letters\MatTroiSeConMoc\.dsh\browser-profile` (moved out of
+`D:\Programs\evTEMP\` on 2026-09-17; the old directory is deleted). If the
+shortcut is ever recreated with a different `--user-data-dir`, edit that one
+line (and the matching constant in `verify-client.mjs`).
 
 ## Installing
 
@@ -93,7 +94,7 @@ order forces (read before skipping it):
        - webServer
      config:
        connectUrl: 'http://127.0.0.1:9222'
-       userDataDir: 'D:\Programs\evTEMP\dsh-chrome-profile'
+       userDataDir: 'D:\Letters\MatTroiSeConMoc\.dsh\browser-profile'
    ```
 
 Then restart `dsh web` (host rows and new bundles are not hot-loaded) and

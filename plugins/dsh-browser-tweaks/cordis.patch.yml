@@ -35,7 +35,7 @@
 # is skipped.
 - id: dsh-browser-agent
   config:
-    userDataDir: 'D:\Programs\evTEMP\dsh-chrome-profile'
+    userDataDir: 'D:\Letters\MatTroiSeConMoc\.dsh\browser-profile'
 
 - insert:
     - id: browser-tweaks
