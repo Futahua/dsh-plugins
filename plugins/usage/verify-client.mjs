@@ -6,7 +6,7 @@
  * a mis-wired slot registration. It stubs `window.__ModuleLoader__`, `require`,
  * a minimal DOM, and a minimal React, so it runs with no dependencies installed:
  *
- *   node plugins/dsh-opencode-go-usage/verify-client.mjs
+ *   node plugins/usage/verify-client.mjs
  *
  * The React stub is intentionally tiny: this never renders, it only evaluates
  * the bundle and inspects what it registered. `createElement` returns a plain
@@ -57,14 +57,14 @@ new Function("window", "require", source)(globalThis.window, requireStub);
 
 console.log("bundle envelope:");
 check("registered with __ModuleLoader__", registration !== undefined);
-check("declares its own id", registration?.id === "dsh-opencode-go-usage", String(registration?.id));
+check("declares its own id", registration?.id === "usage", String(registration?.id));
 
 const exported = registration.factory(requireStub);
 console.log("exports:");
 check("exports apply", typeof exported.apply === "function");
 check("exports inject", Array.isArray(exported.inject), JSON.stringify(exported.inject));
 check("injects the slots service", exported.inject?.includes("slots"));
-check("exports the component", typeof exported.GoUsagePill === "function");
+check("exports the component", typeof exported.UsagePill === "function");
 
 console.log("slot registration:");
 const registrations = [];
@@ -85,14 +85,14 @@ const injectCall = registrations.find((r) => r.phase === "inject");
 const registerCall = registrations.find((r) => r.phase === "register");
 check("waits for the seat declaration", injectCall?.key === "conversation.input.right", String(injectCall?.key));
 check("registers into that seat", registerCall?.spec?.name === "conversation.input.right");
-check("uses its own cell id", registerCall?.spec?.id === "opencode-go-usage", String(registerCall?.spec?.id));
+check("uses its own cell id", registerCall?.spec?.id === "usage", String(registerCall?.spec?.id));
 check("orders after shipped entries", typeof registerCall?.spec?.order === "number", String(registerCall?.spec?.order));
-check("registers the pill component", registerCall?.component === exported.GoUsagePill);
+check("registers the pill component", registerCall?.component === exported.UsagePill);
 
 console.log("style injection:");
 check("added one plugin style tag", styleTags.length === 1, `${styleTags.length} tag(s)`);
-check("tagged for hmr cleanup", styleTags[0]?.dataset?.plugin === "dsh-opencode-go-usage");
-check("scopes its rules", String(styleTags[0]?.textContent).includes(".dsh-go-usage-button"));
+check("tagged for hmr cleanup", styleTags[0]?.dataset?.plugin === "usage");
+check("scopes its rules", String(styleTags[0]?.textContent).includes(".dsh-usage-button"));
 check("no floating caption (removed by request)", !String(styleTags[0]?.textContent).includes("roll independently"));
 
 console.log("panel placement (pure helper):");

@@ -1,4 +1,4 @@
-# The dsh-opencode-go-usage bundle patch.
+# The usage bundle patch.
 #
 # Registers one host-side service that reads the OpenCode Go subscription usage
 # from https://opencode.ai/zen/go/v1/usage and caches it.
@@ -12,8 +12,8 @@
 # touches no other plugin's behaviour.
 
 - insert:
-    - id: opencode-go-usage
-      name: dsh-opencode-go-usage
+    - id: usage
+      name: usage
       config:
         enabled: true
         baseUrl: https://opencode.ai/zen/go/v1

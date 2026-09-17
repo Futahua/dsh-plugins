@@ -29,7 +29,7 @@ for (const tab of dshTabs) {
 
   console.log(`--- ${tab.id.slice(0, 8)} ---`)
   const report = await evaluate(`(async () => {
-    const btn = document.querySelector('.dsh-go-usage-button');
+    const btn = document.querySelector('.dsh-usage-button');
     if (!btn) return { pill: false };
 
     // Open the panel and measure it.
@@ -37,9 +37,9 @@ for (const tab of dshTabs) {
     await new Promise(r => setTimeout(r, 250));
 
     const ring = btn.querySelector('svg');
-    const arc = btn.querySelector('.dsh-go-usage-arc');
-    const panel = document.querySelector('.dsh-go-usage-panel');
-    const rows = panel ? [...panel.querySelectorAll('.dsh-go-usage-row')] : [];
+    const arc = btn.querySelector('.dsh-usage-arc');
+    const panel = document.querySelector('.dsh-usage-panel');
+    const rows = panel ? [...panel.querySelectorAll('.dsh-usage-row')] : [];
 
     return {
       pill: true,
@@ -53,11 +53,11 @@ for (const tab of dshTabs) {
       panelOpen: Boolean(panel),
       rowCount: rows.length,
       rows: rows.map(r => {
-        const label = r.querySelector('.dsh-go-usage-head span')?.textContent;
-        const pct = r.querySelector('.dsh-go-usage-head b')?.textContent;
-        const reset = r.querySelector('.dsh-go-usage-reset')?.textContent?.trim();
-        const bar = r.querySelector('.dsh-go-usage-bar');
-        const fill = r.querySelector('.dsh-go-usage-fill');
+        const label = r.querySelector('.dsh-usage-head span')?.textContent;
+        const pct = r.querySelector('.dsh-usage-head b')?.textContent;
+        const reset = r.querySelector('.dsh-usage-reset')?.textContent?.trim();
+        const bar = r.querySelector('.dsh-usage-bar');
+        const fill = r.querySelector('.dsh-usage-fill');
         const panelW = panel.getBoundingClientRect().width;
         return {
           label, pct, reset,
@@ -67,7 +67,7 @@ for (const tab of dshTabs) {
           fillPx: fill ? Math.round(fill.getBoundingClientRect().width) : null,
         };
       }),
-      caption: panel ? panel.querySelector('.dsh-go-usage-caption')?.textContent?.slice(0, 60) : null,
+      caption: panel ? panel.querySelector('.dsh-usage-caption')?.textContent?.slice(0, 60) : null,
       panelWidthPx: panel ? Math.round(panel.getBoundingClientRect().width) : null,
       viewport: window.innerWidth,
       overflowsLeft: panel ? Math.round(panel.getBoundingClientRect().left) < 0 : null,
@@ -76,7 +76,7 @@ for (const tab of dshTabs) {
   console.log(JSON.stringify(report, null, 2))
 
   // Close the panel again so both tabs are left clean.
-  await evaluate(`(() => { const b = document.querySelector('.dsh-go-usage-button'); if (b) b.click(); return true })()`)
+  await evaluate(`(() => { const b = document.querySelector('.dsh-usage-button'); if (b) b.click(); return true })()`)
   ws.close()
   console.log('')
 }

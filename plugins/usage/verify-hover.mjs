@@ -28,41 +28,41 @@ const evaluate = async (expression) => {
 }
 
 // Close anything open first.
-await evaluate(`(() => { if (document.querySelector('.dsh-go-usage-panel')) document.querySelector('.dsh-go-usage-button').click(); return true })()`)
+await evaluate(`(() => { if (document.querySelector('.dsh-usage-panel')) document.querySelector('.dsh-usage-button').click(); return true })()`)
 await new Promise((r) => setTimeout(r, 250))
 
 console.log('--- is the new bundle loaded? ---')
 console.log(JSON.stringify(await evaluate(`(() => {
-  const tag = document.querySelector('style[data-plugin="dsh-opencode-go-usage"]');
+  const tag = document.querySelector('style[data-plugin="usage"]');
   const css = tag ? tag.textContent : '';
   return {
-    styleTags: document.querySelectorAll('style[data-plugin="dsh-opencode-go-usage"]').length,
-    hasQuickCss: css.includes('dsh-go-usage-quick'),
-    hasSwatchCss: css.includes('dsh-go-usage-swatch'),
-    hasRowsCss: css.includes('dsh-go-usage-rows'),
+    styleTags: document.querySelectorAll('style[data-plugin="usage"]').length,
+    hasQuickCss: css.includes('dsh-usage-quick'),
+    hasSwatchCss: css.includes('dsh-usage-swatch'),
+    hasRowsCss: css.includes('dsh-usage-rows'),
   };
 })()`), null, 2))
 
 console.log('\n--- mouse hover (via pointerover, which React maps to onPointerEnter) ---')
 console.log(JSON.stringify(await evaluate(`(async () => {
-  const btn = document.querySelector('.dsh-go-usage-button');
+  const btn = document.querySelector('.dsh-usage-button');
   if (!btn) return 'no pill';
   btn.dispatchEvent(new PointerEvent('pointerover', {
     bubbles: true, pointerType: 'mouse', relatedTarget: document.body,
   }));
   await new Promise(r => setTimeout(r, 300));
-  const quick = document.querySelector('.dsh-go-usage-quick');
+  const quick = document.querySelector('.dsh-usage-quick');
   if (!quick) return { quick: false };
-  const rows = [...quick.querySelectorAll('.dsh-go-usage-quickrow')].map(r => ({
+  const rows = [...quick.querySelectorAll('.dsh-usage-quickrow')].map(r => ({
     text: r.textContent,
-    swatch: getComputedStyle(r.querySelector('.dsh-go-usage-swatch')).backgroundColor,
+    swatch: getComputedStyle(r.querySelector('.dsh-usage-swatch')).backgroundColor,
   }));
   const r = quick.getBoundingClientRect();
   return {
     quick: true,
     rows: rows.length,
     data: rows,
-    hasChart: Boolean(document.querySelector('.dsh-go-usage-rows')),
+    hasChart: Boolean(document.querySelector('.dsh-usage-rows')),
     sizePx: Math.round(r.width) + 'x' + Math.round(r.height),
     onScreen: r.left >= 0 && r.right <= window.innerWidth,
   };
@@ -70,20 +70,20 @@ console.log(JSON.stringify(await evaluate(`(async () => {
 
 console.log('\n--- leaving hides it ---')
 console.log(JSON.stringify(await evaluate(`(async () => {
-  const btn = document.querySelector('.dsh-go-usage-button');
+  const btn = document.querySelector('.dsh-usage-button');
   btn.dispatchEvent(new PointerEvent('pointerout', {
     bubbles: true, pointerType: 'mouse', relatedTarget: document.body,
   }));
   await new Promise(r => setTimeout(r, 300));
-  return { quickGone: !document.querySelector('.dsh-go-usage-quick') };
+  return { quickGone: !document.querySelector('.dsh-usage-quick') };
 })()`)))
 
 console.log('\n--- a touch tap must NOT show the glance ---')
 console.log(JSON.stringify(await evaluate(`(async () => {
-  const btn = document.querySelector('.dsh-go-usage-button');
+  const btn = document.querySelector('.dsh-usage-button');
   btn.dispatchEvent(new PointerEvent('pointerenter', { bubbles: false, pointerType: 'touch' }));
   await new Promise(r => setTimeout(r, 200));
-  return { quickShown: Boolean(document.querySelector('.dsh-go-usage-quick')) };
+  return { quickShown: Boolean(document.querySelector('.dsh-usage-quick')) };
 })()`)))
 
 ws.close()

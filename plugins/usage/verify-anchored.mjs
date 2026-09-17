@@ -37,28 +37,28 @@ const evaluate = async (expression) => {
 }
 
 // Force closed first so the click opens rather than toggles.
-await evaluate(`(() => { const p = document.querySelector('.dsh-go-usage-panel'); if (p) document.querySelector('.dsh-go-usage-button').click(); return true })()`)
+await evaluate(`(() => { const p = document.querySelector('.dsh-usage-panel'); if (p) document.querySelector('.dsh-usage-button').click(); return true })()`)
 await new Promise((r) => setTimeout(r, 250))
 
 const report = await evaluate(`(async () => {
-  const btn = document.querySelector('.dsh-go-usage-button');
+  const btn = document.querySelector('.dsh-usage-button');
   if (!btn) return 'no pill';
   btn.click();
   await new Promise(r => setTimeout(r, 400));
 
-  const rows = [...document.querySelectorAll('.dsh-go-usage-row')];
-  if (rows.length === 0) return { rows: 0, panel: Boolean(document.querySelector('.dsh-go-usage-panel')) };
+  const rows = [...document.querySelectorAll('.dsh-usage-row')];
+  if (rows.length === 0) return { rows: 0, panel: Boolean(document.querySelector('.dsh-usage-panel')) };
 
   const data = rows.map(row => {
-    const track = row.querySelector('.dsh-go-usage-track');
-    const seg = row.querySelector('.dsh-go-usage-seg');
-    const fill = row.querySelector('.dsh-go-usage-segfill');
-    const anchor = row.querySelector('.dsh-go-usage-anchor');
+    const track = row.querySelector('.dsh-usage-track');
+    const seg = row.querySelector('.dsh-usage-seg');
+    const fill = row.querySelector('.dsh-usage-segfill');
+    const anchor = row.querySelector('.dsh-usage-anchor');
     const tr = track.getBoundingClientRect();
     return {
       window: row.getAttribute('data-window'),
-      label: row.querySelector('.dsh-go-usage-label')?.textContent,
-      figure: row.querySelector('.dsh-go-usage-figs')?.textContent,
+      label: row.querySelector('.dsh-usage-label')?.textContent,
+      figure: row.querySelector('.dsh-usage-figs')?.textContent,
       trackLeft: Math.round(tr.left),
       trackWidth: Math.round(tr.width),
       segLeftPct: +((seg.getBoundingClientRect().left - tr.left) / tr.width * 100).toFixed(1),
@@ -72,12 +72,12 @@ const report = await evaluate(`(async () => {
     };
   });
 
-  const arc = btn.querySelector('.dsh-go-usage-arc');
+  const arc = btn.querySelector('.dsh-usage-arc');
   return {
     rows: data.length,
     data,
     arcColour: arc ? getComputedStyle(arc).stroke : null,
-    panelHeight: Math.round(document.querySelector('.dsh-go-usage-panel').getBoundingClientRect().height),
+    panelHeight: Math.round(document.querySelector('.dsh-usage-panel').getBoundingClientRect().height),
   };
 })()`)
 
@@ -98,5 +98,5 @@ if (report && Array.isArray(report.data)) {
   }
 }
 
-await evaluate(`(() => { const b = document.querySelector('.dsh-go-usage-button'); if (b) b.click(); return true })()`)
+await evaluate(`(() => { const b = document.querySelector('.dsh-usage-button'); if (b) b.click(); return true })()`)
 ws.close()

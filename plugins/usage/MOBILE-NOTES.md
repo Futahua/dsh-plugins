@@ -93,8 +93,8 @@ on a phone (`layout:299`), reachable through `conversation.session.header.corner
 
 ## How this plugin uses it
 
-`dsh-opencode-go-usage` registers into `conversation.input.right` — a list seat
+`usage` registers into `conversation.input.right` — a list seat
 that is empty in the shipped product, phone-visible, and validated by plugin
 `verify-client.mjs`. On a narrow screen the composer row is tight, so the pill is
 deliberately small (a dot plus `Go 27%`); its own CSS is scoped under
-`.dsh-go-usage` so it can be narrowed further with a media query if needed.
+`.dsh-usage` so it can be narrowed further with a media query if needed.

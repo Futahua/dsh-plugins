@@ -1,4 +1,4 @@
-# dsh-opencode-go-usage
+# usage
 
 Shows how much of your **OpenCode Go** subscription allowance is spent — the
 5-hour, weekly, and monthly windows — inside the DSH Web GUI.
@@ -73,7 +73,7 @@ into:
 
 ```js
 ctx.slots.inject("conversation.input.right", () =>
-  ctx.slots.register({ name: "conversation.input.right", id: "opencode-go-usage", order: 100 }, GoUsagePill));
+  ctx.slots.register({ name: "conversation.input.right", id: "usage", order: 100 }, UsagePill));
 ```
 
 So the meter and the Go pill sit side by side, each with its own popover. Putting
@@ -142,8 +142,8 @@ Caveats worth knowing:
 ## Verifying
 
 ```
-node .dsh\profiles\web\plugins\dsh-opencode-go-usage\verify.mjs          # host: helpers + live gateway
-node .dsh\profiles\web\plugins\dsh-opencode-go-usage\verify-client.mjs   # client: bundle envelope + seat wiring
+node .dsh\profiles\web\plugins\usage\verify.mjs          # host: helpers + live gateway
+node .dsh\profiles\web\plugins\usage\verify-client.mjs   # client: bundle envelope + seat wiring
 ```
 
 `verify-client.mjs` stubs `window.__ModuleLoader__`, `require`, and a minimal DOM,

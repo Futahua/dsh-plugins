@@ -1,10 +1,10 @@
 /**
- * Self-check for dsh-opencode-go-usage.
+ * Self-check for usage.
  *
  * The service itself needs a Cordis context, so this exercises the extracted
  * `fetchUsage` path plus the pure helpers against the machine's real credential
  * store and the live gateway. Run:
- *   node .dsh/profiles/web/plugins/dsh-opencode-go-usage/verify.mjs
+ *   node .dsh/profiles/web/plugins/usage/verify.mjs
  */
 import { readFileSync } from "node:fs";
 import { DEFAULT_BASE_URL, describeFailure, fetchUsage, normalizeWindow } from "./index.js";

@@ -27,17 +27,17 @@ const evaluate = async (expression) => {
 }
 
 // Ensure it ends closed, then open it.
-await evaluate(`(() => { if (document.querySelector('.dsh-go-usage-panel')) document.querySelector('.dsh-go-usage-button').click(); return true })()`)
+await evaluate(`(() => { if (document.querySelector('.dsh-usage-panel')) document.querySelector('.dsh-usage-button').click(); return true })()`)
 await new Promise((r) => setTimeout(r, 250))
 
 const report = await evaluate(`(async () => {
-  document.querySelector('.dsh-go-usage-button').click();
+  document.querySelector('.dsh-usage-button').click();
   await new Promise(r => setTimeout(r, 400));
-  const rows = [...document.querySelectorAll('.dsh-go-usage-row')];
+  const rows = [...document.querySelectorAll('.dsh-usage-row')];
   return rows.map(row => {
-    const track = row.querySelector('.dsh-go-usage-track');
-    const seg = row.querySelector('.dsh-go-usage-seg');
-    const fill = row.querySelector('.dsh-go-usage-segfill');
+    const track = row.querySelector('.dsh-usage-track');
+    const seg = row.querySelector('.dsh-usage-seg');
+    const fill = row.querySelector('.dsh-usage-segfill');
     const tw = track.getBoundingClientRect().width;
     return {
       window: row.getAttribute('data-window'),
@@ -59,5 +59,5 @@ if (Array.isArray(report)) {
   }
 }
 
-await evaluate(`(() => { document.querySelector('.dsh-go-usage-button').click(); return true })()`)
+await evaluate(`(() => { document.querySelector('.dsh-usage-button').click(); return true })()`)
 ws.close()

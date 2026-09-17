@@ -25,17 +25,17 @@ const evaluate = async (expression) => {
 }
 
 console.log(JSON.stringify(await evaluate(`(async () => {
-  const btn = document.querySelector('.dsh-go-usage-button');
+  const btn = document.querySelector('.dsh-usage-button');
   if (!btn) return 'no pill';
-  if (!document.querySelector('.dsh-go-usage-panel')) { btn.click(); await new Promise(r => setTimeout(r, 250)); }
-  const panel = document.querySelector('.dsh-go-usage-panel');
-  const wrap = document.querySelector('.dsh-go-usage');
+  if (!document.querySelector('.dsh-usage-panel')) { btn.click(); await new Promise(r => setTimeout(r, 250)); }
+  const panel = document.querySelector('.dsh-usage-panel');
+  const wrap = document.querySelector('.dsh-usage');
   const pb = panel.getBoundingClientRect();
   const wb = wrap.getBoundingClientRect();
   const bb = btn.getBoundingClientRect();
 
   // Is the new CSS actually loaded?
-  const tag = document.querySelector('style[data-plugin="dsh-opencode-go-usage"]');
+  const tag = document.querySelector('style[data-plugin="usage"]');
   const css = tag ? tag.textContent : '';
 
   return {
@@ -45,7 +45,7 @@ console.log(JSON.stringify(await evaluate(`(async () => {
     panelRect: { left: Math.round(pb.left), right: Math.round(pb.right), w: Math.round(pb.width) },
     overflowLeftPx: Math.max(0, Math.round(-pb.left)),
     cssHasRightMinus8: css.includes('right:-8px'),
-    cssPanelRule: (css.match(/\\.dsh-go-usage-panel\\{[^}]*\\}/) || ['(absent)'])[0],
+    cssPanelRule: (css.match(/\\.dsh-usage-panel\\{[^}]*\\}/) || ['(absent)'])[0],
     panelOffsetParent: panel.offsetParent ? panel.offsetParent.className.toString().slice(0, 40) : null,
   };
 })()`), null, 2))

@@ -1,5 +1,5 @@
 {
-  "name": "dsh-opencode-go-usage",
+  "name": "usage",
   "version": "1.0.0",
   "private": true,
   "description": "OpenCode Go subscription usage (5-hour / weekly / monthly) for the DSH Web GUI",
