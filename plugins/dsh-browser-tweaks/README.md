@@ -1,12 +1,15 @@
 # dsh-browser-tweaks
 
-Two small behaviour changes to the shipped browser pane
-(`@try-works/dsh-browser-agent`), without touching that package:
+Behaviour changes to the shipped browser pane
+(`@try-works/dsh-browser-agent`) and the composer model pill, without
+touching those packages:
 
 1. **Plugin/stealth mode uses the shortcut-created Chrome profile**, so fresh
    logins land where the desktop shortcut's Chrome already lives.
 2. **The "My Chrome" mode button is hidden** from the pane's mode toggle.
    Headless + Plugin remain, both clickable, both still switching modes.
+3. **The composer model pill carries a provider badge**: the active provider
+   plus usage left — or "free" for unmetered providers.
 
 ## How it works
 
@@ -40,6 +43,28 @@ Current value: `D:\Letters\MatTroiSeConMoc\.dsh\browser-profile` (moved out of
 `D:\Programs\evTEMP\` on 2026-09-17; the old directory is deleted). If the
 shortcut is ever recreated with a different `--user-data-dir`, edit that one
 line (and the matching constant in `verify-client.mjs`).
+
+**The badge — appended DOM, read provider.** The pill is the shipped
+`conversation.input.model` seat: its text is React-owned, so the badge is a
+`<span>` appended beside the pill content inside the pill element, and the
+pill's own text is never rewritten. The provider is never assumed:
+
+- a `provider/model` fallback label names it directly;
+- the open model menu names it exactly (checked option's provider section),
+  and a clicked option teaches it at once — cached per model name;
+- model names unique to one provider (installed pi-ai catalogs, the session
+  bundle's gap model, settings.yaml) resolve without the menu;
+- names shared by several providers ("Muse Spark 1.3 Contributor" is both
+  meta and opencode-go) show the safe fallback "free" until the menu has been
+  opened once.
+
+Only opencode-go is metered: the badge reuses the sibling
+`dsh-opencode-go-usage` plugin's `/api/opencode-go-usage.status` reading
+(what is left of the 5-hour window, polled every 60s while an opencode-go
+model is active). meta and openai-codex have no usage API, so those read
+"free". If the sibling plugin is absent the fetch fails and the badge shows
+the provider name alone. A MutationObserver repaints on every DOM change, so
+the badge follows model switches and survives re-renders; unload removes it.
 
 ## Installing
 
